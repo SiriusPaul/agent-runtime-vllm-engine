@@ -101,19 +101,19 @@ option(LLAMA_SANITIZE_ADDRESS   "llama: enable address sanitizer"   OFF)
 option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 
 # utils
-option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_COMMON "llama: build common utils library" OFF)
 
 # extra artifacts
-option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
+option(LLAMA_BUILD_TESTS    "llama: build tests"          OFF)
+option(LLAMA_BUILD_TOOLS    "llama: build tools"          OFF)
+option(LLAMA_BUILD_EXAMPLES "llama: build examples"       OFF)
+option(LLAMA_BUILD_SERVER   "llama: build server example" OFF)
+option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  OFF)
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
 # 3rd party libs
-option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
+option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
 

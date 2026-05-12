@@ -10,36 +10,5 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
-# examples
-
-if (EMSCRIPTEN)
-else()
-    add_subdirectory(batched)
-    add_subdirectory(debug)
-    add_subdirectory(embedding)
-    add_subdirectory(eval-callback)
-
-    add_subdirectory(gguf-hash)
-    add_subdirectory(gguf)
-    add_subdirectory(idle)
-    add_subdirectory(lookahead)
-    add_subdirectory(lookup)
-    add_subdirectory(parallel)
-    add_subdirectory(passkey)
-    add_subdirectory(retrieval)
-    add_subdirectory(save-load-state)
-    add_subdirectory(simple)
-    add_subdirectory(simple-chat)
-    add_subdirectory(speculative)
-    add_subdirectory(speculative-simple)
-    add_subdirectory(gen-docs)
-    add_subdirectory(training)
-    add_subdirectory(diffusion)
-    if (NOT GGML_BACKEND_DL)
-        add_subdirectory(convert-llama2c-to-ggml)
-        # these examples use the backends directly and cannot be built with dynamic loading
-        if (GGML_SYCL)
-            add_subdirectory(sycl)
-        endif()
-    endif()
-endif()
+# The fork keeps only the Android OSH26 runtime under examples/android_osh26.
+# It is a Gradle project, so there is intentionally no CMake target here.
