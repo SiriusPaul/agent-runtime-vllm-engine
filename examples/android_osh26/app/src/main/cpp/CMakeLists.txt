@@ -35,7 +35,8 @@ set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 add_subdirectory(${LLAMA_ROOT} llama-build)
 
 add_library(llama_osh26 SHARED
-    native-lib.cpp)
+    native-lib.cpp
+    osh26_engine.cpp)
 
 target_compile_features(llama_osh26 PRIVATE cxx_std_17)
 

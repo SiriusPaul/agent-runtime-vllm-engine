@@ -74,6 +74,28 @@
                 android:text="Cancel" />
         </LinearLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/start_server"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Start 8000" />
+
+            <Button
+                android:id="@+id/stop_server"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="Stop 8000" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/output"
             android:layout_width="match_parent"

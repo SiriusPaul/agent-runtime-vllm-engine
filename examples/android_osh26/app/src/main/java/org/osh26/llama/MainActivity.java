@@ -21,10 +21,7 @@ public class MainActivity extends Activity {
     private TextView output;
     private EditText modelPath;
     private EditText prompt;
-
-    static {
-        System.loadLibrary("llama_osh26");
-    }
+    private final LlmHttpServer httpServer = new LlmHttpServer();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -39,9 +36,12 @@ public class MainActivity extends Activity {
         Button importModel = findViewById(R.id.import_model);
         Button generate = findViewById(R.id.generate);
         Button cancel = findViewById(R.id.cancel);
+        Button startServer = findViewById(R.id.start_server);
+        Button stopServer = findViewById(R.id.stop_server);
 
         File modelDir = new File(getFilesDir(), "models");
         modelPath.setText(new File(modelDir, "qwen3-0.6b.gguf").getAbsolutePath());
+        appendLine(httpServer.start());
         refreshStats();
 
         importModel.setOnClickListener(v -> {
@@ -52,47 +52,63 @@ public class MainActivity extends Activity {
         });
 
         loadModel.setOnClickListener(v -> {
-            appendLine(nativeLoadModel(modelPath.getText().toString()));
+            appendLine(LlamaNative.loadModel(modelPath.getText().toString()));
             refreshStats();
         });
 
         generate.setOnClickListener(v -> {
             output.setText("");
-            appendLine(nativeGenerate(prompt.getText().toString(), new TokenCallback() {
-                @Override
-                public void onToken(String token) {
-                    runOnUiThread(() -> output.append(token));
-                }
+            String userPrompt = prompt.getText().toString();
+            new Thread(() -> {
+                String status = LlamaNative.generateStream(userPrompt, new LlamaNative.StreamCallback() {
+                    @Override
+                    public void onToken(String token) {
+                        runOnUiThread(() -> output.append(token));
+                    }
 
-                @Override
-                public void onComplete(String stats) {
-                    runOnUiThread(() -> {
-                        appendLine("\n" + stats);
-                        refreshStats();
-                    });
-                }
+                    @Override
+                    public void onComplete(String text, String finishReason) {
+                        runOnUiThread(() -> {
+                            appendLine("\ncomplete: " + finishReason);
+                            refreshStats();
+                        });
+                    }
 
-                @Override
-                public void onError(String error) {
-                    runOnUiThread(() -> {
-                        appendLine("\nERROR: " + error);
-                        refreshStats();
-                    });
-                }
-            }));
+                    @Override
+                    public void onError(String error) {
+                        runOnUiThread(() -> {
+                            appendLine("\nERROR: " + error);
+                            refreshStats();
+                        });
+                    }
+                }, 128, 0.6f, 0.95f, 0xCAFE, false);
+                runOnUiThread(() -> appendLine(status));
+            }, "osh26-ui-generate").start();
             refreshStats();
         });
 
         cancel.setOnClickListener(v -> {
-            nativeCancel();
+            LlamaNative.cancel();
             appendLine("\ncancel requested");
+            refreshStats();
+        });
+
+        startServer.setOnClickListener(v -> {
+            appendLine(httpServer.start());
+            refreshStats();
+        });
+
+        stopServer.setOnClickListener(v -> {
+            httpServer.stop();
+            appendLine("HTTP server stopped");
             refreshStats();
         });
     }
 
     @Override
     protected void onDestroy() {
-        nativeRelease();
+        httpServer.stop();
+        LlamaNative.release();
         super.onDestroy();
     }
 
@@ -156,7 +172,9 @@ public class MainActivity extends Activity {
     }
 
     private void refreshStats() {
-        engineStatus.setText(nativeGetEngineStats());
+        String status = LlamaNative.getEngineStats();
+        status += "\nhttp_server_running=" + httpServer.isRunning() + ", port=" + LlmHttpServer.PORT;
+        engineStatus.setText(status);
     }
 
     private void appendLine(String text) {
@@ -164,15 +182,4 @@ public class MainActivity extends Activity {
         output.append("\n");
     }
 
-    public interface TokenCallback {
-        void onToken(String token);
-        void onComplete(String stats);
-        void onError(String error);
-    }
-
-    private native String nativeLoadModel(String modelPath);
-    private native String nativeGenerate(String prompt, TokenCallback callback);
-    private native void nativeCancel();
-    private native void nativeRelease();
-    private native String nativeGetEngineStats();
 }
