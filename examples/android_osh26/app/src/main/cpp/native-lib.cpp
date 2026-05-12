@@ -113,6 +113,17 @@ std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
     return std::string(buffer.data(), (size_t) n);
 }
 
+std::string build_qwen3_thinking_prompt(const std::string & user_prompt) {
+    return "<|im_start|>system\n"
+           "You are a helpful local assistant. Think before answering when useful."
+           "<|im_end|>\n"
+           "<|im_start|>user\n"
+           + user_prompt
+           + "\n/think"
+             "<|im_end|>\n"
+             "<|im_start|>assistant\n";
+}
+
 std::string json_escape(const std::string & value) {
     std::ostringstream out;
     for (char c : value) {
@@ -216,6 +227,7 @@ void run_generation(jobject callback, llama_model * model, std::string prompt) {
     int decoded_tokens = 0;
     std::string error;
 
+    prompt = build_qwen3_thinking_prompt(prompt);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), nullptr, 0, true, true);
     if (n_prompt <= 0) {
@@ -253,7 +265,10 @@ void run_generation(jobject callback, llama_model * model, std::string prompt) {
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     sampler_params.no_perf = false;
     llama_sampler * sampler = llama_sampler_chain_init(sampler_params);
-    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(20));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.6f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(0xCAFE));
 
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
     int n_pos = 0;
