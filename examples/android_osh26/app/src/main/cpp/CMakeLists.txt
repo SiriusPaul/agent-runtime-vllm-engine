@@ -27,12 +27,33 @@ set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
-set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN_VALIDATE OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN_RUN_TESTS OFF CACHE BOOL "" FORCE)
+
+if (ANDROID AND CMAKE_ANDROID_NDK)
+    if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+        set(_OSH26_GLSLC "${CMAKE_ANDROID_NDK}/shader-tools/windows-x86_64/glslc.exe")
+    elseif (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+        set(_OSH26_GLSLC "${CMAKE_ANDROID_NDK}/shader-tools/darwin-x86_64/glslc")
+    else()
+        set(_OSH26_GLSLC "${CMAKE_ANDROID_NDK}/shader-tools/linux-x86_64/glslc")
+    endif()
+    if (EXISTS "${_OSH26_GLSLC}")
+        set(Vulkan_GLSLC_EXECUTABLE "${_OSH26_GLSLC}" CACHE FILEPATH "" FORCE)
+    endif()
+endif()
 
 add_subdirectory(${LLAMA_ROOT} llama-build)
+
+if (TARGET ggml-vulkan)
+    target_include_directories(ggml-vulkan PRIVATE
+        ${LLAMA_ROOT}/vendor/vulkan-headers/include
+        ${LLAMA_ROOT}/vendor/spirv-headers/include)
+endif()
 
 add_library(llama_osh26 SHARED
     native-lib.cpp

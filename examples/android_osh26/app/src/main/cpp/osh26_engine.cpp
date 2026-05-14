@@ -70,6 +70,48 @@ std::string describe_file(const std::string & path) {
     return out.str();
 }
 
+const char * backend_dev_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "IGPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
+        case GGML_BACKEND_DEVICE_TYPE_META:  return "META";
+        default:                             return "UNKNOWN";
+    }
+}
+
+std::string describe_backend_devices() {
+    std::ostringstream out;
+    out << "[";
+    const size_t count = ggml_backend_dev_count();
+    for (size_t i = 0; i < count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (i > 0) {
+            out << ",";
+        }
+        out << "{"
+            << "\"name\":\"" << json_escape(ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "") << "\","
+            << "\"description\":\"" << json_escape(ggml_backend_dev_description(dev) ? ggml_backend_dev_description(dev) : "") << "\","
+            << "\"type\":\"" << backend_dev_type_name(ggml_backend_dev_type(dev)) << "\""
+            << "}";
+    }
+    out << "]";
+    return out.str();
+}
+
+bool has_gpu_backend_device() {
+    const size_t count = ggml_backend_dev_count();
+    for (size_t i = 0; i < count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int default_thread_count() {
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw == 0) {
@@ -137,6 +179,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    available_devices_ = describe_backend_devices();
     cancel_requested_.store(true);
     if (ctx_ != nullptr) {
         llama_free(ctx_);
@@ -148,10 +191,18 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    const bool try_gpu = llama_supports_gpu_offload() && has_gpu_backend_device();
+    model_params.n_gpu_layers = try_gpu ? -1 : 0;
     model_params.use_mmap = false;
     model_params.use_mlock = false;
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
+    active_backend_ = try_gpu ? "llama.cpp Vulkan" : "llama.cpp CPU";
+    if (model_ == nullptr && try_gpu) {
+        __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "Vulkan model load failed; retrying CPU backend");
+        model_params.n_gpu_layers = 0;
+        model_ = llama_model_load_from_file(model_path.c_str(), model_params);
+        active_backend_ = "llama.cpp CPU fallback";
+    }
     if (model_ == nullptr) {
         model_path_.clear();
         last_error_ = "failed to load model: " + model_path + " (" + file_info + ")";
@@ -165,8 +216,21 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     ctx_params.n_seq_max = kDefaultMaxSeq;
     ctx_params.n_threads = default_thread_count();
     ctx_params.n_threads_batch = ctx_params.n_threads;
+    ctx_params.offload_kqv = try_gpu && active_backend_ == "llama.cpp Vulkan";
+    ctx_params.op_offload = try_gpu && active_backend_ == "llama.cpp Vulkan";
     ctx_params.no_perf = false;
     ctx_ = llama_init_from_model(model_, ctx_params);
+    if (ctx_ == nullptr && active_backend_ == "llama.cpp Vulkan") {
+        llama_model_free(model_);
+        model_params.n_gpu_layers = 0;
+        model_ = llama_model_load_from_file(model_path.c_str(), model_params);
+        active_backend_ = "llama.cpp CPU fallback";
+        ctx_params.offload_kqv = false;
+        ctx_params.op_offload = false;
+        if (model_ != nullptr) {
+            ctx_ = llama_init_from_model(model_, ctx_params);
+        }
+    }
     if (ctx_ == nullptr) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -178,7 +242,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     model_path_ = model_path;
     last_error_.clear();
     cancel_requested_.store(false);
-    return "model loaded: " + model_path + " (" + file_info + ")";
+    return "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
 }
 
 GenerateResult ComputeBackend::generate(const std::string & user_prompt, const GenerateOptions & options, const TokenCallback & on_token) {
@@ -321,7 +385,9 @@ std::string ComputeBackend::stats_json() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream out;
     out << "{\n"
-        << "  \"backend\": \"llama.cpp CPU\",\n"
+        << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
+        << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
+        << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
         << "  \"scheduler\": \"lite\",\n"
         << "  \"max_concurrent_requests\": 1,\n"

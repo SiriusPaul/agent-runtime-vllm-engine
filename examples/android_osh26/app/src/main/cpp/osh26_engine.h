@@ -56,6 +56,8 @@ private:
     double last_tokens_per_second_ = 0.0;
     std::string last_finish_reason_ = "stop";
     std::string last_error_;
+    std::string active_backend_ = "llama.cpp CPU";
+    std::string available_devices_;
 };
 
 class SchedulerLite {
