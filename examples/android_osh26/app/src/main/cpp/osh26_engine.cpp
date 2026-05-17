@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -115,22 +116,26 @@ bool has_gpu_backend_device() {
 int default_thread_count() {
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw == 0) {
-        return 2;
+        return 4;
     }
-    return std::max(1, std::min(4, (int) hw));
+    return std::max(1, std::min(8, (int) hw));
 }
 
-std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
-    std::vector<char> buffer(256);
-    int n = llama_token_to_piece(vocab, token, buffer.data(), (int32_t) buffer.size(), 0, true);
-    if (n < 0) {
-        buffer.resize((size_t) -n);
-        n = llama_token_to_piece(vocab, token, buffer.data(), (int32_t) buffer.size(), 0, true);
-    }
-    if (n < 0) {
+std::string token_to_text(const llama_vocab * vocab, llama_token token) {
+    int32_t n = llama_detokenize(vocab, &token, 1, nullptr, 0, true, false);
+    if (n == 0) {
         return {};
     }
-    return std::string(buffer.data(), (size_t) n);
+    if (n < 0) {
+        n = -n;
+    }
+    std::string out(static_cast<size_t>(n), '\0');
+    const int32_t written = llama_detokenize(vocab, &token, 1, out.data(), n, true, false);
+    if (written <= 0) {
+        return {};
+    }
+    out.resize(static_cast<size_t>(written));
+    return out;
 }
 
 } // namespace
@@ -152,6 +157,38 @@ ComputeBackend::~ComputeBackend() {
 }
 
 std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool enable_thinking) const {
+    if (model_ != nullptr) {
+        const char * tmpl = llama_model_chat_template(model_, nullptr);
+        if (tmpl != nullptr && tmpl[0] != '\0') {
+            std::string system_msg = "You are a helpful local assistant.";
+            std::string user_msg = user_prompt;
+            if (enable_thinking) {
+                user_msg += "\n/think";
+            } else {
+                user_msg += "\n/no_think";
+            }
+            std::array<llama_chat_message, 2> messages = {
+                llama_chat_message{"system", system_msg.c_str()},
+                llama_chat_message{"user", user_msg.c_str()},
+            };
+            const int32_t needed = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
+            if (needed > 0) {
+                std::string buffer(static_cast<size_t>(needed), '\0');
+                const int32_t written = llama_chat_apply_template(
+                    tmpl,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    buffer.data(),
+                    (int32_t) buffer.size());
+                if (written > 0) {
+                    buffer.resize(static_cast<size_t>(written));
+                    return buffer;
+                }
+            }
+        }
+    }
+
     std::string prompt = "<|im_start|>system\n"
                          "You are a helpful local assistant. Think before answering when useful.\n"
                          "<|im_end|>\n"
@@ -327,10 +364,12 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             first_token = false;
         }
 
-        std::string piece = token_to_piece(vocab, token);
-        result.text += piece;
-        if (on_token) {
-            on_token(piece);
+        std::string piece = token_to_text(vocab, token);
+        if (!piece.empty()) {
+            result.text += piece;
+            if (on_token) {
+                on_token(piece);
+            }
         }
         batch = llama_batch_get_one(&token, 1);
         result.decoded_tokens += 1;

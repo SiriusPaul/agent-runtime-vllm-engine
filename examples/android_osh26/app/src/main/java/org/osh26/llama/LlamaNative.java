@@ -2,6 +2,7 @@ package org.osh26.llama;
 
 public final class LlamaNative {
     static {
+        System.loadLibrary("vulkan");
         System.loadLibrary("llama_osh26");
     }
 

@@ -65,3 +65,9 @@ target_link_libraries(llama_osh26
     llama
     android
     log)
+
+# Vulkan 1.1+ symbols (e.g. vkGetPhysicalDeviceFeatures2) are resolved at
+# runtime via the device's system libvulkan.so. Override NDK's --no-undefined
+# to allow these PLT entries.
+target_link_options(llama_osh26 PRIVATE
+    "SHELL:-Wl,-z,undefs")

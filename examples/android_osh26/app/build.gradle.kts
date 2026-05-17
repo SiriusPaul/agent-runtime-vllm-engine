@@ -12,14 +12,19 @@ android {
 
     defaultConfig {
         applicationId = "org.osh26.llama"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
 
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+
         externalNativeBuild {
             cmake {
                 arguments += "-DLLAMA_ROOT=${rootDir}/../.."
+                arguments += "-DANDROID_PLATFORM=android-26"
             }
         }
     }

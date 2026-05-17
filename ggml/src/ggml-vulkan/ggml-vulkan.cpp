@@ -1,3 +1,4 @@
+#include <android/log.h>
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
@@ -37,6 +38,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -610,6 +612,10 @@ struct vk_device_struct {
     bool pipeline_robustness;
     bool memory_priority;
     vk::Device device;
+    PFN_vkCreateBuffer pfn_vkCreateBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements pfn_vkGetBufferMemoryRequirements = nullptr;
+    PFN_vkGetBufferDeviceAddress pfn_vkGetBufferDeviceAddress = nullptr;
+    PFN_vkGetBufferDeviceAddressKHR pfn_vkGetBufferDeviceAddressKHR = nullptr;
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
@@ -939,8 +945,14 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        device->device.freeMemory(device_memory);
-        device->device.destroyBuffer(buffer);
+        vkFreeMemory(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkDeviceMemory>(device_memory),
+            nullptr);
+        vkDestroyBuffer(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkBuffer>(buffer),
+            nullptr);
     }
 };
 
@@ -2637,6 +2649,16 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
+static vk::PhysicalDeviceMemoryProperties ggml_vk_get_memory_properties(const vk_device& device) {
+    VkPhysicalDeviceMemoryProperties mem_props_vk {};
+    vkGetPhysicalDeviceMemoryProperties(
+        static_cast<VkPhysicalDevice>(device->physical_device),
+        &mem_props_vk);
+    vk::PhysicalDeviceMemoryProperties mem_props {};
+    std::memcpy(&mem_props, &mem_props_vk, sizeof(mem_props));
+    return mem_props;
+}
+
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
@@ -2673,11 +2695,37 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         buffer_create_info.setPNext(&external_memory_bci);
     }
 
-    buf->buffer = device->device.createBuffer(buffer_create_info);
+    __android_log_print(ANDROID_LOG_INFO, "OSH26Vk",
+        "createBuffer: dev=%p size=%zu, pfn_vkCreateBuffer=%p pfn_vkGetBufferMemoryRequirements=%p",
+        (void*)static_cast<VkDevice>(device->device),
+        size,
+        (void*)device->pfn_vkCreateBuffer,
+        (void*)device->pfn_vkGetBufferMemoryRequirements);
+    if (!device->pfn_vkCreateBuffer || !device->pfn_vkGetBufferMemoryRequirements) {
+        __android_log_print(ANDROID_LOG_ERROR, "OSH26Vk",
+            "device procs missing; abort createBuffer");
+        return {};
+    }
 
-    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    VkBuffer vk_buffer_handle = VK_NULL_HANDLE;
+    const VkResult vk_res = device->pfn_vkCreateBuffer(
+        static_cast<VkDevice>(device->device),
+        reinterpret_cast<const VkBufferCreateInfo*>(&buffer_create_info),
+        nullptr,
+        &vk_buffer_handle);
+    if (vk_res != VK_SUCCESS) {
+        throw vk::SystemError(static_cast<vk::Result>(vk_res), "vkCreateBuffer failed");
+    }
+    buf->buffer = vk::Buffer(vk_buffer_handle);
 
-    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    VkMemoryRequirements mem_req_vk {};
+    device->pfn_vkGetBufferMemoryRequirements(
+        static_cast<VkDevice>(device->device),
+        static_cast<VkBuffer>(buf->buffer),
+        &mem_req_vk);
+    vk::MemoryRequirements mem_req = mem_req_vk;
+
+    vk::PhysicalDeviceMemoryProperties mem_props = ggml_vk_get_memory_properties(device);
 
     const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
 
@@ -2693,14 +2741,14 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             host_pointer_props = device->device.getMemoryHostPointerPropertiesEXT(vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, import_ptr);
         } catch (vk::SystemError& e) {
             GGML_LOG_WARN("ggml_vulkan: Failed getMemoryHostPointerPropertiesEXT (%s)\n", e.what());
-            device->device.destroyBuffer(buf->buffer);
+            vkDestroyBuffer(static_cast<VkDevice>(device->device), static_cast<VkBuffer>(buf->buffer), nullptr);
             return {};
         }
-        vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+        vk::PhysicalDeviceMemoryProperties mem_props = ggml_vk_get_memory_properties(device);
 
         uint32_t memory_type_idx;
         vk::MemoryPropertyFlags property_flags = *req_flags_list.begin();
-        for (memory_type_idx = 0; memory_type_idx < 32; ++memory_type_idx) {
+        for (memory_type_idx = 0; memory_type_idx < mem_props.memoryTypeCount; ++memory_type_idx) {
             if (!(host_pointer_props.memoryTypeBits & (1u << memory_type_idx))) {
                 continue;
             }
@@ -2715,9 +2763,9 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                 break;
             }
         }
-        if (memory_type_idx == 32) {
+        if (memory_type_idx >= mem_props.memoryTypeCount) {
             GGML_LOG_WARN("ggml_vulkan: Memory type for host allocation not found\n");
-            device->device.destroyBuffer(buf->buffer);
+            vkDestroyBuffer(static_cast<VkDevice>(device->device), static_cast<VkBuffer>(buf->buffer), nullptr);
             return {};
         }
 
@@ -2727,7 +2775,18 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
             import_info.pHostPointer = import_ptr;
             import_info.setPNext(&mem_flags_info);
-            buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
+            vk::MemoryAllocateInfo alloc_info(size, memory_type_idx);
+            alloc_info.setPNext(&import_info);
+            VkDeviceMemory vk_device_memory = VK_NULL_HANDLE;
+            const VkResult alloc_res = vkAllocateMemory(
+                static_cast<VkDevice>(device->device),
+                reinterpret_cast<const VkMemoryAllocateInfo*>(&alloc_info),
+                nullptr,
+                &vk_device_memory);
+            if (alloc_res != VK_SUCCESS) {
+                throw vk::SystemError(static_cast<vk::Result>(alloc_res), "vkAllocateMemory failed");
+            }
+            buf->device_memory = vk::DeviceMemory(vk_device_memory);
         } catch (const vk::SystemError& e) {
         }
     } else {
@@ -2745,14 +2804,25 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
                 try {
-                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                    vk::MemoryAllocateInfo alloc_info(mem_req.size, *mtype_it);
+                    alloc_info.setPNext(&mem_flags_info);
+                    VkDeviceMemory vk_device_memory = VK_NULL_HANDLE;
+                    const VkResult alloc_res = vkAllocateMemory(
+                        static_cast<VkDevice>(device->device),
+                        reinterpret_cast<const VkMemoryAllocateInfo*>(&alloc_info),
+                        nullptr,
+                        &vk_device_memory);
+                    if (alloc_res != VK_SUCCESS) {
+                        throw vk::SystemError(static_cast<vk::Result>(alloc_res), "vkAllocateMemory failed");
+                    }
+                    buf->device_memory = vk::DeviceMemory(vk_device_memory);
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
                     // loop and retry
                     // during last attempt throw the exception
                     if (it + 1 == req_flags_list.end() && mtype_it + 1 == memory_type_indices.end()) {
-                        device->device.destroyBuffer(buf->buffer);
+                        vkDestroyBuffer(static_cast<VkDevice>(device->device), static_cast<VkBuffer>(buf->buffer), nullptr);
                         throw e;
                     }
                 }
@@ -2765,7 +2835,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     }
 
     if (!buf->device_memory) {
-        device->device.destroyBuffer(buf->buffer);
+        vkDestroyBuffer(static_cast<VkDevice>(device->device), static_cast<VkBuffer>(buf->buffer), nullptr);
         throw vk::OutOfDeviceMemoryError("No suitable memory type found");
     }
 
@@ -2775,18 +2845,49 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         buf->ptr = import_ptr;
     } else {
         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-            buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+            void * mapped = nullptr;
+            const VkResult map_res = vkMapMemory(
+                static_cast<VkDevice>(device->device),
+                static_cast<VkDeviceMemory>(buf->device_memory),
+                0,
+                VK_WHOLE_SIZE,
+                0,
+                &mapped);
+            if (map_res != VK_SUCCESS) {
+                throw vk::SystemError(static_cast<vk::Result>(map_res), "vkMapMemory failed");
+            }
+            buf->ptr = mapped;
         }
     }
 
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    const VkResult bind_res = vkBindBufferMemory(
+        static_cast<VkDevice>(device->device),
+        static_cast<VkBuffer>(buf->buffer),
+        static_cast<VkDeviceMemory>(buf->device_memory),
+        0);
+    if (bind_res != VK_SUCCESS) {
+        throw vk::SystemError(static_cast<vk::Result>(bind_res), "vkBindBufferMemory failed");
+    }
 
     buf->device = device;
     buf->size = size;
 
     if (device->buffer_device_address) {
-        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
-        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+        VkBufferDeviceAddressInfo address_info {};
+        address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        address_info.buffer = static_cast<VkBuffer>(buf->buffer);
+        if (device->pfn_vkGetBufferDeviceAddress) {
+            buf->bda_addr = device->pfn_vkGetBufferDeviceAddress(
+                static_cast<VkDevice>(device->device),
+                &address_info);
+        } else if (device->pfn_vkGetBufferDeviceAddressKHR) {
+            buf->bda_addr = device->pfn_vkGetBufferDeviceAddressKHR(
+                static_cast<VkDevice>(device->device),
+                &address_info);
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, "OSH26Vk",
+                "buffer device address requested but function pointer missing; skipping");
+        }
     }
 
     device->memory_logger->log_allocation(buf, size);
@@ -4929,6 +5030,7 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
 static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
 
 static vk_device ggml_vk_get_device(size_t idx) {
+    __android_log_print(ANDROID_LOG_INFO, "OSH26Vk", "ggml_vk_get_device(%zu) called, devices[%zu]=%p", idx, idx, (void*)vk_instance.devices[idx].get());
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
     if (vk_instance.devices[idx] == nullptr) {
@@ -5101,6 +5203,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->support_async = (device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  std::string(device->properties.deviceName.data()).find("(DG1)") == std::string::npos) &&
                                 getenv("GGML_VK_DISABLE_ASYNC") == nullptr;
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            device->support_async = false;
+        }
 
         if (!device->support_async) {
             GGML_LOG_DEBUG("ggml_vulkan: WARNING: Async execution disabled on certain Intel devices.\n");
@@ -5580,7 +5685,76 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setQueueCreateInfos(device_queue_create_infos)
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
-        device->device = device->physical_device.createDevice(device_create_info);
+
+        // Bypass Vulkan-Hpp dispatch for createDevice to avoid VK_HEADER_VERSION
+        // mismatch between vendored vulkan.hpp (351) and NDK C headers (275).
+        // The dispatch table layout mismatch causes Vulkan-Hpp createDevice to
+        // return a NULL VkDevice handle on Qualcomm Adreno (Android 13+).
+        {
+            VkDevice vk_device = VK_NULL_HANDLE;
+            VkResult vk_res = vkCreateDevice(
+                static_cast<VkPhysicalDevice>(device->physical_device),
+                reinterpret_cast<const VkDeviceCreateInfo*>(&device_create_info),
+                nullptr,
+                &vk_device);
+            __android_log_print(ANDROID_LOG_INFO, "OSH26Vk", "vkCreateDevice result=%d dev=%p", vk_res, (void*)vk_device);
+            if (vk_res == VK_SUCCESS) {
+                device->device = vk::Device(vk_device);
+            } else {
+                __android_log_print(ANDROID_LOG_ERROR, "OSH26Vk", "vkCreateDevice FAILED with %d, falling back to empty device", vk_res);
+            }
+        }
+        __android_log_print(ANDROID_LOG_INFO, "OSH26Vk", "createDevice OK: %p", (void*)static_cast<VkDevice>(device->device));
+
+        device->pfn_vkCreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(
+            vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkCreateBuffer"));
+        device->pfn_vkGetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(
+            vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkGetBufferMemoryRequirements"));
+        device->pfn_vkGetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+            vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkGetBufferDeviceAddress"));
+        device->pfn_vkGetBufferDeviceAddressKHR = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(
+            vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkGetBufferDeviceAddressKHR"));
+        __android_log_print(ANDROID_LOG_INFO, "OSH26Vk",
+            "device procs: vkCreateBuffer=%p vkGetBufferMemoryRequirements=%p vkGetBufferDeviceAddress=%p vkGetBufferDeviceAddressKHR=%p",
+            (void*)device->pfn_vkCreateBuffer,
+            (void*)device->pfn_vkGetBufferMemoryRequirements,
+            (void*)device->pfn_vkGetBufferDeviceAddress,
+            (void*)device->pfn_vkGetBufferDeviceAddressKHR);
+        if (!device->pfn_vkCreateBuffer || !device->pfn_vkGetBufferMemoryRequirements) {
+            __android_log_print(ANDROID_LOG_ERROR, "OSH26Vk",
+                "device procs missing; vkCreateBuffer=%p vkGetBufferMemoryRequirements=%p",
+                (void*)device->pfn_vkCreateBuffer,
+                (void*)device->pfn_vkGetBufferMemoryRequirements);
+            throw std::runtime_error("Vulkan device procs missing");
+        }
+        if (device->buffer_device_address &&
+            !device->pfn_vkGetBufferDeviceAddress &&
+            !device->pfn_vkGetBufferDeviceAddressKHR) {
+            __android_log_print(ANDROID_LOG_WARN, "OSH26Vk",
+                "buffer device address requested but function pointer missing; disabling BDA");
+            device->buffer_device_address = false;
+        }
+
+        // Initialize global dispatcher with instance-level resolution only.
+        // On Android, vkGetInstanceProcAddr resolves ALL Vulkan functions
+        // (including device-level). DO NOT pass device here - vkGetDeviceProcAddr
+        // may return NULL for functions gated by extensions not explicitly enabled,
+        // overwriting valid instance-level pointers.
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(
+            static_cast<VkInstance>(vk_instance.instance),
+            ::vkGetInstanceProcAddr);
+
+        __android_log_print(ANDROID_LOG_INFO, "OSH26Vk", "dispatch init done, vkCreateBuffer=%p vkCreateDevice=%p vkGetBufferDeviceAddress=%p vkWaitSemaphores=%p",
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores);
+
+        __android_log_print(ANDROID_LOG_INFO, "OSH26Vk", "dispatch init done, vkCreateBuffer=%p vkCreateDevice=%p vkGetBufferDeviceAddress=%p vkWaitSemaphores=%p",
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDevice,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress,
+            (void*)VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores);
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
@@ -6527,8 +6701,14 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
             size/1024.0/1024.0);
-        device->device.freeMemory(buf->device_memory);
-        device->device.destroyBuffer(buf->buffer);
+        vkFreeMemory(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkDeviceMemory>(buf->device_memory),
+            nullptr);
+        vkDestroyBuffer(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkBuffer>(buf->buffer),
+            nullptr);
         return nullptr;
     }
 
@@ -15469,11 +15649,12 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->type        = ggml_backend_vk_device_get_type(dev);
     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
     ggml_backend_vk_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    const vk_device& device = ggml_vk_get_device(ctx->device);
     props->caps = {
-        /* .async                 = */ true,
+        /* .async                 = */ device->support_async,
         /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ true,
+        /* .events                = */ device->support_async,
     };
 }
 
@@ -16062,10 +16243,23 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
     // No events initially, they get created on demand
     vkev->has_event = false;
 
-    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
-    vk::SemaphoreCreateInfo ci{};
-    ci.setPNext(&tci);
-    vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
+    VkSemaphoreTypeCreateInfo tci {};
+    tci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    tci.initialValue = 0;
+
+    VkSemaphoreCreateInfo ci {};
+    ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    ci.pNext = &tci;
+
+    VkSemaphore sem = VK_NULL_HANDLE;
+    VkResult sem_res = vkCreateSemaphore(static_cast<VkDevice>(device->device), &ci, nullptr, &sem);
+    if (sem_res != VK_SUCCESS || sem == VK_NULL_HANDLE) {
+        fprintf(stderr, "ggml_vulkan: vkCreateSemaphore failed %d at %s:%d\n", sem_res, __FILE__, __LINE__);
+        exit(1);
+    }
+
+    vkev->tl_semaphore = { vk::Semaphore(sem), 0 };
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -16079,15 +16273,27 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroySemaphore(vkev->tl_semaphore.s);
+    vkDestroySemaphore(
+        static_cast<VkDevice>(device->device),
+        static_cast<VkSemaphore>(vkev->tl_semaphore.s),
+        nullptr);
     for (auto& event : vkev->events_free) {
-        device->device.destroyEvent(event);
+        vkDestroyEvent(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkEvent>(event),
+            nullptr);
     }
     for (auto& event : vkev->events_submitted) {
-        device->device.destroyEvent(event);
+        vkDestroyEvent(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkEvent>(event),
+            nullptr);
     }
     if (vkev->has_event) {
-        device->device.destroyEvent(vkev->event);
+        vkDestroyEvent(
+            static_cast<VkDevice>(device->device),
+            static_cast<VkEvent>(vkev->event),
+            nullptr);
     }
     delete vkev;
     delete event;
@@ -16103,12 +16309,27 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     if (vkev->has_event) {
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
-        vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
-        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize");
+        VkSemaphore sem_vk = static_cast<VkSemaphore>(sem);
+        VkSemaphoreWaitInfo wait_info {};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.flags = 0;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &sem_vk;
+        wait_info.pValues = &val;
+        VkResult wait_res = vkWaitSemaphores(
+            static_cast<VkDevice>(device->device),
+            &wait_info,
+            UINT64_MAX);
+        if (wait_res != VK_SUCCESS) {
+            fprintf(stderr, "ggml_vulkan: vkWaitSemaphores failed %d at %s:%d\n", wait_res, __FILE__, __LINE__);
+            exit(1);
+        }
 
         // Reset and move submitted events
         for (auto& event : vkev->events_submitted) {
-            device->device.resetEvent(event);
+            vkResetEvent(
+                static_cast<VkDevice>(device->device),
+                static_cast<VkEvent>(event));
         }
         vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
         vkev->events_submitted.clear();
