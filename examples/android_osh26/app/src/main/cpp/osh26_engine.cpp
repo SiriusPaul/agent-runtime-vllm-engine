@@ -228,13 +228,15 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
 
     llama_model_params model_params = llama_model_default_params();
-    const bool try_gpu = llama_supports_gpu_offload() && has_gpu_backend_device();
-    model_params.n_gpu_layers = try_gpu ? -1 : 0;
+    const bool force_cpu = requested_backend_ == "cpu";
+    const bool force_vulkan = requested_backend_ == "vulkan";
+    const bool try_gpu = !force_cpu && llama_supports_gpu_offload() && has_gpu_backend_device();
+    model_params.n_gpu_layers = try_gpu ? requested_gpu_layers_ : 0;
     model_params.use_mmap = false;
     model_params.use_mlock = false;
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     active_backend_ = try_gpu ? "llama.cpp Vulkan" : "llama.cpp CPU";
-    if (model_ == nullptr && try_gpu) {
+    if (model_ == nullptr && try_gpu && !force_vulkan) {
         __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "Vulkan model load failed; retrying CPU backend");
         model_params.n_gpu_layers = 0;
         model_ = llama_model_load_from_file(model_path.c_str(), model_params);
@@ -257,7 +259,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     ctx_params.op_offload = try_gpu && active_backend_ == "llama.cpp Vulkan";
     ctx_params.no_perf = false;
     ctx_ = llama_init_from_model(model_, ctx_params);
-    if (ctx_ == nullptr && active_backend_ == "llama.cpp Vulkan") {
+    if (ctx_ == nullptr && active_backend_ == "llama.cpp Vulkan" && !force_vulkan) {
         llama_model_free(model_);
         model_params.n_gpu_layers = 0;
         model_ = llama_model_load_from_file(model_path.c_str(), model_params);
@@ -365,6 +367,10 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         }
 
         std::string piece = token_to_text(vocab, token);
+        if (!result.token_ids.empty()) {
+            result.token_ids += ",";
+        }
+        result.token_ids += std::to_string(token);
         if (!piece.empty()) {
             result.text += piece;
             if (on_token) {
@@ -397,8 +403,19 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     last_tokens_per_second_ = result.tokens_per_second;
     last_finish_reason_ = result.finish_reason;
     last_error_ = result.error;
+    last_token_ids_ = result.token_ids;
     running_ = false;
     return result;
+}
+
+void ComputeBackend::configure_backend(const std::string & mode, int n_gpu_layers) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mode == "cpu" || mode == "vulkan" || mode == "auto") {
+        requested_backend_ = mode;
+    } else {
+        requested_backend_ = "auto";
+    }
+    requested_gpu_layers_ = n_gpu_layers;
 }
 
 void ComputeBackend::cancel() {
@@ -425,6 +442,8 @@ std::string ComputeBackend::stats_json() const {
     std::ostringstream out;
     out << "{\n"
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
+        << "  \"requested_backend\": \"" << json_escape(requested_backend_) << "\",\n"
+        << "  \"requested_gpu_layers\": " << requested_gpu_layers_ << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
@@ -437,7 +456,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_ttft_ms\": " << last_ttft_ms_ << ",\n"
         << "  \"last_tokens_per_second\": " << last_tokens_per_second_ << ",\n"
         << "  \"last_finish_reason\": \"" << json_escape(last_finish_reason_) << "\",\n"
-        << "  \"last_error\": \"" << json_escape(last_error_) << "\"\n"
+        << "  \"last_error\": \"" << json_escape(last_error_) << "\",\n"
+        << "  \"last_token_ids\": \"" << json_escape(last_token_ids_) << "\"\n"
         << "}";
     return out.str();
 }
@@ -448,6 +468,10 @@ std::string SchedulerLite::load_model(const std::string & model_path) {
 
 GenerateResult SchedulerLite::generate(const std::string & prompt, const GenerateOptions & options, const TokenCallback & on_token) {
     return backend_.generate(prompt, options, on_token);
+}
+
+void SchedulerLite::configure_backend(const std::string & mode, int n_gpu_layers) {
+    backend_.configure_backend(mode, n_gpu_layers);
 }
 
 void SchedulerLite::cancel() {

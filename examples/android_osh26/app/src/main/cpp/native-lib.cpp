@@ -52,6 +52,7 @@ std::string result_to_json(const osh26::GenerateResult & result) {
             + ",\"ttft_ms\":" + std::to_string(result.ttft_ms)
             + ",\"tokens_per_second\":" + std::to_string(result.tokens_per_second)
             + ",\"error\":\"" + json_escape(result.error) + "\""
+            + ",\"token_ids\":\"" + json_escape(result.token_ids) + "\""
             + ",\"text\":\"" + json_escape(result.text) + "\""
             + "}";
 }
@@ -140,6 +141,11 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_osh26_llama_LlamaNative_loadModel(JNIEnv * env, jclass, jstring j_model_path) {
     return string_to_jstring(env, osh26::engine().load_model(jstring_to_string(env, j_model_path)));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_osh26_llama_LlamaNative_configureBackend(JNIEnv * env, jclass, jstring j_mode, jint n_gpu_layers) {
+    osh26::engine().configure_backend(jstring_to_string(env, j_mode), n_gpu_layers);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

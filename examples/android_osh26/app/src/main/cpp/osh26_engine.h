@@ -29,6 +29,7 @@ struct GenerateResult {
     std::string finish_reason = "stop";
     std::string error;
     std::string text;
+    std::string token_ids;
 };
 
 class ComputeBackend {
@@ -38,6 +39,7 @@ public:
 
     std::string load_model(const std::string & model_path);
     GenerateResult generate(const std::string & prompt, const GenerateOptions & options, const TokenCallback & on_token);
+    void configure_backend(const std::string & mode, int n_gpu_layers);
     void cancel();
     void release();
     std::string stats_json() const;
@@ -58,12 +60,16 @@ private:
     std::string last_error_;
     std::string active_backend_ = "llama.cpp CPU";
     std::string available_devices_;
+    std::string requested_backend_ = "auto";
+    int requested_gpu_layers_ = -1;
+    std::string last_token_ids_;
 };
 
 class SchedulerLite {
 public:
     std::string load_model(const std::string & model_path);
     GenerateResult generate(const std::string & prompt, const GenerateOptions & options, const TokenCallback & on_token);
+    void configure_backend(const std::string & mode, int n_gpu_layers);
     void cancel();
     void release();
     std::string stats_json() const;
