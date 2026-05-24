@@ -112,6 +112,10 @@ if (Vulkan_FOUND)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_SHADER_DEBUG_INFO=ON)
     endif()
 
+    if (GGML_VULKAN_SHADER_TARGET)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_SHADER_TARGET=${GGML_VULKAN_SHADER_TARGET})
+    endif()
+
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()
@@ -172,6 +176,10 @@ if (Vulkan_FOUND)
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+    set (_ggml_vk_shader_target_args "")
+    if (GGML_VULKAN_SHADER_TARGET)
+        set(_ggml_vk_shader_target_args --target-env ${GGML_VULKAN_SHADER_TARGET})
+    endif()
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
@@ -188,6 +196,7 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_shader_target_args}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
@@ -207,6 +216,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_shader_target_args}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

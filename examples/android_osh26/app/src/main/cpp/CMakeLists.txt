@@ -31,8 +31,10 @@ set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN_CHECK_RESULTS ON CACHE BOOL "" FORCE)
 set(GGML_VULKAN_VALIDATE OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN_RUN_TESTS OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN_SHADER_TARGET vulkan1.1 CACHE STRING "" FORCE)
 
 if (ANDROID AND CMAKE_ANDROID_NDK)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
@@ -57,7 +59,8 @@ endif()
 
 add_library(llama_osh26 SHARED
     native-lib.cpp
-    osh26_engine.cpp)
+    osh26_engine.cpp
+    vulkan_test.c)
 
 target_compile_features(llama_osh26 PRIVATE cxx_std_17)
 

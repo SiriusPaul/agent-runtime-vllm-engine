@@ -25,7 +25,7 @@
 #elif 199711L < VULKAN_HPP_CPLUSPLUS
 #  define VULKAN_HPP_CPP_VERSION 11
 #else
-#  error "vulkan.hpp needs at least c++ standard version 11"
+#  error "vulkansc.hpp needs at least c++ standard version 11"
 #endif
 
 // include headers holding feature-test macros

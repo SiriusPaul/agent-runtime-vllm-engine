@@ -41,6 +41,7 @@ std::string input_filepath = "";
 std::string output_dir = "/tmp";
 std::string target_hpp = "";
 std::string target_cpp = "";
+std::string shader_target_env = "vulkan1.1";
 
 const std::vector<std::string> type_names = {
     "f32",
@@ -325,7 +326,8 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+    std::string target_env_name = (name.find("_cm2") != std::string::npos) ? "vulkan1.3" : shader_target_env;
+    std::string target_env = "--target-env=" + target_env_name;
 
     #ifdef _WIN32
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
@@ -1186,6 +1188,9 @@ int main(int argc, char** argv) {
     }
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file
+    }
+    if (args.find("--target-env") != args.end() && !args["--target-env"].empty()) {
+        shader_target_env = args["--target-env"]; // glslc --target-env value for non-coopmat2 shaders
     }
 
     if (!directory_exists(output_dir)) {
