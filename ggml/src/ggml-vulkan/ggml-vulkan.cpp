@@ -633,6 +633,46 @@ struct vk_device_struct {
     PFN_vkGetBufferDeviceAddressKHR pfn_vkGetBufferDeviceAddressKHR = nullptr;
     PFN_vkWaitSemaphores pfn_vkWaitSemaphores = nullptr;
     PFN_vkWaitSemaphoresKHR pfn_vkWaitSemaphoresKHR = nullptr;
+    /* Pure-C bypass: all Vulkan functions used */
+    PFN_vkCreateShaderModule pfn_vkCreateShaderModule = nullptr;
+    PFN_vkDestroyShaderModule pfn_vkDestroyShaderModule = nullptr;
+    PFN_vkCreateDescriptorSetLayout pfn_vkCreateDescriptorSetLayout = nullptr;
+    PFN_vkDestroyDescriptorSetLayout pfn_vkDestroyDescriptorSetLayout = nullptr;
+    PFN_vkCreatePipelineLayout pfn_vkCreatePipelineLayout = nullptr;
+    PFN_vkDestroyPipelineLayout pfn_vkDestroyPipelineLayout = nullptr;
+    PFN_vkCreateComputePipelines pfn_vkCreateComputePipelines = nullptr;
+    PFN_vkDestroyPipeline pfn_vkDestroyPipeline = nullptr;
+    PFN_vkCreateDescriptorPool pfn_vkCreateDescriptorPool = nullptr;
+    PFN_vkDestroyDescriptorPool pfn_vkDestroyDescriptorPool = nullptr;
+    PFN_vkAllocateDescriptorSets pfn_vkAllocateDescriptorSets = nullptr;
+    PFN_vkUpdateDescriptorSets pfn_vkUpdateDescriptorSets = nullptr;
+    PFN_vkFreeDescriptorSets pfn_vkFreeDescriptorSets = nullptr;
+    PFN_vkCreateCommandPool pfn_vkCreateCommandPool = nullptr;
+    PFN_vkDestroyCommandPool pfn_vkDestroyCommandPool = nullptr;
+    PFN_vkAllocateCommandBuffers pfn_vkAllocateCommandBuffers = nullptr;
+    PFN_vkFreeCommandBuffers pfn_vkFreeCommandBuffers = nullptr;
+    PFN_vkBeginCommandBuffer pfn_vkBeginCommandBuffer = nullptr;
+    PFN_vkEndCommandBuffer pfn_vkEndCommandBuffer = nullptr;
+    PFN_vkCmdBindPipeline pfn_vkCmdBindPipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets pfn_vkCmdBindDescriptorSets = nullptr;
+    PFN_vkCmdDispatch pfn_vkCmdDispatch = nullptr;
+    PFN_vkCmdPushConstants pfn_vkCmdPushConstants = nullptr;
+    PFN_vkQueueSubmit pfn_vkQueueSubmit = nullptr;
+    PFN_vkCreateFence pfn_vkCreateFence = nullptr;
+    PFN_vkDestroyFence pfn_vkDestroyFence = nullptr;
+    PFN_vkWaitForFences pfn_vkWaitForFences = nullptr;
+    PFN_vkCreateSemaphore pfn_vkCreateSemaphore = nullptr;
+    PFN_vkDestroySemaphore pfn_vkDestroySemaphore = nullptr;
+    PFN_vkResetCommandPool pfn_vkResetCommandPool = nullptr;
+    PFN_vkGetDeviceProcAddr pfn_vkGetDeviceProcAddr = nullptr;
+    PFN_vkCmdCopyBuffer pfn_vkCmdCopyBuffer = nullptr;
+    PFN_vkCreateEvent pfn_vkCreateEvent = nullptr;
+    PFN_vkDestroyEvent pfn_vkDestroyEvent = nullptr;
+    PFN_vkCmdSetEvent pfn_vkCmdSetEvent = nullptr;
+    PFN_vkCmdResetEvent pfn_vkCmdResetEvent = nullptr;
+    PFN_vkCmdWaitEvents pfn_vkCmdWaitEvents = nullptr;
+    PFN_vkGetEventStatus pfn_vkGetEventStatus = nullptr;
+    PFN_vkCmdPipelineBarrier pfn_vkCmdPipelineBarrier = nullptr;
     uint32_t vendor_id {};
     vk::DriverId driver_id {};
     vk_device_architecture architecture {};
@@ -2239,7 +2279,18 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         shader_module_create_info = vk::ShaderModuleCreateInfo({}, spirv.size() * sizeof(uint32_t), spirv.data());
     }
 
-    pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
+    {
+        VkShaderModuleCreateInfo smci = {
+            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            shader_module_create_info.pNext,
+            static_cast<VkShaderModuleCreateFlags>(shader_module_create_info.flags),
+            shader_module_create_info.codeSize,
+            reinterpret_cast<const uint32_t*>(shader_module_create_info.pCode)
+        };
+        VkShaderModule sm;
+        device->pfn_vkCreateShaderModule(static_cast<VkDevice>(device->device), &smci, nullptr, &sm);
+        pipeline->shader_module = vk::ShaderModule(sm);
+    }
 
     vk::PushConstantRange pcr(
         vk::ShaderStageFlagBits::eCompute,
@@ -2314,7 +2365,23 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
-        pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+        // Pure C API: bypass Vulkan-Hpp for pipeline creation
+        VkComputePipelineCreateInfo cpci = {
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            compute_pipeline_create_info.pNext,
+            static_cast<VkPipelineCreateFlags>(compute_pipeline_create_info.flags),
+            *reinterpret_cast<const VkPipelineShaderStageCreateInfo*>(&pipeline_shader_create_info),
+            static_cast<VkPipelineLayout>(pipeline->layout),
+            compute_pipeline_create_info.basePipelineHandle,
+            compute_pipeline_create_info.basePipelineIndex
+        };
+        VkPipeline vk_pipe;
+        VkResult pipe_res = device->pfn_vkCreateComputePipelines(
+            static_cast<VkDevice>(device->device), VK_NULL_HANDLE, 1, &cpci, nullptr, &vk_pipe);
+        if (pipe_res != VK_SUCCESS) {
+            throw vk::SystemError(static_cast<vk::Result>(pipe_res), "pipeline creation failed (C API)");
+        }
+        pipeline->pipeline = vk::Pipeline(vk_pipe);
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -5106,7 +5173,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->architecture = get_device_architecture(device->physical_device);
 
         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
-        device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
+        device->prefer_host_memory = device->vendor_id == VK_VENDOR_ID_QUALCOMM ||
+                                     GGML_VK_PREFER_HOST_MEMORY != nullptr;
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
@@ -5115,7 +5183,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
-        device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+        device->disable_graph_optimize = device->vendor_id == VK_VENDOR_ID_QUALCOMM ||
+                                          GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -5585,6 +5654,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
+        // Qualcomm Adreno: shaderInt64 often buggy, force disable
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            GGML_VK_ANDROID_LOG(ANDROID_LOG_INFO, "OSH26Vk", "disabling shader_int64 on Qualcomm device");
+            device->shader_int64 = false;
+        }
         device->buffer_device_address = api_1_2 ?
                 vk12_features.bufferDeviceAddress :
                 buffer_device_address_features.bufferDeviceAddress;
@@ -5881,6 +5955,32 @@ static vk_device ggml_vk_get_device(size_t idx) {
             vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkWaitSemaphores"));
         device->pfn_vkWaitSemaphoresKHR = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
             vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), "vkWaitSemaphoresKHR"));
+        // Pure-C bypass: resolve ALL Vulkan functions we use
+        #define LOAD_DEV_PFN(name) device->pfn_##name = reinterpret_cast<PFN_##name>( \
+            vkGetDeviceProcAddr(static_cast<VkDevice>(device->device), #name))
+        LOAD_DEV_PFN(vkCreateShaderModule);   LOAD_DEV_PFN(vkDestroyShaderModule);
+        LOAD_DEV_PFN(vkCreateDescriptorSetLayout); LOAD_DEV_PFN(vkDestroyDescriptorSetLayout);
+        LOAD_DEV_PFN(vkCreatePipelineLayout);  LOAD_DEV_PFN(vkDestroyPipelineLayout);
+        LOAD_DEV_PFN(vkCreateComputePipelines); LOAD_DEV_PFN(vkDestroyPipeline);
+        LOAD_DEV_PFN(vkCreateDescriptorPool);  LOAD_DEV_PFN(vkDestroyDescriptorPool);
+        LOAD_DEV_PFN(vkAllocateDescriptorSets); LOAD_DEV_PFN(vkUpdateDescriptorSets);
+        LOAD_DEV_PFN(vkFreeDescriptorSets);
+        LOAD_DEV_PFN(vkCreateCommandPool);     LOAD_DEV_PFN(vkDestroyCommandPool);
+        LOAD_DEV_PFN(vkAllocateCommandBuffers); LOAD_DEV_PFN(vkFreeCommandBuffers);
+        LOAD_DEV_PFN(vkBeginCommandBuffer);    LOAD_DEV_PFN(vkEndCommandBuffer);
+        LOAD_DEV_PFN(vkCmdBindPipeline);       LOAD_DEV_PFN(vkCmdBindDescriptorSets);
+        LOAD_DEV_PFN(vkCmdDispatch);           LOAD_DEV_PFN(vkCmdPushConstants);
+        LOAD_DEV_PFN(vkQueueSubmit);           LOAD_DEV_PFN(vkCreateFence);
+        LOAD_DEV_PFN(vkDestroyFence);          LOAD_DEV_PFN(vkWaitForFences);
+        LOAD_DEV_PFN(vkCreateSemaphore);       LOAD_DEV_PFN(vkDestroySemaphore);
+        LOAD_DEV_PFN(vkResetCommandPool);
+        LOAD_DEV_PFN(vkGetDeviceProcAddr);
+        LOAD_DEV_PFN(vkCmdCopyBuffer);
+        LOAD_DEV_PFN(vkCreateEvent);           LOAD_DEV_PFN(vkDestroyEvent);
+        LOAD_DEV_PFN(vkCmdSetEvent);           LOAD_DEV_PFN(vkCmdResetEvent);
+        LOAD_DEV_PFN(vkCmdWaitEvents);         LOAD_DEV_PFN(vkGetEventStatus);
+        LOAD_DEV_PFN(vkCmdPipelineBarrier);
+        #undef LOAD_DEV_PFN
         GGML_VK_ANDROID_LOG(ANDROID_LOG_INFO, "OSH26Vk",
             "device procs: vkCreateBuffer=%p vkGetBufferMemoryRequirements=%p vkGetBufferDeviceAddress=%p vkGetBufferDeviceAddressKHR=%p vkWaitSemaphores=%p vkWaitSemaphoresKHR=%p",
             (void*)device->pfn_vkCreateBuffer,
@@ -7056,18 +7156,26 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
-    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
-    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+    VkDescriptorSet descriptor_set = static_cast<VkDescriptorSet>(ctx->descriptor_sets[ctx->descriptor_set_idx++]);
+    {
+        VkWriteDescriptorSet wds = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            descriptor_set, 0, 0, (uint32_t)pipeline->parameter_count,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr,
+            reinterpret_cast<const VkDescriptorBufferInfo*>(descriptor_buffer_infos.begin()), nullptr};
+        ctx->device->pfn_vkUpdateDescriptorSets(static_cast<VkDevice>(ctx->device->device), 1, &wds, 0, nullptr);
+    }
 
-    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
-    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
-    subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
-                                pipeline->layout,
-                                0,
-                                { descriptor_set },
-                                {});
-    subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+    {
+        VkCommandBuffer cb = static_cast<VkCommandBuffer>(subctx->s->buffer->buf);
+        VkPipelineLayout pl = static_cast<VkPipelineLayout>(pipeline->layout);
+        VkPipeline vk_pipe = static_cast<VkPipeline>(pipeline->pipeline);
+
+        ctx->device->pfn_vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            push_constant_size(push_constants), push_constant_data(push_constants));
+        ctx->device->pfn_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipe);
+        ctx->device->pfn_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &descriptor_set, 0, nullptr);
+        ctx->device->pfn_vkCmdDispatch(cb, wg0, wg1, wg2);
+    }
 }
 
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {

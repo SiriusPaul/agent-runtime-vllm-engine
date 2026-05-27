@@ -1,0 +1,12 @@
+#version 450
+// z[i] = SiLU(a[i]) * b[i] = a[i]/(1+exp(-a[i])) * b[i]
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(push_constant) uniform P { uint n; } pc;
+layout(set=0,binding=0,std430) readonly  buffer A { float a[]; };
+layout(set=0,binding=1,std430) readonly  buffer B { float b[]; };
+layout(set=0,binding=2,std430) writeonly buffer Z { float z[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x; if (i >= pc.n) return;
+    float av = a[i]; float sx = 1.0 / (1.0 + exp(-av));
+    z[i] = av * sx * b[i];
+}

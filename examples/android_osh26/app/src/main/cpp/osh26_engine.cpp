@@ -1,4 +1,5 @@
 #include "osh26_engine.h"
+#include "osh26_vk_gpu.h"
 
 #include <android/log.h>
 #include "ggml-backend.h"
@@ -101,6 +102,33 @@ std::string describe_backend_devices() {
     return out.str();
 }
 
+std::string describe_osh26_vk_stats() {
+    osh26_vk_stats stats {};
+    if (osh26_vk_get_stats(&stats) != 0) {
+        return "{}";
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"ready\":" << (stats.ready ? "true" : "false") << ","
+        << "\"registered\":" << (stats.registered ? "true" : "false") << ","
+        << "\"graph_compute_calls\":" << stats.graph_compute_calls << ","
+        << "\"mul_mat_dispatches\":" << stats.mul_mat_dispatches << ","
+        << "\"rms_norm_dispatches\":" << stats.rms_norm_dispatches << ","
+        << "\"buffers_allocated\":" << stats.buffers_allocated << ","
+        << "\"buffers_freed\":" << stats.buffers_freed << ","
+        << "\"current_buffer_bytes\":" << stats.current_buffer_bytes << ","
+        << "\"peak_buffer_bytes\":" << stats.peak_buffer_bytes << ","
+        << "\"expanded_tensor_uploads\":" << stats.expanded_tensor_uploads << ","
+        << "\"expanded_upload_bytes\":" << stats.expanded_upload_bytes << ","
+        << "\"f16_uploads\":" << stats.f16_uploads << ","
+        << "\"bf16_uploads\":" << stats.bf16_uploads << ","
+        << "\"q4_k_uploads\":" << stats.q4_k_uploads << ","
+        << "\"q6_k_uploads\":" << stats.q6_k_uploads
+        << "}";
+    return out.str();
+}
+
 bool has_gpu_backend_device() {
     const size_t count = ggml_backend_dev_count();
     for (size_t i = 0; i < count; ++i) {
@@ -145,6 +173,7 @@ void init_llama_backend() {
         llama_log_set(android_llama_log, nullptr);
         ggml_backend_load_all();
         llama_backend_init();
+        osh26_vk_gpu_init();
     });
 }
 
@@ -227,25 +256,24 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         model_ = nullptr;
     }
 
+    // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
-    const bool force_cpu = requested_backend_ == "cpu";
-    const bool force_vulkan = requested_backend_ == "vulkan";
-    const bool try_gpu = !force_cpu && llama_supports_gpu_offload() && has_gpu_backend_device();
-    model_params.n_gpu_layers = try_gpu ? requested_gpu_layers_ : 0;
+    model_params.n_gpu_layers = 0;
     model_params.use_mmap = false;
     model_params.use_mlock = false;
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
-    active_backend_ = try_gpu ? "llama.cpp Vulkan" : "llama.cpp CPU";
-    if (model_ == nullptr && try_gpu && !force_vulkan) {
-        __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "Vulkan model load failed; retrying CPU backend");
-        model_params.n_gpu_layers = 0;
-        model_ = llama_model_load_from_file(model_path.c_str(), model_params);
-        active_backend_ = "llama.cpp CPU fallback";
-    }
     if (model_ == nullptr) {
         model_path_.clear();
         last_error_ = "failed to load model: " + model_path + " (" + file_info + ")";
         return last_error_;
+    }
+    // Load weights into GPU pool
+    if (osh26_vk_gpu_load_model(model_path.c_str()) == 0) {
+        active_backend_ = "OSH26 GPU Runtime";
+        __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "GPU model loaded");
+    } else {
+        active_backend_ = "CPU (GPU load failed)";
+        __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "GPU model load failed");
     }
 
     llama_context_params ctx_params = llama_context_default_params();
@@ -255,21 +283,13 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     ctx_params.n_seq_max = kDefaultMaxSeq;
     ctx_params.n_threads = default_thread_count();
     ctx_params.n_threads_batch = ctx_params.n_threads;
-    ctx_params.offload_kqv = try_gpu && active_backend_ == "llama.cpp Vulkan";
-    ctx_params.op_offload = try_gpu && active_backend_ == "llama.cpp Vulkan";
+    // The custom Vulkan backend does not implement the KV update/attention ops yet.
+    // Keep KV cache in CPU memory while allowing layer weights and supported matmuls on GPU.
+    ctx_params.offload_kqv = false;
+    ctx_params.op_offload = false;
     ctx_params.no_perf = false;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_ = llama_init_from_model(model_, ctx_params);
-    if (ctx_ == nullptr && active_backend_ == "llama.cpp Vulkan" && !force_vulkan) {
-        llama_model_free(model_);
-        model_params.n_gpu_layers = 0;
-        model_ = llama_model_load_from_file(model_path.c_str(), model_params);
-        active_backend_ = "llama.cpp CPU fallback";
-        ctx_params.offload_kqv = false;
-        ctx_params.op_offload = false;
-        if (model_ != nullptr) {
-            ctx_ = llama_init_from_model(model_, ctx_params);
-        }
-    }
     if (ctx_ == nullptr) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -331,54 +351,80 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(options.temperature));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(options.seed));
 
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
-    int n_pos = 0;
-    bool first_token = true;
     const int max_tokens = std::max(1, std::min(options.max_tokens, kDefaultContextSize - n_prompt));
     bool hit_eog = false;
     bool hit_limit = true;
 
+    bool use_gpu = osh26_vk_gpu_ready();
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+    int n_pos = 0;
+    bool first_token = true;
+
     for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
-        if (cancel_requested_.load()) {
-            result.cancelled = true;
-            hit_limit = false;
-            break;
-        }
+        if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
-        const int decode_status = llama_decode(ctx_, batch);
-        if (decode_status != 0) {
-            result.error = "llama_decode failed: " + std::to_string(decode_status);
-            hit_limit = false;
-            break;
-        }
+        if (use_gpu) {
+            llama_token * tok_data = (llama_token *)batch.token;
+            int nt = batch.n_tokens;
+            osh26_vk_gpu_forward((int *)tok_data, nt, n_pos);
+            n_pos += nt;
 
-        n_pos += batch.n_tokens;
-        llama_token token = llama_sampler_sample(sampler, ctx_, -1);
-        if (llama_vocab_is_eog(vocab, token)) {
-            hit_eog = true;
-            hit_limit = false;
-            break;
-        }
-
-        if (first_token) {
-            const auto now = std::chrono::steady_clock::now();
-            result.ttft_ms = std::chrono::duration<double, std::milli>(now - start).count();
-            first_token = false;
-        }
-
-        std::string piece = token_to_text(vocab, token);
-        if (!result.token_ids.empty()) {
-            result.token_ids += ",";
-        }
-        result.token_ids += std::to_string(token);
-        if (!piece.empty()) {
-            result.text += piece;
-            if (on_token) {
-                on_token(piece);
+            // Sample from GPU logits (pre-allocated candidates array, reused)
+            const float * logits = osh26_vk_gpu_logits();
+            int n_vocab = llama_vocab_n_tokens(vocab);
+            static std::vector<llama_token_data> s_candidates;
+            if ((int)s_candidates.size() < n_vocab)
+                s_candidates.resize((size_t)n_vocab);
+            for (int i = 0; i < n_vocab; i++)
+                s_candidates[i] = { (llama_token)i, logits[i], 0.0f };
+            llama_token_data_array cur_p = {
+                s_candidates.data(), (size_t)n_vocab, -1, false };
+            llama_sampler_apply(sampler, &cur_p);
+            if (cur_p.selected < 0 || (size_t)cur_p.selected >= cur_p.size) {
+                result.error = "sampler returned invalid index";
+                hit_limit = false; break;
             }
+            llama_token token = cur_p.data[cur_p.selected].id;
+
+            if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+
+            if (first_token) {
+                result.ttft_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                first_token = false;
+            }
+
+            std::string piece = token_to_text(vocab, token);
+            if (!result.token_ids.empty()) result.token_ids += ",";
+            result.token_ids += std::to_string(token);
+            if (!piece.empty()) { result.text += piece; if (on_token) on_token(piece); }
+            batch = llama_batch_get_one(&token, 1);
+            result.decoded_tokens += 1;
+        } else {
+            // CPU path via llama_decode
+            const int decode_status = llama_decode(ctx_, batch);
+            if (decode_status != 0) {
+                result.error = "llama_decode failed: " + std::to_string(decode_status);
+                hit_limit = false; break;
+            }
+
+            n_pos += batch.n_tokens;
+            llama_token token = llama_sampler_sample(sampler, ctx_, -1);
+            if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+
+            if (first_token) {
+                result.ttft_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                first_token = false;
+            }
+
+            std::string piece = token_to_text(vocab, token);
+            if (!result.token_ids.empty()) result.token_ids += ",";
+            result.token_ids += std::to_string(token);
+            if (!piece.empty()) { result.text += piece; if (on_token) on_token(piece); }
+            batch = llama_batch_get_one(&token, 1);
+            result.decoded_tokens += 1;
         }
-        batch = llama_batch_get_one(&token, 1);
-        result.decoded_tokens += 1;
     }
 
     const auto end = std::chrono::steady_clock::now();
@@ -410,10 +456,10 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
 void ComputeBackend::configure_backend(const std::string & mode, int n_gpu_layers) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (mode == "cpu" || mode == "vulkan" || mode == "auto") {
+    if (mode == "cpu" || mode == "vulkan") {
         requested_backend_ = mode;
     } else {
-        requested_backend_ = "auto";
+        requested_backend_ = "vulkan";
     }
     requested_gpu_layers_ = n_gpu_layers;
 }
@@ -445,6 +491,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"requested_backend\": \"" << json_escape(requested_backend_) << "\",\n"
         << "  \"requested_gpu_layers\": " << requested_gpu_layers_ << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
+        << "  \"kv_cache_device\": \"CPU\",\n"
+        << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
         << "  \"scheduler\": \"lite\",\n"

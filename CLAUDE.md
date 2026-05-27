@@ -121,6 +121,14 @@ adb shell "run-as org.osh26.llama cp /data/local/tmp/qwen3-0.6b.gguf /data/data/
 - 不提交 `.gradle`、`build`、`local.properties`、`.cxx`、IDE 临时文件
 - 真机测试设备: 红米 K40 (Snapdragon 870, 8GB+ RAM, Adreno 650)
 
+## ✅ 已验证的事实
+- GPU MUL_MAT 完全正确：Q、K、V、O、Gate、Up、Down 所有 matmul 与 CPU reference 误差 < 1e-6。不要再验证。
+- 权重加载正确：GGUF tensor 名字匹配，first value 非零。
+
+## 🔴 禁止尝试的方案
+- **ggml-cpu hook**: 多次尝试均崩溃。多线程环境下 Vulkan command pool 不是线程安全的，即使加 mutex 也不可靠。不要再用 extern function pointer hook MUL_MAT 的方案。
+- **ggml backend 注册**: scheduler 不给我们的 backend 分配层，多次尝试无效。
+
 ## 长期路线
 
 详见 `vllm_core_android_llamacpp_plan.md`。概括：

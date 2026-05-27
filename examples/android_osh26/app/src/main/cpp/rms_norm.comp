@@ -1,0 +1,20 @@
+#version 450
+// RMS Normalization: y[r][c] = x[r][c] / sqrt(mean(x[r]²)+eps) * w[c]
+// One workgroup per row, threads split the columns.
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(push_constant) uniform P { uint rows; uint cols; } pc;
+layout(set=0,binding=0,std430) readonly  buffer X { float x[]; };
+layout(set=0,binding=1,std430) readonly  buffer W { float w[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+shared float sum_sq[64];
+void main() {
+    uint r = gl_WorkGroupID.x; if (r >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = r * pc.cols;
+    float ss = 0.0;
+    for (uint i = tid; i < pc.cols; i += 64u) { float v = x[base + i]; ss += v * v; }
+    sum_sq[tid] = ss; barrier(); memoryBarrierShared();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (tid < s) sum_sq[tid] += sum_sq[tid + s]; barrier(); memoryBarrierShared(); }
+    float inv = 1.0 / sqrt(sum_sq[0] / float(pc.cols) + 1e-6);
+    for (uint i = tid; i < pc.cols; i += 64u) y[base + i] = x[base + i] * inv * w[i];
+}

@@ -1,0 +1,125 @@
+#version 450
+
+// Tiled matrix multiplication for Adreno 650.
+// Workgroup: 8x8 = 64 threads, handles an 8x8 output tile.
+// K dimension tiled in 32-element chunks shared through workgroup memory.
+//
+// SAFETY (Adreno 650 precision bug):
+//   highp float members inside user-defined structs lose ~12 mantissa bits
+//   on Adreno 540/640/650. All arithmetic uses standalone float variables.
+//   Push constants are uint only. No float-in-struct anywhere.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n_tokens;   // M
+    uint n_outputs;  // N
+    uint k_dim;      // K
+    uint stride_a;   // input row stride in floats (nb[1]/4)
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly  buffer WeightBuf { float w[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer InputBuf  { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuf { float y[]; };
+
+shared float As[8][32];
+shared float Bs[32][8];
+
+void main() {
+    uint ti = gl_LocalInvocationID.x;  // 0..7
+    uint tj = gl_LocalInvocationID.y;  // 0..7
+    uint m  = gl_WorkGroupID.y * 8u + ti;
+    uint n  = gl_WorkGroupID.x * 8u + tj;
+
+    uint m_ok = (m < pc.n_tokens) ? 1u : 0u;
+    uint n_ok = (n < pc.n_outputs) ? 1u : 0u;
+    uint valid = m_ok & n_ok;
+
+    float sum = 0.0;
+
+    uint k = pc.k_dim;
+    uint k0 = 0u;
+    for (; k0 + 32u <= k; k0 += 32u) {
+
+        // Cooperative load of As[8][32] — each thread loads 4 elements
+        uint kk_a = tj;
+        for (uint a = 0u; a < 4u; a++) {
+            float av = 0.0;
+            if (m_ok != 0u) {
+                av = x[m * pc.stride_a + k0 + kk_a];
+            }
+            As[ti][kk_a] = av;
+            kk_a += 8u;
+        }
+
+        // Cooperative load of Bs[32][8] — each thread loads 4 elements
+        uint kk_b = ti;
+        for (uint a = 0u; a < 4u; a++) {
+            float bv = 0.0;
+            if (n_ok != 0u) {
+                bv = w[n * k + k0 + kk_b];
+            }
+            Bs[kk_b][tj] = bv;
+            kk_b += 8u;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        // Compute partial dot product
+        if (valid != 0u) {
+            float s = sum;
+            for (uint ki = 0u; ki < 32u; ki++) {
+                s += As[ti][ki] * Bs[ki][tj];
+            }
+            sum = s;
+        }
+
+        barrier();
+    }
+
+    // Tail: remaining K elements (k_rem < 32)
+    uint k_rem = k - k0;
+    if (k_rem > 0u) {
+        // Cooperative load of As tail
+        uint kk_a = tj;
+        for (uint a = 0u; a < 4u; a++) {
+            if (kk_a < k_rem) {
+                float av = 0.0;
+                if (m_ok != 0u) {
+                    av = x[m * pc.stride_a + k0 + kk_a];
+                }
+                As[ti][kk_a] = av;
+            }
+            kk_a += 8u;
+        }
+
+        // Cooperative load of Bs tail
+        uint kk_b = ti;
+        for (uint a = 0u; a < 4u; a++) {
+            if (kk_b < k_rem) {
+                float bv = 0.0;
+                if (n_ok != 0u) {
+                    bv = w[n * k + k0 + kk_b];
+                }
+                Bs[kk_b][tj] = bv;
+            }
+            kk_b += 8u;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        if (valid != 0u) {
+            float s = sum;
+            for (uint ki = 0u; ki < k_rem; ki++) {
+                s += As[ti][ki] * Bs[ki][tj];
+            }
+            sum = s;
+        }
+    }
+
+    if (valid != 0u) {
+        y[m * pc.n_outputs + n] = sum;
+    }
+}

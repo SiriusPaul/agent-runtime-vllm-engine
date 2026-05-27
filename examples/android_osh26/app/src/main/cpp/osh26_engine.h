@@ -60,7 +60,7 @@ private:
     std::string last_error_;
     std::string active_backend_ = "llama.cpp CPU";
     std::string available_devices_;
-    std::string requested_backend_ = "auto";
+    std::string requested_backend_ = "vulkan";
     int requested_gpu_layers_ = -1;
     std::string last_token_ids_;
 };

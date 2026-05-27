@@ -133,12 +133,8 @@ osh26::GenerateOptions options_from_args(jint max_tokens, jfloat temperature, jf
 
 } // namespace
 
-extern "C" int run_vulkan_test(void);
-
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
     g_vm = vm;
-    // Run standalone Vulkan compute test (A+B=C) to verify GPU driver
-    run_vulkan_test();
     return JNI_VERSION_1_6;
 }
 
@@ -182,13 +178,6 @@ Java_org_osh26_llama_LlamaNative_generateStream(
     }
     env->DeleteGlobalRef(callback_ref);
     return string_to_jstring(env, result.ok ? "generation complete" : "generation failed: " + result.error);
-}
-
-extern "C" int run_vulkan_test(void);
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_osh26_llama_LlamaNative_runtest(JNIEnv *, jclass) {
-    run_vulkan_test();
 }
 
 extern "C" JNIEXPORT void JNICALL

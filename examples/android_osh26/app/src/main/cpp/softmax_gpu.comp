@@ -1,0 +1,24 @@
+#version 450
+// Softmax over last dimension with configurable row stride.
+// One workgroup per row, threads reduce for max and sum.
+layout(local_size_x = 64, local_size_y = 1) in;
+layout(push_constant) uniform P { uint rows; uint cols; uint stride; } pc;
+layout(set=0,binding=0,std430) buffer X { float x[]; };
+shared float sh[64];
+void main() {
+    uint r = gl_WorkGroupID.x; if (r >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint ro = r * pc.stride;
+    float mx = (tid < pc.cols) ? x[ro + tid] : -1e30;
+    for (uint i = tid + 64u; i < pc.cols; i += 64u) { float v = x[ro + i]; if (v > mx) mx = v; }
+    sh[tid] = mx; barrier(); memoryBarrierShared();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (tid < s && sh[tid + s] > sh[tid]) sh[tid] = sh[tid + s]; barrier(); memoryBarrierShared(); }
+    mx = sh[0];
+    float sum = 0.0;
+    if (tid < pc.cols) { float v = exp(x[ro + tid] - mx); x[ro + tid] = v; sum = v; }
+    for (uint i = tid + 64u; i < pc.cols; i += 64u) { float v = exp(x[ro + i] - mx); x[ro + i] = v; sum += v; }
+    sh[tid] = sum; barrier(); memoryBarrierShared();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (tid < s) sh[tid] += sh[tid + s]; barrier(); memoryBarrierShared(); }
+    sum = sh[0];
+    for (uint i = tid; i < pc.cols; i += 64u) x[ro + i] /= sum;
+}
