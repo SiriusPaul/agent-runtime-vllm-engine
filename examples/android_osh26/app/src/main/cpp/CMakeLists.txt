@@ -37,18 +37,19 @@ set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 add_subdirectory(${LLAMA_ROOT} llama-build)
 
 include_directories(${LLAMA_ROOT}/ggml/src)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 add_library(llama_osh26 SHARED
     native-lib.cpp
     osh26_engine.cpp
-    osh26_vk_gpu.c)
+    osh26_vk_gpu.c
+    vk_wrapper/vulkan_wrapper.cpp)
 
 target_compile_features(llama_osh26 PRIVATE cxx_std_17)
 
 target_link_libraries(llama_osh26
     llama
     android
-    vulkan
     dl
     log)
 

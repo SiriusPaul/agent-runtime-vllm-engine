@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <vulkan/vulkan.h>
+#include "vk_wrapper/vulkan_wrapper.h"
 #include "mulmat_tiled.spv.h"
 #include "mulmat_reduce.spv.h"
 #include "rms_norm.spv.h"
@@ -106,7 +106,7 @@ static void cpu_attn(float*qb,float*kb,float*vb,float*kv,float*sc,float*att,int 
 
 // ---- Init ----
 int osh26_vk_gpu_init(void){if(vk_ok)return 0;
-    void*lib=dlopen("libvulkan.so",RTLD_NOW);if(!lib){LOGE("dlopen");return -1;}
+    if(!InitVulkan()){LOGE("InitVulkan failed");return -1;}
     VkApplicationInfo ai={VK_STRUCTURE_TYPE_APPLICATION_INFO,0,"OSH26",1,"OSH26",1,VK_API_VERSION_1_1};
     VkInstanceCreateInfo ci={VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,0,0,&ai,0,0,0,0};
     if(vkCreateInstance(&ci,0,&V))return -1;
