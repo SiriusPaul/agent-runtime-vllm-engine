@@ -148,6 +148,11 @@ Java_org_osh26_llama_LlamaNative_configureBackend(JNIEnv * env, jclass, jstring 
     osh26::engine().configure_backend(jstring_to_string(env, j_mode), n_gpu_layers);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_org_osh26_llama_LlamaNative_setDebugCorrectness(JNIEnv *, jclass, jboolean enabled) {
+    osh26::engine().set_debug_correctness(enabled == JNI_TRUE);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_osh26_llama_LlamaNative_generateBlockingJson(
         JNIEnv * env, jclass, jstring j_prompt, jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
@@ -183,6 +188,11 @@ Java_org_osh26_llama_LlamaNative_generateStream(
 extern "C" JNIEXPORT void JNICALL
 Java_org_osh26_llama_LlamaNative_cancel(JNIEnv *, jclass) {
     osh26::engine().cancel();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_osh26_llama_LlamaNative_resetCache(JNIEnv *, jclass) {
+    osh26::engine().reset_cache();
 }
 
 extern "C" JNIEXPORT void JNICALL

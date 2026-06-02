@@ -141,7 +141,9 @@ public final class LlmHttpServer {
             String modelPath = request.optString("path", "");
             String backend = request.optString("backend", "auto");
             int nGpuLayers = request.optInt("n_gpu_layers", -1);
+            boolean debugCorrectness = request.optBoolean("debug_correctness", false);
             LlamaNative.configureBackend(backend, nGpuLayers);
+            LlamaNative.setDebugCorrectness(debugCorrectness);
             JSONObject json = new JSONObject();
             json.put("result", LlamaNative.loadModel(modelPath));
             json.put("engine", new JSONObject(LlamaNative.getEngineStats()));
@@ -153,6 +155,15 @@ public final class LlmHttpServer {
             LlamaNative.cancel();
             JSONObject json = new JSONObject();
             json.put("result", "cancel requested");
+            json.put("engine", new JSONObject(LlamaNative.getEngineStats()));
+            writeJson(writer, 200, json);
+            return;
+        }
+
+        if ("POST".equals(method) && "/reset_cache".equals(path)) {
+            LlamaNative.resetCache();
+            JSONObject json = new JSONObject();
+            json.put("result", "cache reset");
             json.put("engine", new JSONObject(LlamaNative.getEngineStats()));
             writeJson(writer, 200, json);
             return;

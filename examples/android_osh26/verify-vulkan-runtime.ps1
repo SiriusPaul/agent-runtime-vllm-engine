@@ -1,11 +1,13 @@
-param(
+﻿param(
     [string] $ModelPath = "/data/data/org.osh26.llama/files/models/qwen3-0.6b.gguf",
     [string] $LocalModelPath = "",
     [string] $ApkPath = "app/build/outputs/apk/debug/app-debug.apk",
     [string] $Prompt = "Write one short sentence about local inference.",
     [int] $MaxTokens = 48,
     [switch] $SkipInstall,
-    [switch] $SkipCpu
+    [switch] $SkipCpu,
+    [switch] $DebugCorrectness,
+    [switch] $RunAccuracySet
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,6 +111,7 @@ function Load-Backend {
         path = $ModelPath
         backend = $Backend
         n_gpu_layers = $GpuLayers
+        debug_correctness = [bool] $DebugCorrectness
     }
     Write-Host "$Backend load_model:"
     $load | ConvertTo-Json -Depth 8 | Write-Host
@@ -116,7 +119,10 @@ function Load-Backend {
 }
 
 function Invoke-Completion {
-    param([string] $Label)
+    param(
+        [string] $Label,
+        [string] $UserPrompt = $Prompt
+    )
 
     $completion = Invoke-JsonPost "/v1/chat/completions" @{
         model = "local-gguf"
@@ -128,13 +134,43 @@ function Invoke-Completion {
         messages = @(
             @{
                 role = "user"
-                content = $Prompt
+                content = $UserPrompt
             }
         )
     }
     Write-Host "$Label completion:"
     $completion | ConvertTo-Json -Depth 8 | Write-Host
     return $completion
+}
+
+function Assert-VulkanHealthGate {
+    param($Health)
+
+    $vk = $Health.engine.vulkan
+    if (-not $vk) {
+        throw "missing engine.vulkan health stats"
+    }
+    if ($vk.attention_fallback_layers -ne 0) {
+        throw "attention_fallback_layers expected 0, got $($vk.attention_fallback_layers)"
+    }
+    if ($DebugCorrectness -and [double] $vk.last_attention_max_abs_err -gt 1e-3) {
+        throw "last_attention_max_abs_err expected <= 1e-3, got $($vk.last_attention_max_abs_err)"
+    }
+    if (-not $vk.last_logits_top5 -or $vk.last_logits_top5.Count -lt 5) {
+        throw "last_logits_top5 missing or incomplete"
+    }
+    if ($DebugCorrectness -and $vk.gpu_lm_head_enabled) {
+        if ([double] $vk.last_lm_head_max_abs_err -gt 1e-3) {
+            throw "last_lm_head_max_abs_err expected <= 1e-3, got $($vk.last_lm_head_max_abs_err)"
+        }
+        if ($vk.last_lm_head_ref_top5 -and $vk.last_lm_head_ref_top5.Count -gt 0) {
+            $gpuTop1 = [int] $vk.last_logits_top5[0].id
+            $refTop1 = [int] $vk.last_lm_head_ref_top5[0]
+            if ($gpuTop1 -ne $refTop1) {
+                throw "LM head top1 mismatch: gpu=$gpuTop1 ref=$refTop1"
+            }
+        }
+    }
 }
 
 function Get-CompletionText {
@@ -199,7 +235,7 @@ Write-Host "health:"
 $health | ConvertTo-Json -Depth 8 | Write-Host
 
 $cpuText = ""
-if (-not $SkipCpu) {
+if (-not $SkipCpu -and -not $RunAccuracySet) {
     Load-Backend "cpu" 0 | Out-Null
     $cpuCompletion = Invoke-Completion "cpu"
     $cpuText = Get-CompletionText $cpuCompletion
@@ -207,13 +243,29 @@ if (-not $SkipCpu) {
     $cpuTokenIds = Get-LastTokenIds $cpuHealth
 }
 
-Load-Backend "vulkan" -1 | Out-Null
-$vulkanCompletion = Invoke-Completion "vulkan"
-$vulkanText = Get-CompletionText $vulkanCompletion
-$vulkanHealth = Get-Health "vulkan"
-$vulkanTokenIds = Get-LastTokenIds $vulkanHealth
+$accuracyPrompts = if ($RunAccuracySet) {
+    @(
+        "Please say the word apple.",
+        [System.Text.Encoding]::UTF8.GetString([byte[]](231,148,168,228,184,173,230,150,135,229,155,158,231,173,148,239,188,154,49,43,49,231,173,137,228,186,142,229,135,160,239,188,159)),
+        [System.Text.Encoding]::UTF8.GetString([byte[]](232,175,183,229,134,153,228,184,128,229,143,165,228,184,173,230,150,135,233,151,174,229,128,153))
+    )
+} else {
+    @($Prompt)
+}
 
-if (-not $SkipCpu) {
+Load-Backend "vulkan" -1 | Out-Null
+$vulkanText = ""
+$vulkanTokenIds = ""
+foreach ($casePrompt in $accuracyPrompts) {
+    Write-Host "vulkan prompt: $casePrompt"
+    $vulkanCompletion = Invoke-Completion "vulkan" $casePrompt
+    $vulkanText = Get-CompletionText $vulkanCompletion
+    $vulkanHealth = Get-Health "vulkan"
+    Assert-VulkanHealthGate $vulkanHealth
+    $vulkanTokenIds = Get-LastTokenIds $vulkanHealth
+}
+
+if (-not $SkipCpu -and -not $RunAccuracySet) {
     Write-Host "comparison:"
     Write-Host "CPU text    : $cpuText"
     Write-Host "Vulkan text : $vulkanText"
@@ -233,3 +285,4 @@ if (-not $SkipCpu) {
 
 Write-Host "recent OSH26 logs:"
 Invoke-Adb logcat -d -t 600 OSH26Vk:I OSH26Llama:I AndroidRuntime:E "*:S"
+

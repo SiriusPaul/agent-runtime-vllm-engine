@@ -126,9 +126,21 @@ std::string describe_osh26_vk_stats() {
         << "\"q4_k_uploads\":" << stats.q4_k_uploads << ","
         << "\"q6_k_uploads\":" << stats.q6_k_uploads << ","
         << "\"mnn_attention_enabled\":" << (stats.mnn_attention_enabled ? "true" : "false") << ","
+        << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
         << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
+        << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
+        << "\"last_decode_ms\":" << stats.last_decode_ms << ","
+        << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
+        << "\"last_token_tps\":" << stats.last_token_tps << ","
+        << "\"gpu_lm_head_enabled\":" << (stats.gpu_lm_head_enabled ? "true" : "false") << ","
+        << "\"last_lm_head_max_abs_err\":" << stats.last_lm_head_max_abs_err << ","
+        << "\"last_lm_head_ref_top5\":[" << stats.last_lm_head_ref_top5[0] << ","
+        << stats.last_lm_head_ref_top5[1] << ","
+        << stats.last_lm_head_ref_top5[2] << ","
+        << stats.last_lm_head_ref_top5[3] << ","
+        << stats.last_lm_head_ref_top5[4] << "],"
         << "\"last_logits_top5\":["
         << "{\"id\":" << stats.last_logits_top5[0] << ",\"logit\":" << stats.last_logits_top5_values[0] << "},"
         << "{\"id\":" << stats.last_logits_top5[1] << ",\"logit\":" << stats.last_logits_top5_values[1] << "},"
@@ -241,6 +253,90 @@ std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool e
     return prompt;
 }
 
+std::string ComputeBackend::build_prompt_prefix() const {
+    if (model_ != nullptr) {
+        const char * tmpl = llama_model_chat_template(model_, nullptr);
+        if (tmpl != nullptr && tmpl[0] != '\0') {
+            const std::string marker = "__OSH26_PREFIX_SPLIT_MARKER__";
+            std::array<llama_chat_message, 2> messages = {
+                llama_chat_message{"system", "You are a helpful local assistant."},
+                llama_chat_message{"user", marker.c_str()},
+            };
+            const int32_t needed = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
+            if (needed > 0) {
+                std::string buffer(static_cast<size_t>(needed), '\0');
+                const int32_t written = llama_chat_apply_template(
+                    tmpl,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    buffer.data(),
+                    (int32_t) buffer.size());
+                if (written > 0) {
+                    buffer.resize(static_cast<size_t>(written));
+                    const size_t marker_pos = buffer.find(marker);
+                    if (marker_pos != std::string::npos) {
+                        return buffer.substr(0, marker_pos);
+                    }
+                }
+            }
+        }
+    }
+
+    return "<|im_start|>system\n"
+           "You are a helpful local assistant. Think before answering when useful.\n"
+           "<|im_end|>\n"
+           "<|im_start|>user\n";
+}
+
+bool ComputeBackend::prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const {
+    if (!prefix_cache_valid_ || prefix_tokens_.empty() || prompt_tokens.size() < prefix_tokens_.size()) {
+        return false;
+    }
+    return std::equal(prefix_tokens_.begin(), prefix_tokens_.end(), prompt_tokens.begin());
+}
+
+void ComputeBackend::reset_cache_locked() {
+    prefix_cache_valid_ = false;
+    prefix_cached_pos_ = 0;
+    prefix_tokens_.clear();
+    if (ctx_ != nullptr) {
+        llama_memory_clear(llama_get_memory(ctx_), false);
+    }
+}
+
+bool ComputeBackend::warm_prefix_cache_locked() {
+    if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
+        return false;
+    }
+    if (prefix_cache_valid_) {
+        return true;
+    }
+
+    const std::string prefix = build_prompt_prefix();
+    const llama_vocab * vocab = llama_model_get_vocab(model_);
+    const int n_prefix = -llama_tokenize(vocab, prefix.c_str(), (int32_t) prefix.size(), nullptr, 0, true, true);
+    if (n_prefix <= 0 || n_prefix >= kDefaultContextSize) {
+        return false;
+    }
+
+    std::vector<llama_token> tokens((size_t) n_prefix);
+    if (llama_tokenize(vocab, prefix.c_str(), (int32_t) prefix.size(), tokens.data(), n_prefix, true, true) < 0) {
+        return false;
+    }
+
+    if (osh26_vk_gpu_forward((int *) tokens.data(), n_prefix, 0) != 0) {
+        __android_log_write(ANDROID_LOG_WARN, "OSH26GPU", "prefix cache warmup failed");
+        return false;
+    }
+
+    prefix_tokens_ = std::move(tokens);
+    prefix_cached_pos_ = n_prefix;
+    prefix_cache_valid_ = true;
+    __android_log_print(ANDROID_LOG_INFO, "OSH26GPU", "prefix cache warmed tokens=%d", n_prefix);
+    return true;
+}
+
 std::string ComputeBackend::load_model(const std::string & model_path) {
     init_llama_backend();
     if (model_path.empty()) {
@@ -267,6 +363,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
     osh26_vk_gpu_free();
     active_backend_ = "llama.cpp CPU";
+    reset_cache_locked();
 
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
@@ -319,6 +416,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     model_path_ = model_path;
     last_error_.clear();
     cancel_requested_.store(false);
+    warm_prefix_cache_locked();
     return "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
 }
 
@@ -339,9 +437,21 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     running_ = true;
     cancel_requested_.store(false);
     last_error_.clear();
+    last_prompt_build_ms_ = 0.0;
+    last_tokenize_ms_ = 0.0;
+    last_prefix_cache_hit_ = false;
+    last_prefix_tokens_ = 0;
+    last_user_prefill_tokens_ = 0;
+    last_user_prefill_ms_ = 0.0;
+    last_first_decode_ms_ = 0.0;
 
     const auto start = std::chrono::steady_clock::now();
+    const auto prompt_build_start = std::chrono::steady_clock::now();
     const std::string prompt = build_prompt(user_prompt, options.enable_thinking);
+    last_prompt_build_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - prompt_build_start).count();
+
+    const auto tokenize_start = std::chrono::steady_clock::now();
     const llama_vocab * vocab = llama_model_get_vocab(model_);
     const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), nullptr, 0, true, true);
     if (n_prompt <= 0 || n_prompt >= kDefaultContextSize) {
@@ -358,8 +468,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         running_ = false;
         return result;
     }
-
-    llama_memory_clear(llama_get_memory(ctx_), false);
+    last_tokenize_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tokenize_start).count();
 
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     sampler_params.no_perf = false;
@@ -376,21 +486,59 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     const bool want_gpu = requested_backend_ == "vulkan";
     bool use_gpu = want_gpu && osh26_vk_gpu_ready();
     if(use_gpu)__android_log_print(ANDROID_LOG_INFO,"OSH26GPU","VOCAB check: hardcoded=151936 llama_vocab=%d",(int)llama_vocab_n_tokens(vocab));
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
     int n_pos = 0;
     bool first_token = true;
-    for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
-        if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
-        if (use_gpu) {
-            llama_token * tok_data = (llama_token *)batch.token;
-            int nt = batch.n_tokens;
-            if (osh26_vk_gpu_forward((int *)tok_data, nt, n_pos) != 0) {
-                result.error = "GPU forward failed";
+    if (use_gpu) {
+        warm_prefix_cache_locked();
+        if (prompt_has_cached_prefix(prompt_tokens)) {
+            last_prefix_cache_hit_ = true;
+            last_prefix_tokens_ = prefix_cached_pos_;
+            n_pos = prefix_cached_pos_;
+        } else {
+            prefix_cache_valid_ = false;
+            prefix_cached_pos_ = 0;
+            prefix_tokens_.clear();
+        }
+
+        const int prefill_start = n_pos;
+        const int user_prefill_tokens = n_prompt - prefill_start;
+        last_user_prefill_tokens_ = std::max(0, user_prefill_tokens);
+        if (user_prefill_tokens <= 0) {
+            result.error = "prompt has no tokens after cached prefix";
+            hit_limit = false;
+        } else {
+            const auto prefill_time_start = std::chrono::steady_clock::now();
+            const llama_token * prefill_tokens = prompt_tokens.data() + prefill_start;
+            if (user_prefill_tokens <= 8) {
+                for (int i = 0; i < user_prefill_tokens; ++i) {
+                    if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
+                    if (osh26_vk_gpu_forward((int *) (prefill_tokens + i), 1, n_pos) != 0) {
+                        result.error = "GPU short prefill failed";
+                        hit_limit = false;
+                        break;
+                    }
+                    n_pos += 1;
+                }
+            } else if (!cancel_requested_.load()) {
+                if (osh26_vk_gpu_forward((int *) prefill_tokens, user_prefill_tokens, n_pos) != 0) {
+                    result.error = "GPU prefill failed";
+                    hit_limit = false;
+                } else {
+                    n_pos += user_prefill_tokens;
+                }
+            } else {
+                result.cancelled = true;
                 hit_limit = false;
-                break;
             }
-            n_pos += nt;
+            last_user_prefill_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prefill_time_start).count();
+        }
+
+        for (; result.error.empty() && !result.cancelled && result.decoded_tokens < max_tokens;) {
+            if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
+
+            const auto first_decode_start = first_token ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
             const float * logits = osh26_vk_gpu_logits();
             int n_vocab = llama_vocab_n_tokens(vocab);
@@ -412,6 +560,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             llama_sampler_accept(sampler, token);
 
             if (first_token) {
+                last_first_decode_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - first_decode_start).count();
                 result.ttft_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - start).count();
                 first_token = false;
@@ -421,14 +571,43 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             if (!result.token_ids.empty()) result.token_ids += ",";
             result.token_ids += std::to_string(token);
             if (!piece.empty()) { result.text += piece; if (on_token) on_token(piece); }
-            batch = llama_batch_get_one(&token, 1);
             result.decoded_tokens += 1;
-        } else {
+            if (result.decoded_tokens >= max_tokens) {
+                break;
+            }
+
+            const auto decode_start = std::chrono::steady_clock::now();
+            if (osh26_vk_gpu_forward((int *) &token, 1, n_pos) != 0) {
+                result.error = "GPU decode failed";
+                hit_limit = false;
+                break;
+            }
+            n_pos += 1;
+            if (first_token) {
+                last_first_decode_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - decode_start).count();
+            }
+        }
+    } else {
+        llama_memory_clear(llama_get_memory(ctx_), false);
+        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+        last_user_prefill_tokens_ = n_prompt;
+        for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
+            if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
+
             // CPU path via llama_decode
+            const auto decode_start = std::chrono::steady_clock::now();
             const int decode_status = llama_decode(ctx_, batch);
             if (decode_status != 0) {
                 result.error = "llama_decode failed: " + std::to_string(decode_status);
                 hit_limit = false; break;
+            }
+            const double decode_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - decode_start).count();
+            if (first_token) {
+                last_user_prefill_ms_ = decode_ms;
+            } else if (last_first_decode_ms_ == 0.0) {
+                last_first_decode_ms_ = decode_ms;
             }
 
             n_pos += batch.n_tokens;
@@ -479,12 +658,28 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
 void ComputeBackend::configure_backend(const std::string & mode, int n_gpu_layers) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const std::string old_backend = requested_backend_;
     if (mode == "cpu" || mode == "vulkan") {
         requested_backend_ = mode;
     } else {
         requested_backend_ = "vulkan";
     }
     requested_gpu_layers_ = n_gpu_layers;
+    if (old_backend != requested_backend_) {
+        reset_cache_locked();
+    }
+}
+
+void ComputeBackend::set_debug_correctness(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    debug_correctness_ = enabled;
+    osh26_vk_gpu_set_debug_correctness(enabled);
+    reset_cache_locked();
+}
+
+void ComputeBackend::reset_cache() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reset_cache_locked();
 }
 
 void ComputeBackend::cancel() {
@@ -505,6 +700,7 @@ void ComputeBackend::release() {
     osh26_vk_gpu_free();
     model_path_.clear();
     active_backend_ = "llama.cpp CPU";
+    reset_cache_locked();
     running_ = false;
 }
 
@@ -515,6 +711,7 @@ std::string ComputeBackend::stats_json() const {
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
         << "  \"requested_backend\": \"" << json_escape(requested_backend_) << "\",\n"
         << "  \"requested_gpu_layers\": " << requested_gpu_layers_ << ",\n"
+        << "  \"debug_correctness\": " << (debug_correctness_ ? "true" : "false") << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
         << "  \"kv_cache_device\": \"CPU\",\n"
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
@@ -526,6 +723,15 @@ std::string ComputeBackend::stats_json() const {
         << "  \"model_path\": \"" << json_escape(model_path_) << "\",\n"
         << "  \"running\": " << (running_ ? "true" : "false") << ",\n"
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
+        << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
+        << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
+        << "  \"last_prefix_cache_hit\": " << (last_prefix_cache_hit_ ? "true" : "false") << ",\n"
+        << "  \"prefix_cache_valid\": " << (prefix_cache_valid_ ? "true" : "false") << ",\n"
+        << "  \"prefix_cached_pos\": " << prefix_cached_pos_ << ",\n"
+        << "  \"last_prefix_tokens\": " << last_prefix_tokens_ << ",\n"
+        << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
+        << "  \"last_user_prefill_ms\": " << last_user_prefill_ms_ << ",\n"
+        << "  \"last_first_decode_ms\": " << last_first_decode_ms_ << ",\n"
         << "  \"last_ttft_ms\": " << last_ttft_ms_ << ",\n"
         << "  \"last_tokens_per_second\": " << last_tokens_per_second_ << ",\n"
         << "  \"last_finish_reason\": \"" << json_escape(last_finish_reason_) << "\",\n"
@@ -545,6 +751,14 @@ GenerateResult SchedulerLite::generate(const std::string & prompt, const Generat
 
 void SchedulerLite::configure_backend(const std::string & mode, int n_gpu_layers) {
     backend_.configure_backend(mode, n_gpu_layers);
+}
+
+void SchedulerLite::set_debug_correctness(bool enabled) {
+    backend_.set_debug_correctness(enabled);
+}
+
+void SchedulerLite::reset_cache() {
+    backend_.reset_cache();
 }
 
 void SchedulerLite::cancel() {

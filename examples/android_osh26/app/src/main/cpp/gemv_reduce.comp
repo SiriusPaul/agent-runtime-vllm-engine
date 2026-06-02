@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint stride;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer W { float w[]; };
+layout(set=0,binding=1,std430) readonly buffer X { float x[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+
+shared float partial[256];
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationID.x;
+    if (m >= pc.M || n >= pc.N) return;
+
+    float sum = 0.0;
+    for (uint k = lid; k < pc.K; k += 256u) {
+        sum += w[n * pc.K + k] * x[m * pc.stride + k];
+    }
+    partial[lid] = sum;
+
+    barrier();
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        if (lid < offset) {
+            partial[lid] += partial[lid + offset];
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        y[m * pc.N + n] = partial[0];
+    }
+}

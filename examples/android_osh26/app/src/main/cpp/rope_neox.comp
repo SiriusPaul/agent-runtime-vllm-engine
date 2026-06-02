@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1) in;
+
+layout(push_constant) uniform P {
+    uint nt;
+    uint nh;
+    int pos;
+    uint hd;
+} pc;
+
+layout(set=0,binding=0,std430) buffer X { float x[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_dim = pc.hd / 2u;
+    uint total = pc.nt * pc.nh * half_dim;
+    if (idx >= total) return;
+
+    uint t = idx / (pc.nh * half_dim);
+    uint r = idx % (pc.nh * half_dim);
+    uint h = r / half_dim;
+    uint i = r % half_dim;
+    uint base = (t * pc.nh + h) * pc.hd;
+
+    float theta = 1.0 / pow(1000000.0, (2.0 * float(i)) / float(pc.hd));
+    float c = cos(float(pc.pos + int(t)) * theta);
+    float s = sin(float(pc.pos + int(t)) * theta);
+    float x0 = x[base + i];
+    float x1 = x[base + i + half_dim];
+    x[base + i] = x0 * c - x1 * s;
+    x[base + i + half_dim] = x0 * s + x1 * c;
+}

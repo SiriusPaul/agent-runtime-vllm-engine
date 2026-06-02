@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "llama.h"
 
@@ -40,12 +41,18 @@ public:
     std::string load_model(const std::string & model_path);
     GenerateResult generate(const std::string & prompt, const GenerateOptions & options, const TokenCallback & on_token);
     void configure_backend(const std::string & mode, int n_gpu_layers);
+    void set_debug_correctness(bool enabled);
+    void reset_cache();
     void cancel();
     void release();
     std::string stats_json() const;
 
 private:
     std::string build_prompt(const std::string & user_prompt, bool enable_thinking) const;
+    std::string build_prompt_prefix() const;
+    bool warm_prefix_cache_locked();
+    bool prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const;
+    void reset_cache_locked();
 
     mutable std::mutex mutex_;
     llama_model * model_ = nullptr;
@@ -62,7 +69,18 @@ private:
     std::string available_devices_;
     std::string requested_backend_ = "vulkan";
     int requested_gpu_layers_ = -1;
+    bool debug_correctness_ = false;
     std::string last_token_ids_;
+    bool prefix_cache_valid_ = false;
+    int prefix_cached_pos_ = 0;
+    std::vector<llama_token> prefix_tokens_;
+    double last_prompt_build_ms_ = 0.0;
+    double last_tokenize_ms_ = 0.0;
+    bool last_prefix_cache_hit_ = false;
+    int last_prefix_tokens_ = 0;
+    int last_user_prefill_tokens_ = 0;
+    double last_user_prefill_ms_ = 0.0;
+    double last_first_decode_ms_ = 0.0;
 };
 
 class SchedulerLite {
@@ -70,6 +88,8 @@ public:
     std::string load_model(const std::string & model_path);
     GenerateResult generate(const std::string & prompt, const GenerateOptions & options, const TokenCallback & on_token);
     void configure_backend(const std::string & mode, int n_gpu_layers);
+    void set_debug_correctness(bool enabled);
+    void reset_cache();
     void cancel();
     void release();
     std::string stats_json() const;
