@@ -38,7 +38,7 @@
 #define QDIM  (N_HD*HD)
 #define KVD   (N_KVH*HD)
 #define VOCAB 151936
-#define MAX_S 512
+#define MAX_S 1024
 #define HEAD_SHARD 16384
 #define HEAD_SHARDS ((VOCAB + HEAD_SHARD - 1) / HEAD_SHARD)
 #define F32(n) ((VkDeviceSize)(n)*4)
@@ -362,24 +362,33 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     }
     free(head_tmp);
     gguf_free(gctx);fclose(f);
-    buf_alloc(&B_KV,((VkDeviceSize)N_LAY*2*MAX_S*KVD)*4);memset(B_KV.P,0,B_KV.size);buf_flush(&B_KV);
+#define ALLOC_ZERO_BUF(buf, bytes, label) do { \
+        if(!buf_alloc(&(buf),(bytes))){LOGE("alloc %s",label);osh26_vk_gpu_free();return -1;} \
+        memset((buf).P,0,(buf).size);buf_flush(&(buf)); \
+    } while(0)
+#define ALLOC_BUF(buf, bytes, label) do { \
+        if(!buf_alloc(&(buf),(bytes))){LOGE("alloc %s",label);osh26_vk_gpu_free();return -1;} \
+    } while(0)
+    ALLOC_ZERO_BUF(B_KV,((VkDeviceSize)N_LAY*2*MAX_S*KVD)*4,"B_KV");
     for(int l=0;l<N_LAY;l++){
-        buf_alloc(&B_KCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4);memset(B_KCache[l].P,0,B_KCache[l].size);buf_flush(&B_KCache[l]);
-        buf_alloc(&B_VCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4);memset(B_VCache[l].P,0,B_VCache[l].size);buf_flush(&B_VCache[l]);
+        ALLOC_ZERO_BUF(B_KCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_KCache");
+        ALLOC_ZERO_BUF(B_VCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_VCache");
     }
-    buf_alloc(&B_Hid,((VkDeviceSize)MAX_S*HDIM)*4);
-    buf_alloc(&B_Hid2,((VkDeviceSize)MAX_S*HDIM)*4);
-    buf_alloc(&B_Qb,((VkDeviceSize)MAX_S*QDIM)*4);
-    buf_alloc(&B_Kb,((VkDeviceSize)MAX_S*KVD)*4);
-    buf_alloc(&B_Vb,((VkDeviceSize)MAX_S*KVD)*4);
-    buf_alloc(&B_Sc,((VkDeviceSize)N_HD*MAX_S*MAX_S)*4);
-    buf_alloc(&B_Att,((VkDeviceSize)MAX_S*QDIM)*4);
-    buf_alloc(&B_Gat,((VkDeviceSize)MAX_S*IDIM)*4);
-    buf_alloc(&B_Up,((VkDeviceSize)MAX_S*IDIM)*4);
-    buf_alloc(&B_Dwn,((VkDeviceSize)MAX_S*IDIM)*4);
-    buf_alloc(&B_Tmp,((VkDeviceSize)MAX_S*HDIM)*4);
-    buf_alloc(&B_Log,((VkDeviceSize)VOCAB)*4);
-    buf_alloc(&B_LogPart,((VkDeviceSize)HEAD_SHARD)*4);
+    ALLOC_BUF(B_Hid,((VkDeviceSize)MAX_S*HDIM)*4,"B_Hid");
+    ALLOC_BUF(B_Hid2,((VkDeviceSize)MAX_S*HDIM)*4,"B_Hid2");
+    ALLOC_BUF(B_Qb,((VkDeviceSize)MAX_S*QDIM)*4,"B_Qb");
+    ALLOC_BUF(B_Kb,((VkDeviceSize)MAX_S*KVD)*4,"B_Kb");
+    ALLOC_BUF(B_Vb,((VkDeviceSize)MAX_S*KVD)*4,"B_Vb");
+    ALLOC_BUF(B_Sc,((VkDeviceSize)N_HD*MAX_S*MAX_S)*4,"B_Sc");
+    ALLOC_BUF(B_Att,((VkDeviceSize)MAX_S*QDIM)*4,"B_Att");
+    ALLOC_BUF(B_Gat,((VkDeviceSize)MAX_S*IDIM)*4,"B_Gat");
+    ALLOC_BUF(B_Up,((VkDeviceSize)MAX_S*IDIM)*4,"B_Up");
+    ALLOC_BUF(B_Dwn,((VkDeviceSize)MAX_S*IDIM)*4,"B_Dwn");
+    ALLOC_BUF(B_Tmp,((VkDeviceSize)MAX_S*HDIM)*4,"B_Tmp");
+    ALLOC_BUF(B_Log,((VkDeviceSize)VOCAB)*4,"B_Log");
+    ALLOC_BUF(B_LogPart,((VkDeviceSize)HEAD_SHARD)*4,"B_LogPart");
+#undef ALLOC_BUF
+#undef ALLOC_ZERO_BUF
     mdl_ok=true;LOGI("Model loaded");return 0;}
 
 /* ---- Forward pass ---- */

@@ -20,9 +20,10 @@
 namespace osh26 {
 namespace {
 
-constexpr int kDefaultContextSize = 2048;
+constexpr int kDefaultContextSize = 1024;
 constexpr int kDefaultBatchSize = 512;
 constexpr int kDefaultMaxSeq = 4;
+constexpr int kShortPrefillTokenLimit = 32;
 
 std::once_flag g_backend_once;
 
@@ -510,7 +511,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         } else {
             const auto prefill_time_start = std::chrono::steady_clock::now();
             const llama_token * prefill_tokens = prompt_tokens.data() + prefill_start;
-            if (user_prefill_tokens <= 8) {
+            if (user_prefill_tokens <= kShortPrefillTokenLimit) {
                 for (int i = 0; i < user_prefill_tokens; ++i) {
                     if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
                     if (osh26_vk_gpu_forward((int *) (prefill_tokens + i), 1, n_pos) != 0) {
@@ -714,6 +715,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"debug_correctness\": " << (debug_correctness_ ? "true" : "false") << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
         << "  \"kv_cache_device\": \"CPU\",\n"
+        << "  \"max_context_tokens\": " << kDefaultContextSize << ",\n"
+        << "  \"short_prefill_token_limit\": " << kShortPrefillTokenLimit << ",\n"
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"

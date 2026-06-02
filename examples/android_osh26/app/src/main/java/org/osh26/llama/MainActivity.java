@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.File;
@@ -18,10 +19,14 @@ public class MainActivity extends Activity {
     private static final int REQUEST_IMPORT_MODEL = 1001;
 
     private TextView engineStatus;
-    private TextView output;
+    private TextView chatTranscript;
+    private ScrollView chatScroll;
     private EditText modelPath;
-    private EditText prompt;
+    private EditText messageInput;
+    private Button sendMessage;
     private final LlmHttpServer httpServer = new LlmHttpServer();
+    private final StringBuilder conversationContext = new StringBuilder();
+    private boolean generating = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -29,19 +34,21 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         engineStatus = findViewById(R.id.engine_status);
-        output = findViewById(R.id.output);
+        chatTranscript = findViewById(R.id.chat_transcript);
+        chatScroll = findViewById(R.id.chat_scroll);
         modelPath = findViewById(R.id.model_path);
-        prompt = findViewById(R.id.prompt);
+        messageInput = findViewById(R.id.message_input);
         Button loadModel = findViewById(R.id.load_model);
         Button importModel = findViewById(R.id.import_model);
-        Button generate = findViewById(R.id.generate);
+        Button resetCache = findViewById(R.id.reset_cache);
+        sendMessage = findViewById(R.id.send_message);
         Button cancel = findViewById(R.id.cancel);
         Button startServer = findViewById(R.id.start_server);
         Button stopServer = findViewById(R.id.stop_server);
 
         File modelDir = new File(getFilesDir(), "models");
         modelPath.setText(new File(modelDir, "qwen3-0.6b.gguf").getAbsolutePath());
-        appendLine(httpServer.start());
+        appendSystemLine(httpServer.start());
         refreshStats();
 
         importModel.setOnClickListener(v -> {
@@ -52,24 +59,49 @@ public class MainActivity extends Activity {
         });
 
         loadModel.setOnClickListener(v -> {
-            appendLine(LlamaNative.loadModel(modelPath.getText().toString()));
+            appendSystemLine(LlamaNative.loadModel(modelPath.getText().toString()));
             refreshStats();
         });
 
-        generate.setOnClickListener(v -> {
-            output.setText("");
-            String userPrompt = prompt.getText().toString();
+        resetCache.setOnClickListener(v -> {
+            LlamaNative.resetCache();
+            conversationContext.setLength(0);
+            chatTranscript.setText("");
+            appendSystemLine("KV cache reset");
+            refreshStats();
+        });
+
+        sendMessage.setOnClickListener(v -> {
+            if (generating) {
+                return;
+            }
+            String userMessage = messageInput.getText().toString().trim();
+            if (userMessage.isEmpty()) {
+                return;
+            }
+            messageInput.setText("");
+            appendChatLine("User", userMessage);
+            String generationPrompt = buildConversationPrompt(userMessage);
+            generating = true;
+            sendMessage.setEnabled(false);
             new Thread(() -> {
-                String status = LlamaNative.generateStream(userPrompt, new LlamaNative.StreamCallback() {
+                String status = LlamaNative.generateStream(generationPrompt, new LlamaNative.StreamCallback() {
                     @Override
                     public void onToken(String token) {
-                        runOnUiThread(() -> output.append(token));
+                        runOnUiThread(() -> {
+                            chatTranscript.append(token);
+                            scrollChatToBottom();
+                        });
                     }
 
                     @Override
                     public void onComplete(String text, String finishReason) {
                         runOnUiThread(() -> {
-                            appendLine("\ncomplete: " + finishReason);
+                            generating = false;
+                            sendMessage.setEnabled(true);
+                            conversationContext.append("User: ").append(userMessage).append('\n')
+                                    .append("Assistant: ").append(text).append("\n\n");
+                            appendSystemLine("complete: " + finishReason);
                             refreshStats();
                         });
                     }
@@ -77,30 +109,34 @@ public class MainActivity extends Activity {
                     @Override
                     public void onError(String error) {
                         runOnUiThread(() -> {
-                            appendLine("\nERROR: " + error);
+                            generating = false;
+                            sendMessage.setEnabled(true);
+                            appendSystemLine("ERROR: " + error);
                             refreshStats();
                         });
                     }
                 }, 128, 0.6f, 0.95f, 0xCAFE, false);
-                runOnUiThread(() -> appendLine(status));
+                runOnUiThread(() -> appendSystemLine(status));
             }, "osh26-ui-generate").start();
             refreshStats();
         });
 
         cancel.setOnClickListener(v -> {
             LlamaNative.cancel();
-            appendLine("\ncancel requested");
+            generating = false;
+            sendMessage.setEnabled(true);
+            appendSystemLine("cancel requested");
             refreshStats();
         });
 
         startServer.setOnClickListener(v -> {
-            appendLine(httpServer.start());
+            appendSystemLine(httpServer.start());
             refreshStats();
         });
 
         stopServer.setOnClickListener(v -> {
             httpServer.stop();
-            appendLine("HTTP server stopped");
+            appendSystemLine("HTTP server stopped");
             refreshStats();
         });
     }
@@ -121,14 +157,14 @@ public class MainActivity extends Activity {
 
         Uri uri = data.getData();
         if (uri == null) {
-            appendLine("import failed: empty uri");
+            appendSystemLine("import failed: empty uri");
             return;
         }
 
         try {
             File modelDir = new File(getFilesDir(), "models");
             if (!modelDir.exists() && !modelDir.mkdirs()) {
-                appendLine("import failed: cannot create " + modelDir.getAbsolutePath());
+                appendSystemLine("import failed: cannot create " + modelDir.getAbsolutePath());
                 return;
             }
 
@@ -141,7 +177,7 @@ public class MainActivity extends Activity {
             try (InputStream input = getContentResolver().openInputStream(uri);
                  FileOutputStream output = new FileOutputStream(target)) {
                 if (input == null) {
-                    appendLine("import failed: cannot open input stream");
+                    appendSystemLine("import failed: cannot open input stream");
                     return;
                 }
 
@@ -153,9 +189,9 @@ public class MainActivity extends Activity {
             }
 
             modelPath.setText(target.getAbsolutePath());
-            appendLine("imported model: " + target.getAbsolutePath());
+            appendSystemLine("imported model: " + target.getAbsolutePath());
         } catch (Exception e) {
-            appendLine("import failed: " + e.getMessage());
+            appendSystemLine("import failed: " + e.getMessage());
         }
     }
 
@@ -177,9 +213,31 @@ public class MainActivity extends Activity {
         engineStatus.setText(status);
     }
 
-    private void appendLine(String text) {
-        output.append(text);
-        output.append("\n");
+    private String buildConversationPrompt(String userMessage) {
+        if (conversationContext.length() == 0) {
+            return userMessage;
+        }
+        return conversationContext.toString() + "User: " + userMessage;
+    }
+
+    private void appendChatLine(String role, String text) {
+        if (chatTranscript.length() > 0) {
+            chatTranscript.append("\n");
+        }
+        chatTranscript.append(role + ": " + text + "\nAssistant: ");
+        scrollChatToBottom();
+    }
+
+    private void appendSystemLine(String text) {
+        if (chatTranscript.length() > 0) {
+            chatTranscript.append("\n");
+        }
+        chatTranscript.append("[status] " + text + "\n");
+        scrollChatToBottom();
+    }
+
+    private void scrollChatToBottom() {
+        chatScroll.post(() -> chatScroll.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
 }
