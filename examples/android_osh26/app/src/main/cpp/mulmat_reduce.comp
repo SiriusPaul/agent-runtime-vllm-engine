@@ -1,68 +1,14 @@
 #version 450
-
-// Reduction-based matmul optimized for Adreno 650.
-// One workgroup per output element, 64 threads split the K dimension,
-// shared-memory reduction to combine partial sums.
-//
-// SAFETY (Adreno 650 precision bug):
-//   All arithmetic uses standalone float variables. No float-in-struct.
-//   Push constants are uint only.
-
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-
-layout(push_constant) uniform Params {
-    uint n_tokens;   // M
-    uint n_outputs;  // N
-    uint k_dim;      // K = inner dimension
-    uint stride_a;   // input row stride in floats (nb[1]/4), for non-contiguous views
-} pc;
-
-layout(set = 0, binding = 0, std430) readonly  buffer WeightBuf { float w[]; };
-layout(set = 0, binding = 1, std430) readonly  buffer InputBuf  { float x[]; };
-layout(set = 0, binding = 2, std430) writeonly buffer OutputBuf { float y[]; };
-
-shared float partial[64];
-
+/* Simple matmul: 1 thread per output, verified on Adreno 650 */
+layout(local_size_x = 1, local_size_y = 1) in;
+layout(push_constant) uniform P { uint M; uint N; uint K; uint stride; } pc;
+layout(set=0,binding=0,std430) readonly buffer W { float w[]; };
+layout(set=0,binding=1,std430) readonly buffer X { float x[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
 void main() {
-    uint n  = gl_WorkGroupID.x;   // output element index
-    uint m  = gl_WorkGroupID.y;   // token index
-    uint tid = gl_LocalInvocationID.x;
-
-    if (m >= pc.n_tokens || n >= pc.n_outputs) {
-        return;
-    }
-
+    uint n = gl_WorkGroupID.x; uint m = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
     float sum = 0.0;
-    uint k = pc.k_dim;
-    uint ki = tid;
-    uint row_in = m * pc.stride_a;      // start of input row m (handles non-contiguous views)
-    for (; ki + 64u <= k; ki += 64u) {
-        float av = x[row_in + ki];
-        float bv = w[n * k + ki];        // weight stride = k_dim (always contiguous)
-        sum += av * bv;
-    }
-    // Tail
-    if (ki < k) {
-        float av = x[row_in + ki];
-        float bv = w[n * k + ki];
-        sum += av * bv;
-    }
-
-    partial[tid] = sum;
-    barrier();
-    memoryBarrierShared();
-
-    // Tree reduction in shared memory
-    uint stride = 32u;
-    for (; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        barrier();
-        memoryBarrierShared();
-    }
-
-    if (tid == 0u) {
-        y[m * pc.n_outputs + n] = partial[0u];
-    }
+    for (uint k = 0u; k < pc.K; k++) sum += w[n * pc.K + k] * x[m * pc.stride + k];
+    y[m * pc.N + n] = sum;
 }

@@ -124,7 +124,17 @@ std::string describe_osh26_vk_stats() {
         << "\"f16_uploads\":" << stats.f16_uploads << ","
         << "\"bf16_uploads\":" << stats.bf16_uploads << ","
         << "\"q4_k_uploads\":" << stats.q4_k_uploads << ","
-        << "\"q6_k_uploads\":" << stats.q6_k_uploads
+        << "\"q6_k_uploads\":" << stats.q6_k_uploads << ","
+        << "\"mnn_attention_enabled\":" << (stats.mnn_attention_enabled ? "true" : "false") << ","
+        << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
+        << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
+        << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
+        << "\"last_logits_top5\":["
+        << "{\"id\":" << stats.last_logits_top5[0] << ",\"logit\":" << stats.last_logits_top5_values[0] << "},"
+        << "{\"id\":" << stats.last_logits_top5[1] << ",\"logit\":" << stats.last_logits_top5_values[1] << "},"
+        << "{\"id\":" << stats.last_logits_top5[2] << ",\"logit\":" << stats.last_logits_top5_values[2] << "},"
+        << "{\"id\":" << stats.last_logits_top5[3] << ",\"logit\":" << stats.last_logits_top5_values[3] << "},"
+        << "{\"id\":" << stats.last_logits_top5[4] << ",\"logit\":" << stats.last_logits_top5_values[4] << "}]"
         << "}";
     return out.str();
 }
@@ -255,6 +265,8 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         llama_model_free(model_);
         model_ = nullptr;
     }
+    osh26_vk_gpu_free();
+    active_backend_ = "llama.cpp CPU";
 
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
@@ -267,13 +279,17 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         last_error_ = "failed to load model: " + model_path + " (" + file_info + ")";
         return last_error_;
     }
-    // Load weights into GPU pool
-    if (osh26_vk_gpu_load_model(model_path.c_str()) == 0) {
-        active_backend_ = "OSH26 GPU Runtime";
-        __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "GPU model loaded");
+    if (requested_backend_ == "vulkan") {
+        // Load weights into the handwritten Vulkan runtime only when explicitly requested.
+        if (osh26_vk_gpu_load_model(model_path.c_str()) == 0) {
+            active_backend_ = "OSH26 GPU Runtime";
+            __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "GPU model loaded");
+        } else {
+            active_backend_ = "CPU (GPU load failed)";
+            __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "GPU model load failed");
+        }
     } else {
-        active_backend_ = "CPU (GPU load failed)";
-        __android_log_write(ANDROID_LOG_WARN, "OSH26Llama", "GPU model load failed");
+        __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "Skipping GPU model load (CPU backend requested)");
     }
 
     llama_context_params ctx_params = llama_context_default_params();
@@ -291,9 +307,11 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (ctx_ == nullptr) {
+        osh26_vk_gpu_free();
         llama_model_free(model_);
         model_ = nullptr;
         model_path_.clear();
+        active_backend_ = "llama.cpp CPU";
         last_error_ = "failed to create llama_context";
         return last_error_;
     }
@@ -355,21 +373,25 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     bool hit_eog = false;
     bool hit_limit = true;
 
-    bool use_gpu = osh26_vk_gpu_ready();
+    const bool want_gpu = requested_backend_ == "vulkan";
+    bool use_gpu = want_gpu && osh26_vk_gpu_ready();
+    if(use_gpu)__android_log_print(ANDROID_LOG_INFO,"OSH26GPU","VOCAB check: hardcoded=151936 llama_vocab=%d",(int)llama_vocab_n_tokens(vocab));
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
     int n_pos = 0;
     bool first_token = true;
-
     for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
         if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
         if (use_gpu) {
             llama_token * tok_data = (llama_token *)batch.token;
             int nt = batch.n_tokens;
-            osh26_vk_gpu_forward((int *)tok_data, nt, n_pos);
+            if (osh26_vk_gpu_forward((int *)tok_data, nt, n_pos) != 0) {
+                result.error = "GPU forward failed";
+                hit_limit = false;
+                break;
+            }
             n_pos += nt;
 
-            // Sample from GPU logits (pre-allocated candidates array, reused)
             const float * logits = osh26_vk_gpu_logits();
             int n_vocab = llama_vocab_n_tokens(vocab);
             static std::vector<llama_token_data> s_candidates;
@@ -387,6 +409,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             llama_token token = cur_p.data[cur_p.selected].id;
 
             if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+            llama_sampler_accept(sampler, token);
 
             if (first_token) {
                 result.ttft_ms = std::chrono::duration<double, std::milli>(
@@ -479,7 +502,9 @@ void ComputeBackend::release() {
         llama_model_free(model_);
         model_ = nullptr;
     }
+    osh26_vk_gpu_free();
     model_path_.clear();
+    active_backend_ = "llama.cpp CPU";
     running_ = false;
 }
 

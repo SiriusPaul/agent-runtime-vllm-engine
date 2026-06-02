@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n_tokens;
+    uint n_outputs;
+    uint k;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Weight {
+    float w[];
+};
+
+layout(set = 0, binding = 1) readonly buffer Input {
+    float x[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer Output {
+    float y[];
+};
+
+void main() {
+    uint token = gl_GlobalInvocationID.x;
+    uint out_idx = gl_GlobalInvocationID.y;
+    if (token >= pc.n_tokens || out_idx >= pc.n_outputs) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint i = 0; i < pc.k; ++i) {
+        sum += w[out_idx * pc.k + i] * x[token * pc.k + i];
+    }
+
+    y[token * pc.n_outputs + out_idx] = sum;
+}
