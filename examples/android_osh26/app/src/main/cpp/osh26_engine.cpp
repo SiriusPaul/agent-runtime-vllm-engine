@@ -302,12 +302,29 @@ bool ComputeBackend::prompt_has_cached_prefix(const std::vector<llama_token> & p
     return std::equal(prefix_tokens_.begin(), prefix_tokens_.end(), prompt_tokens.begin());
 }
 
-void ComputeBackend::reset_cache_locked() {
-    prefix_cache_valid_ = false;
-    prefix_cached_pos_ = 0;
-    prefix_tokens_.clear();
+void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
     if (ctx_ != nullptr) {
         llama_memory_clear(llama_get_memory(ctx_), false);
+    }
+    if (clear_prefix_state) {
+        prefix_cache_valid_ = false;
+        prefix_cached_pos_ = 0;
+        prefix_tokens_.clear();
+        active_prompt_tokens_.clear();
+        boot_prefix_tokens_.clear();
+        prefix_cache_entry_count_ = 0;
+        prefix_cache_token_count_ = 0;
+        prefix_cache_evictions_ = 0;
+        prefix_cache_hits_ = 0;
+        prefix_cache_misses_ = 0;
+        prefix_cache_reuse_tokens_ = 0;
+        prefix_cache_block_reuse_ = 0;
+        prefix_cache_root_ = PrefixCacheNode{};
+        prefix_cache_lru_.clear();
+        last_prefix_cache_hit_ = false;
+        last_prefix_tokens_ = 0;
+        last_reusable_prefix_tokens_ = 0;
+        last_cached_prefix_entries_ = 0;
     }
 }
 
@@ -339,8 +356,184 @@ bool ComputeBackend::warm_prefix_cache_locked() {
     prefix_tokens_ = std::move(tokens);
     prefix_cached_pos_ = n_prefix;
     prefix_cache_valid_ = true;
+    prefix_cache_entry_count_ = std::max<size_t>(prefix_cache_entry_count_, 1);
+    prefix_cache_token_count_ = std::max<size_t>(prefix_cache_token_count_, (size_t) n_prefix);
+    last_cached_prefix_entries_ = prefix_cache_entry_count_;
     __android_log_print(ANDROID_LOG_INFO, "OSH26GPU", "prefix cache warmed tokens=%d", n_prefix);
     return true;
+}
+
+size_t ComputeBackend::common_prefix_length(const std::vector<llama_token> & lhs, const std::vector<llama_token> & rhs) const {
+    const size_t limit = std::min(lhs.size(), rhs.size());
+    size_t n = 0;
+    while (n < limit && lhs[n] == rhs[n]) {
+        ++n;
+    }
+    return n;
+}
+
+std::shared_ptr<ComputeBackend::GenerationRequest> ComputeBackend::enqueue_request(
+        const std::string & prompt,
+        const GenerateOptions & options,
+        const TokenCallback & on_token) {
+    auto request = std::make_shared<GenerationRequest>();
+    request->prompt = prompt;
+    request->options = options;
+    request->on_token = on_token;
+    request->submitted_at = std::chrono::steady_clock::now();
+    request->reusable_prefix_tokens = 0;
+    return request;
+}
+
+std::shared_ptr<ComputeBackend::GenerationRequest> ComputeBackend::pick_next_request_locked() {
+    if (request_queue_.empty()) {
+        return nullptr;
+    }
+
+    std::shared_ptr<GenerationRequest> best;
+    size_t best_score = 0;
+    for (const auto & request : request_queue_) {
+        const size_t score = request->reusable_prefix_tokens;
+        if (!best || score > best_score || (score == best_score && request->queue_position < best->queue_position)) {
+            best = request;
+            best_score = score;
+        }
+    }
+
+    return best;
+}
+
+void ComputeBackend::fail_queued_requests_locked(const std::string & error_message, bool cancelled) {
+    for (const auto & request : request_queue_) {
+        if (request == nullptr) {
+            continue;
+        }
+        std::lock_guard<std::mutex> request_lock(request->mutex);
+        request->result.error = error_message;
+        request->result.cancelled = cancelled;
+        request->result.finish_reason = cancelled ? "cancelled" : "error";
+        request->result.ok = false;
+        request->completed = true;
+        request->cv.notify_all();
+        if (cancelled) {
+            total_cancelled_requests_ += 1;
+        }
+    }
+    request_queue_.clear();
+}
+
+void ComputeBackend::ensure_worker_started_locked() {}
+
+void ComputeBackend::worker_loop() {}
+
+void ComputeBackend::complete_request(const std::shared_ptr<GenerationRequest> & request) {
+    if (request == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(request->mutex);
+    request->completed = true;
+    request->cv.notify_all();
+}
+
+void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens) {
+    const size_t prefix_len = std::min(prompt_tokens.size(), max_prefix_cache_tokens_);
+    if (prefix_len == 0) {
+        return;
+    }
+    PrefixCacheNode * node = ensure_prefix_node_locked(std::vector<llama_token>(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len));
+    if (node == nullptr) {
+        return;
+    }
+    if (node->terminal) {
+        node->request_count += 1;
+        node->hit_count += 1;
+        touch_prefix_node_locked(node);
+    } else {
+        node->terminal = true;
+        node->token_count = prefix_len;
+        node->request_count = 1;
+        node->hit_count = 0;
+        prefix_cache_lru_.push_front(node);
+        prefix_cache_entry_count_ += 1;
+        prefix_cache_token_count_ += prefix_len;
+    }
+    prefix_cache_valid_ = true;
+    prefix_cached_pos_ = static_cast<int>(prefix_len);
+    prefix_tokens_.assign(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len);
+    last_cached_prefix_entries_ = prefix_cache_entry_count_;
+    evict_prefix_cache_locked();
+}
+
+ComputeBackend::PrefixCacheNode * ComputeBackend::ensure_prefix_node_locked(const std::vector<llama_token> & tokens) {
+    PrefixCacheNode * node = &prefix_cache_root_;
+    for (const llama_token token : tokens) {
+        auto & child = node->children[token];
+        if (!child) {
+            child = std::make_unique<PrefixCacheNode>();
+            child->parent = node;
+            child->token = token;
+        }
+        node = child.get();
+    }
+    return node;
+}
+
+ComputeBackend::PrefixCacheNode * ComputeBackend::find_prefix_node_locked(const std::vector<llama_token> & tokens) const {
+    const PrefixCacheNode * node = &prefix_cache_root_;
+    for (const llama_token token : tokens) {
+        auto it = node->children.find(token);
+        if (it == node->children.end()) {
+            return nullptr;
+        }
+        node = it->second.get();
+    }
+    return const_cast<PrefixCacheNode *>(node);
+}
+
+void ComputeBackend::touch_prefix_node_locked(PrefixCacheNode * node) {
+    if (node == nullptr) {
+        return;
+    }
+    prefix_cache_lru_.remove(node);
+    prefix_cache_lru_.push_front(node);
+    node->last_used_tick += 1;
+}
+
+void ComputeBackend::evict_prefix_cache_locked() {
+    while (prefix_cache_entry_count_ > max_prefix_cache_entries_ && !prefix_cache_lru_.empty()) {
+        PrefixCacheNode * victim = prefix_cache_lru_.back();
+        prefix_cache_lru_.pop_back();
+        if (victim != nullptr && victim->terminal) {
+            victim->terminal = false;
+            if (prefix_cache_token_count_ >= victim->token_count) {
+                prefix_cache_token_count_ -= victim->token_count;
+            } else {
+                prefix_cache_token_count_ = 0;
+            }
+            victim->token_count = 0;
+            if (prefix_cache_entry_count_ > 0) {
+                prefix_cache_entry_count_ -= 1;
+            }
+            prefix_cache_evictions_ += 1;
+        }
+    }
+}
+
+size_t ComputeBackend::prefix_cache_entry_count_locked() const {
+    return prefix_cache_entry_count_;
+}
+
+size_t ComputeBackend::prefix_cache_token_count_locked() const {
+    return prefix_cache_token_count_;
+}
+
+double ComputeBackend::prefix_cache_fragmentation_locked() const {
+    if (prefix_cache_token_count_ == 0) {
+        return 0.0;
+    }
+    const size_t used_tokens = std::min(prefix_tokens_.size(), prefix_cache_token_count_);
+    const double total_tokens = (double) std::max<size_t>(1, prefix_cache_token_count_);
+    return 1.0 - ((double) used_tokens / total_tokens);
 }
 
 std::string ComputeBackend::load_model(const std::string & model_path) {
@@ -356,6 +549,8 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         return last_error_;
     }
 
+    release();
+
     std::lock_guard<std::mutex> lock(mutex_);
     available_devices_ = describe_backend_devices();
     cancel_requested_.store(true);
@@ -369,7 +564,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
     osh26_vk_gpu_free();
     active_backend_ = "llama.cpp CPU";
-    reset_cache_locked();
+    reset_cache_locked(true);
 
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
@@ -425,61 +620,119 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     last_prefill_skipped_lm_head_count_ = 0;
     cancel_requested_.store(false);
     warm_prefix_cache_locked();
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        shutdown_requested_ = false;
+        queue_cv_.notify_all();
+    }
     return "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
 }
 
 GenerateResult ComputeBackend::generate(const std::string & user_prompt, const GenerateOptions & options, const TokenCallback & on_token) {
     GenerateResult result;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (model_ == nullptr || ctx_ == nullptr) {
-        result.error = "model is not loaded";
-        last_error_ = result.error;
-        return result;
+    auto request = std::make_shared<GenerationRequest>();
+    request->options = options;
+    request->on_token = on_token;
+    request->submitted_at = std::chrono::steady_clock::now();
+
+    std::string prompt;
+    std::vector<llama_token> prompt_tokens;
+    int n_prompt = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (model_ == nullptr || ctx_ == nullptr) {
+            result.error = "model is not loaded";
+            last_error_ = result.error;
+            return result;
+        }
+
+        last_error_.clear();
+        last_prompt_build_ms_ = 0.0;
+        last_tokenize_ms_ = 0.0;
+        last_prefix_cache_hit_ = false;
+        last_prefix_tokens_ = 0;
+        last_user_prefill_tokens_ = 0;
+        last_prefill_forward_count_ = 0;
+        last_prefill_skipped_lm_head_count_ = 0;
+        last_user_prefill_ms_ = 0.0;
+        last_first_decode_ms_ = 0.0;
+
+        const auto prompt_build_start = std::chrono::steady_clock::now();
+        prompt = build_prompt(user_prompt, options.enable_thinking);
+        last_prompt_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prompt_build_start).count();
+
+        const auto tokenize_start = std::chrono::steady_clock::now();
+        const llama_vocab * vocab = llama_model_get_vocab(model_);
+        n_prompt = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), nullptr, 0, true, true);
+        if (n_prompt <= 0 || n_prompt >= kDefaultContextSize) {
+            result.error = n_prompt >= kDefaultContextSize ? "prompt is too long for current context" : "failed to tokenize prompt";
+            last_error_ = result.error;
+            return result;
+        }
+
+        prompt_tokens.resize((size_t) n_prompt);
+        if (llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), prompt_tokens.data(), n_prompt, true, true) < 0) {
+            result.error = "failed to tokenize prompt";
+            last_error_ = result.error;
+            return result;
+        }
+        last_tokenize_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tokenize_start).count();
+
+        request->prompt = std::move(prompt);
+        request->prompt_tokens = prompt_tokens;
+        request->prompt_tokens_total = request->prompt_tokens.size();
+        request->reusable_prefix_tokens = common_prefix_length(request->prompt_tokens, prefix_tokens_);
+        request->queue_position = next_queue_position_++;
+
     }
-    if (running_) {
-        result.error = "generation is already running";
-        last_error_ = result.error;
-        return result;
+
+    {
+        std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+        if (request_queue_.size() >= max_pending_requests_) {
+            result.error = "request queue is full";
+            total_rejected_requests_ += 1;
+            return result;
+        }
+        request_queue_.push_back(request);
+        total_submitted_requests_ += 1;
+        queue_depth_peak_ = std::max(queue_depth_peak_, request_queue_.size());
+        queue_cv_.wait(queue_lock, [&] {
+            if (shutdown_requested_) {
+                return true;
+            }
+            const auto next = pick_next_request_locked();
+            return active_request_ == nullptr && next == request;
+        });
+        if (shutdown_requested_) {
+            auto it = std::find(request_queue_.begin(), request_queue_.end(), request);
+            if (it != request_queue_.end()) {
+                request_queue_.erase(it);
+            }
+            total_cancelled_requests_ += 1;
+            result.error = "engine is shutting down";
+            result.cancelled = true;
+            result.finish_reason = "cancelled";
+            return result;
+        }
+        active_request_ = request;
+        running_ = true;
+        request->started = true;
+        request->started_at = std::chrono::steady_clock::now();
+        request->queue_wait_ms = std::chrono::duration<double, std::milli>(request->started_at - request->submitted_at).count();
+        last_queue_wait_ms_ = request->queue_wait_ms;
+        total_queue_wait_ms_ += request->queue_wait_ms;
+        auto it = std::find(request_queue_.begin(), request_queue_.end(), request);
+        if (it != request_queue_.end()) {
+            request_queue_.erase(it);
+        }
     }
 
-    running_ = true;
-    cancel_requested_.store(false);
-    last_error_.clear();
-    last_prompt_build_ms_ = 0.0;
-    last_tokenize_ms_ = 0.0;
-    last_prefix_cache_hit_ = false;
-    last_prefix_tokens_ = 0;
-    last_user_prefill_tokens_ = 0;
-    last_prefill_forward_count_ = 0;
-    last_prefill_skipped_lm_head_count_ = 0;
-    last_user_prefill_ms_ = 0.0;
-    last_first_decode_ms_ = 0.0;
-
-    const auto start = std::chrono::steady_clock::now();
-    const auto prompt_build_start = std::chrono::steady_clock::now();
-    const std::string prompt = build_prompt(user_prompt, options.enable_thinking);
-    last_prompt_build_ms_ = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - prompt_build_start).count();
-
-    const auto tokenize_start = std::chrono::steady_clock::now();
+    cancel_requested_.store(request->cancelled);
+    const auto start = request->submitted_at;
     const llama_vocab * vocab = llama_model_get_vocab(model_);
-    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), nullptr, 0, true, true);
-    if (n_prompt <= 0 || n_prompt >= kDefaultContextSize) {
-        result.error = n_prompt >= kDefaultContextSize ? "prompt is too long for current context" : "failed to tokenize prompt";
-        last_error_ = result.error;
-        running_ = false;
-        return result;
-    }
-
-    std::vector<llama_token> prompt_tokens((size_t) n_prompt);
-    if (llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), prompt_tokens.data(), n_prompt, true, true) < 0) {
-        result.error = "failed to tokenize prompt";
-        last_error_ = result.error;
-        running_ = false;
-        return result;
-    }
-    last_tokenize_ms_ = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - tokenize_start).count();
 
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     sampler_params.no_perf = false;
@@ -500,24 +753,24 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     bool first_token = true;
 
     if (use_gpu) {
-        warm_prefix_cache_locked();
-        if (prompt_has_cached_prefix(prompt_tokens)) {
-            last_prefix_cache_hit_ = true;
-            last_prefix_tokens_ = prefix_cached_pos_;
-            n_pos = prefix_cached_pos_;
-        } else {
-            prefix_cache_valid_ = false;
-            prefix_cached_pos_ = 0;
-            prefix_tokens_.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            warm_prefix_cache_locked();
+            if (prompt_has_cached_prefix(prompt_tokens)) {
+                last_prefix_cache_hit_ = true;
+                last_prefix_tokens_ = prefix_cached_pos_;
+                n_pos = prefix_cached_pos_;
+            } else {
+                prefix_cache_valid_ = false;
+                prefix_cached_pos_ = 0;
+                prefix_tokens_.clear();
+            }
         }
 
         const int prefill_start = n_pos;
         const int user_prefill_tokens = n_prompt - prefill_start;
         last_user_prefill_tokens_ = std::max(0, user_prefill_tokens);
-        if (user_prefill_tokens <= 0) {
-            result.error = "prompt has no tokens after cached prefix";
-            hit_limit = false;
-        } else {
+        if (user_prefill_tokens > 0) {
             const auto prefill_time_start = std::chrono::steady_clock::now();
             const llama_token * prefill_tokens = prompt_tokens.data() + prefill_start;
             if (user_prefill_tokens <= kShortPrefillTokenLimit) {
@@ -550,6 +803,19 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             }
             last_user_prefill_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - prefill_time_start).count();
+        } else {
+            last_user_prefill_ms_ = 0.0;
+            if (n_prompt > 0 && last_prefix_cache_hit_) {
+                const auto prefill_time_start = std::chrono::steady_clock::now();
+                int refresh_token = (int) prompt_tokens[n_prompt - 1];
+                ++last_prefill_forward_count_;
+                if (osh26_vk_gpu_forward_ex(&refresh_token, 1, std::max(0, n_pos - 1), OSH26_FORWARD_NEED_LOGITS) != 0) {
+                    result.error = "GPU cache refresh failed";
+                    hit_limit = false;
+                }
+                last_user_prefill_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - prefill_time_start).count();
+            }
         }
 
         for (; result.error.empty() && !result.cancelled && result.decoded_tokens < max_tokens;) {
@@ -665,13 +931,42 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     llama_sampler_free(sampler);
     llama_memory_clear(llama_get_memory(ctx_), false);
 
-    last_ttft_ms_ = result.ttft_ms;
-    last_decoded_tokens_ = result.decoded_tokens;
-    last_tokens_per_second_ = result.tokens_per_second;
-    last_finish_reason_ = result.finish_reason;
-    last_error_ = result.error;
-    last_token_ids_ = result.token_ids;
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        active_request_.reset();
+        running_ = false;
+        if (result.cancelled) {
+            total_cancelled_requests_ += 1;
+        } else {
+            total_completed_requests_ += 1;
+        }
+        queue_cv_.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_ttft_ms_ = result.ttft_ms;
+        last_decoded_tokens_ = result.decoded_tokens;
+        last_tokens_per_second_ = result.tokens_per_second;
+        last_finish_reason_ = result.finish_reason;
+        last_error_ = result.error;
+        last_token_ids_ = result.token_ids;
+        if (result.ok && !result.cancelled && result.error.empty() && use_gpu) {
+            insert_prefix_cache_locked(prompt_tokens);
+            last_prefix_tokens_ = prefix_cached_pos_;
+            last_prefix_cache_hit_ = last_prefix_tokens_ > 0 && request->reusable_prefix_tokens > 0;
+            if (request->reusable_prefix_tokens > 0) {
+                prefix_cache_hits_ += 1;
+                prefix_cache_reuse_tokens_ += request->reusable_prefix_tokens;
+                prefix_cache_block_reuse_ += (request->reusable_prefix_tokens + prefix_cache_block_size_ - 1) / std::max<size_t>(1, prefix_cache_block_size_);
+            } else {
+                prefix_cache_misses_ += 1;
+            }
+        } else {
+            prefix_cache_valid_ = false;
+            prefix_cached_pos_ = 0;
+            prefix_tokens_.clear();
+        }
+    }
     return result;
 }
 
@@ -685,7 +980,7 @@ void ComputeBackend::configure_backend(const std::string & mode, int n_gpu_layer
     }
     requested_gpu_layers_ = n_gpu_layers;
     if (old_backend != requested_backend_) {
-        reset_cache_locked();
+        reset_cache_locked(true);
     }
 }
 
@@ -693,40 +988,102 @@ void ComputeBackend::set_debug_correctness(bool enabled) {
     std::lock_guard<std::mutex> lock(mutex_);
     debug_correctness_ = enabled;
     osh26_vk_gpu_set_debug_correctness(enabled);
-    reset_cache_locked();
+    reset_cache_locked(true);
 }
 
 void ComputeBackend::reset_cache() {
     std::lock_guard<std::mutex> lock(mutex_);
-    reset_cache_locked();
+    reset_cache_locked(true);
 }
 
 void ComputeBackend::cancel() {
     cancel_requested_.store(true);
+    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+    if (active_request_ != nullptr) {
+        std::lock_guard<std::mutex> request_lock(active_request_->mutex);
+        active_request_->cancelled = true;
+    } else if (!request_queue_.empty()) {
+        std::lock_guard<std::mutex> request_lock(request_queue_.front()->mutex);
+        request_queue_.front()->cancelled = true;
+    }
+    queue_cv_.notify_all();
 }
 
 void ComputeBackend::release() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cancel_requested_.store(true);
-    if (ctx_ != nullptr) {
-        llama_free(ctx_);
-        ctx_ = nullptr;
+    std::shared_ptr<GenerationRequest> active_request;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        shutdown_requested_ = true;
+        cancel_requested_.store(true);
+        active_request = active_request_;
+        fail_queued_requests_locked("engine released", true);
+        queue_cv_.notify_all();
     }
-    if (model_ != nullptr) {
-        llama_model_free(model_);
-        model_ = nullptr;
+    if (active_request != nullptr) {
+        std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+        queue_cv_.wait(queue_lock, [&] {
+            return active_request_ == nullptr;
+        });
     }
-    osh26_vk_gpu_free();
-    model_path_.clear();
-    active_backend_ = "llama.cpp CPU";
-    reset_cache_locked();
-    last_prefill_forward_count_ = 0;
-    last_prefill_skipped_lm_head_count_ = 0;
-    running_ = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ctx_ != nullptr) {
+            llama_free(ctx_);
+            ctx_ = nullptr;
+        }
+        if (model_ != nullptr) {
+            llama_model_free(model_);
+            model_ = nullptr;
+        }
+        osh26_vk_gpu_free();
+        model_path_.clear();
+        active_backend_ = "llama.cpp CPU";
+        reset_cache_locked(true);
+        last_prefill_forward_count_ = 0;
+        last_prefill_skipped_lm_head_count_ = 0;
+        running_ = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        queue_cv_.notify_all();
+    }
 }
 
 std::string ComputeBackend::stats_json() const {
+    size_t queued_requests = 0;
+    bool has_active_request = false;
+    bool shutdown = false;
+    size_t queue_depth_peak = 0;
+    size_t total_submitted_requests = 0;
+    size_t total_rejected_requests = 0;
+    size_t total_cancelled_requests = 0;
+    size_t total_completed_requests = 0;
+    double total_queue_wait_ms = 0.0;
+    double last_queue_wait_ms = 0.0;
+    bool running = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        queued_requests = request_queue_.size();
+        has_active_request = active_request_ != nullptr;
+        shutdown = shutdown_requested_;
+        running = running_;
+        queue_depth_peak = queue_depth_peak_;
+        total_submitted_requests = total_submitted_requests_;
+        total_rejected_requests = total_rejected_requests_;
+        total_cancelled_requests = total_cancelled_requests_;
+        total_completed_requests = total_completed_requests_;
+        total_queue_wait_ms = total_queue_wait_ms_;
+        last_queue_wait_ms = last_queue_wait_ms_;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    const double prefix_hit_ratio = (prefix_cache_hits_ + prefix_cache_misses_) > 0
+        ? (double) prefix_cache_hits_ / (double) (prefix_cache_hits_ + prefix_cache_misses_)
+        : 0.0;
+    const double block_reuse_ratio = prefix_cache_entry_count_ > 0
+        ? (double) prefix_cache_reuse_tokens_ / (double) std::max<size_t>(1, prefix_cache_token_count_)
+        : 0.0;
     std::ostringstream out;
     out << "{\n"
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
@@ -740,11 +1097,22 @@ std::string ComputeBackend::stats_json() const {
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
-        << "  \"scheduler\": \"lite\",\n"
+        << "  \"scheduler\": \"queued-prefix-lite\",\n"
         << "  \"max_concurrent_requests\": 1,\n"
+        << "  \"max_pending_requests\": " << max_pending_requests_ << ",\n"
         << "  \"model_loaded\": " << (model_ ? "true" : "false") << ",\n"
         << "  \"model_path\": \"" << json_escape(model_path_) << "\",\n"
-        << "  \"running\": " << (running_ ? "true" : "false") << ",\n"
+        << "  \"running\": " << (running ? "true" : "false") << ",\n"
+        << "  \"shutdown_requested\": " << (shutdown ? "true" : "false") << ",\n"
+        << "  \"queue_depth\": " << queued_requests << ",\n"
+        << "  \"active_requests\": " << (has_active_request ? 1 : 0) << ",\n"
+        << "  \"queue_depth_peak\": " << queue_depth_peak << ",\n"
+        << "  \"total_submitted_requests\": " << total_submitted_requests << ",\n"
+        << "  \"total_rejected_requests\": " << total_rejected_requests << ",\n"
+        << "  \"total_cancelled_requests\": " << total_cancelled_requests << ",\n"
+        << "  \"total_completed_requests\": " << total_completed_requests << ",\n"
+        << "  \"last_queue_wait_ms\": " << last_queue_wait_ms << ",\n"
+        << "  \"avg_queue_wait_ms\": " << (total_submitted_requests > 0 ? total_queue_wait_ms / (double) total_submitted_requests : 0.0) << ",\n"
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
         << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
         << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
@@ -752,6 +1120,12 @@ std::string ComputeBackend::stats_json() const {
         << "  \"prefix_cache_valid\": " << (prefix_cache_valid_ ? "true" : "false") << ",\n"
         << "  \"prefix_cached_pos\": " << prefix_cached_pos_ << ",\n"
         << "  \"last_prefix_tokens\": " << last_prefix_tokens_ << ",\n"
+        << "  \"prefix_cache_entries\": " << prefix_cache_entry_count_ << ",\n"
+        << "  \"prefix_cache_tokens\": " << prefix_cache_token_count_ << ",\n"
+        << "  \"prefix_cache_evictions\": " << prefix_cache_evictions_ << ",\n"
+        << "  \"prefix_cache_hit_ratio\": " << prefix_hit_ratio << ",\n"
+        << "  \"prefix_cache_block_reuse_ratio\": " << block_reuse_ratio << ",\n"
+        << "  \"prefix_cache_fragmentation\": " << prefix_cache_fragmentation_locked() << ",\n"
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
         << "  \"last_prefill_forward_count\": " << last_prefill_forward_count_ << ",\n"
         << "  \"last_prefill_skipped_lm_head_count\": " << last_prefill_skipped_lm_head_count_ << ",\n"
