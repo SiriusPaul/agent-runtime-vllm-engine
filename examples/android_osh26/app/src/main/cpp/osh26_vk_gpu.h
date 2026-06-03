@@ -16,6 +16,11 @@ struct osh26_vk_stats {
     bool debug_correctness;
     float last_attention_max_abs_err;
     uint32_t attention_fallback_layers;
+    uint64_t last_forward_submit_count;
+    double last_forward_layers_ms;
+    double last_forward_attention_ms;
+    double last_forward_kv_update_ms;
+    double last_forward_lm_head_ms;
     int last_logits_top5[5];
     float last_logits_top5_values[5];
     double last_prefill_ms;
@@ -27,9 +32,18 @@ struct osh26_vk_stats {
     int last_lm_head_ref_top5[5];
 };
 
+typedef enum osh26_vk_forward_flags {
+    OSH26_FORWARD_NEED_LOGITS = 1u << 0,
+    OSH26_FORWARD_PREFILL_ONLY = 1u << 1,
+    OSH26_FORWARD_DEBUG_CHECK = 1u << 2,
+} osh26_vk_forward_flags_t;
+
 int osh26_vk_gpu_init(void);
 int osh26_vk_gpu_load_model(const char * model_path);
-int osh26_vk_gpu_forward(const int * tokens, int n_tokens, int pos);
+int osh26_vk_gpu_forward_ex(const int * tokens, int n_tokens, int pos, uint32_t flags);
+static inline int osh26_vk_gpu_forward(const int * tokens, int n_tokens, int pos) {
+    return osh26_vk_gpu_forward_ex(tokens, n_tokens, pos, OSH26_FORWARD_NEED_LOGITS);
+}
 const float * osh26_vk_gpu_logits(void);
 bool osh26_vk_gpu_ready(void);
 void osh26_vk_gpu_free(void);

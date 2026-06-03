@@ -93,6 +93,11 @@ static double g_last_prefill_ms;
 static double g_last_decode_ms;
 static double g_last_lm_head_ms;
 static double g_last_token_tps;
+static uint64_t g_last_forward_submit_count;
+static double g_last_forward_layers_ms;
+static double g_last_forward_attention_ms;
+static double g_last_forward_kv_update_ms;
+static double g_last_forward_lm_head_ms;
 static bool g_gpu_lm_head_enabled=true;
 static float g_last_lm_head_max_abs_err;
 static int g_last_lm_head_ref_top5[5];
@@ -138,7 +143,19 @@ static void rope_neox_cpu(float * x, int nt, int nh, int pos, int hd) {
 
 static VkCommandBuffer CB(void){VkCommandBuffer cb;VkCommandBufferAllocateInfo a={VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,0,CP,VK_COMMAND_BUFFER_LEVEL_PRIMARY,1};vkAllocateCommandBuffers(D,&a,&cb);VkCommandBufferBeginInfo b={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,0,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,0};vkBeginCommandBuffer(cb,&b);return cb;}
 static VkDescriptorSet g_ds[16];static int g_n;
-static void Sub(VkCommandBuffer cb){vkEndCommandBuffer(cb);VkFence f;VkFenceCreateInfo fi={VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,0,0};vkCreateFence(D,&fi,0,&f);VkSubmitInfo s={VK_STRUCTURE_TYPE_SUBMIT_INFO,0,0,0,0,1,&cb,0,0};vkQueueSubmit(Q,1,&s,f);vkWaitForFences(D,1,&f,VK_TRUE,UINT64_MAX);vkDestroyFence(D,f,0);vkFreeCommandBuffers(D,CP,1,&cb);if(g_n>0){vkFreeDescriptorSets(D,DP,(uint32_t)g_n,g_ds);g_n=0;}}
+static void Sub(VkCommandBuffer cb){
+    vkEndCommandBuffer(cb);
+    VkFence f;
+    VkFenceCreateInfo fi={VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,0,0};
+    vkCreateFence(D,&fi,0,&f);
+    VkSubmitInfo s={VK_STRUCTURE_TYPE_SUBMIT_INFO,0,0,0,0,1,&cb,0,0};
+    vkQueueSubmit(Q,1,&s,f);
+    vkWaitForFences(D,1,&f,VK_TRUE,UINT64_MAX);
+    vkDestroyFence(D,f,0);
+    vkFreeCommandBuffers(D,CP,1,&cb);
+    g_last_forward_submit_count++;
+    if(g_n>0){vkFreeDescriptorSets(D,DP,(uint32_t)g_n,g_ds);g_n=0;}
+}
 
 /* Bind buffers to descriptor set. NULL buffer → use dummy */
 static void BIND(VkCommandBuffer cb,VkBuf*b0,VkBuf*b1,VkBuf*b2,const uint32_t pc[4]){
@@ -324,6 +341,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_last_attention_max_abs_err=0.0f;g_attention_fallback_layers=0;
     memset(g_last_logits_top5,0,sizeof(g_last_logits_top5));memset(g_last_logits_top5_values,0,sizeof(g_last_logits_top5_values));
     g_last_prefill_ms=0.0;g_last_decode_ms=0.0;g_last_lm_head_ms=0.0;g_last_token_tps=0.0;g_last_lm_head_max_abs_err=0.0f;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));
+    g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
     if(!B_Dummy.B && !buf_alloc(&B_Dummy,256)){LOGE("alloc dummy");return -1;}
     if(!B_AttnConst.B && !buf_alloc(&B_AttnConst,sizeof(AttnConst))){LOGE("alloc attn const");return -1;}
     if(!B_KVConst.B && !buf_alloc(&B_KVConst,sizeof(AttnConst))){LOGE("alloc kv const");return -1;}
@@ -392,15 +410,16 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     mdl_ok=true;LOGI("Model loaded");return 0;}
 
 /* ---- Forward pass ---- */
-int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;static int fc=0;if(++fc<=3)LOGI("forward#%d nt=%d pos=%d",fc,nt,pos);pthread_mutex_lock(&Mtx);
+int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const bool debug_check=(g_debug_correctness||(flags&OSH26_FORWARD_DEBUG_CHECK)!=0);static int fc=0;if(debug_check&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
+    g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
     const double forward_start_ms=now_ms();
     float*hidden=B_Hid.P,*hnorm=B_Hid2.P,*qb=B_Qb.P,*kb=B_Kb.P,*vb=B_Vb.P,*sc=B_Sc.P,*att=B_Att.P,*gate=B_Gat.P,*up=B_Up.P,*dwn=B_Dwn.P,*kv=B_KV.P,*tmp=B_Tmp.P;
     for(int i=0;i<nt;i++){int tok=tokens[i];if(tok<0||tok>=VOCAB)tok=0;memcpy(hidden+i*HDIM,Emb+tok*HDIM,HDIM*sizeof(float));}
     buf_flush(&B_Hid);
-    int do_diag=(nt==1 && g_debug_correctness); /* expensive decode diagnostics */
+    int do_diag=(nt==1 && debug_check); /* expensive decode diagnostics */
     for(int l=0;l<N_LAY;l++){
         /* --- RMS attn + Q,K,V projection --- */
-        if(nt==1 && !g_debug_correctness){
+        if(nt==1 && !debug_check){
           VkCommandBuffer cb1=CB();
           RMS(cb1,nt,HDIM,&B_Hid,&W_ra[l],&B_Hid2);
           BARRIER(cb1);
@@ -424,7 +443,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
          float ecpu0=cpu[0]*inv*w[0],egpu0=hnorm[0];LOGI("D01 RMS: err=%.2e",(double)fabsf(ecpu0-egpu0));}
 
         /* --- Submit 1b: Q,K,V matmul (no RoPE) --- */
-        if(!(nt==1 && !g_debug_correctness)){
+        if(!(nt==1 && !debug_check)){
           VkCommandBuffer cb1b=CB();
           MM(cb1b,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
           MM(cb1b,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
@@ -437,7 +456,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
          LOGI("L%d Q0 e=%.1e K0 e=%.1e",l,(double)fabsf(cq0-qb[0]),(double)fabsf(ck0-kb[0]));}
 
         /* --- CPU: per-head Q/K RMSNorm required by Qwen3 --- */
-        if(nt==1 && !g_debug_correctness){
+        if(nt==1 && !debug_check){
           buf_inv(&B_Kb);buf_inv(&B_Vb);
         }else{
           buf_inv(&B_Qb);buf_inv(&B_Kb);
@@ -466,7 +485,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
         }
 
         /* --- CPU: Qwen3 uses NEOX RoPE layout, not adjacent even/odd pairs --- */
-        if(!(nt==1 && !g_debug_correctness)){ float qpre0 = qb[0], qpre64 = qb[HD/2];
+        if(!(nt==1 && !debug_check)){ float qpre0 = qb[0], qpre64 = qb[HD/2];
           rope_neox_cpu(qb, nt, N_HD, pos, HD);
           rope_neox_cpu(kb, nt, N_KVH, pos, HD);
           buf_flush(&B_Qb);buf_flush(&B_Kb);
@@ -479,8 +498,8 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
         }
 
         /* --- KV cache + MNN-style decode attention with CPU correctness gate --- */
-        { int kvo=l*2*MAX_S*KVD;bool att_on_host=false;bool att_done=false;
-          if(false && nt==1 && !g_debug_correctness && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+        { int kvo=l*2*MAX_S*KVD;bool att_on_host=false;bool att_done=false;const double kv_update_start_ms=now_ms();
+          if(false && nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
               AttnConst kc={{1,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_KVConst.P,&kc,sizeof(kc));
               { VkCommandBuffer cbk=CB();
@@ -496,11 +515,13 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
               memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));memcpy(kv+kvo+MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));
               pack_mnn_kv_cache(l,pos,nt,kb,vb);
           }
+          g_last_forward_kv_update_ms += now_ms()-kv_update_start_ms;
+          const double attention_start_ms=now_ms();
           if(!att_done && nt==1 && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
               AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_AttnConst.P,&ac,sizeof(ac));buf_flush(&B_AttnConst);
               { VkCommandBuffer cba=CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnConst);Sub(cba); }
-              if(g_debug_correctness){
+              if(debug_check){
                   cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
                   buf_inv(&B_Att);
                   float maxe=0.0f;for(int i=0;i<QDIM;i++){float e=fabsf(att[i]-tmp[i]);if(e>maxe)maxe=e;}
@@ -517,6 +538,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
               cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
               memcpy(att,tmp,nt*QDIM*sizeof(float));att_on_host=true;
           }
+          g_last_forward_attention_ms += now_ms()-attention_start_ms;
           if(att_on_host)buf_flush(&B_Att);
         }
         /* GPU output projection reads B_Att for both prefill and decode. */
@@ -532,7 +554,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
          LOGI("D08 ATTN: gpu[0]=%.6f cpu[0]=%.6f err=%.2e",(double)att[0],(double)att_cpu[0],(double)fabsf(att[0]-att_cpu[0]));
          free(score_cpu);free(att_cpu);}
 
-        if(nt==1 && !g_debug_correctness){
+        if(nt==1 && !debug_check){
           VkCommandBuffer cb2=CB();
           MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
           BARRIER(cb2);
@@ -594,10 +616,17 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
         }
         }
     }
-    if(nt==1)LOGI("L27hid: %.4f %.4f %.4f %.4f",(double)hidden[0],(double)hidden[1],(double)hidden[2],(double)hidden[3]);
-    else LOGI("PREFILL L27hid(last): %.4f %.4f %.4f %.4f",
+    g_last_forward_layers_ms=now_ms()-forward_start_ms;
+    if(prefill_only || !need_logits){
+        g_last_prefill_ms=g_last_forward_layers_ms;
+        pthread_mutex_unlock(&Mtx);return 0;
+    }
+    if(debug_check){
+        if(nt==1)LOGI("L27hid: %.4f %.4f %.4f %.4f",(double)hidden[0],(double)hidden[1],(double)hidden[2],(double)hidden[3]);
+        else LOGI("PREFILL L27hid(last): %.4f %.4f %.4f %.4f",
               (double)hidden[(nt-1)*HDIM + 0], (double)hidden[(nt-1)*HDIM + 1],
               (double)hidden[(nt-1)*HDIM + 2], (double)hidden[(nt-1)*HDIM + 3]);
+    }
     /* --- Final RMS + LM head --- */
     { VkCommandBuffer cbf=CB();
       RMS(cbf,nt,HDIM,&B_Hid,&W_Fnorm,&B_Hid2);
@@ -616,7 +645,7 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
         memcpy(B_Log.P+base,B_LogPart.P,F32(nv));
       }
     }
-    if(!g_gpu_lm_head_enabled || g_debug_correctness){
+    if(!g_gpu_lm_head_enabled || debug_check){
       float *cpu_logits=(float*)malloc(F32(VOCAB));
       buf_inv(head_src);
       const float *head_in=head_src->P;
@@ -635,19 +664,20 @@ int osh26_vk_gpu_forward(const int*tokens,int nt,int pos){if(!mdl_ok)return -1;s
         float maxe=0.0f;for(int v=0;v<VOCAB;v++){float e=fabsf(B_Log.P[v]-cpu_logits[v]);if(e>maxe)maxe=e;}
         g_last_lm_head_max_abs_err=maxe;
         int ref5[5]={0};float ref5v[5];update_top5(cpu_logits,ref5,ref5v);memcpy(g_last_lm_head_ref_top5,ref5,sizeof(ref5));
-        if(do_diag)LOGI("LM_HEAD gpu_ref max_abs_err=%.3e ref_top1=%d gpu_top1_pending",(double)maxe,ref5[0]);
+        if(debug_check)LOGI("LM_HEAD gpu_ref max_abs_err=%.3e ref_top1=%d gpu_top1_pending",(double)maxe,ref5[0]);
       }else{
         memcpy(B_Log.P,cpu_logits,F32(VOCAB));
       }
       free(cpu_logits);
     }
     g_last_lm_head_ms=now_ms()-lm_head_start_ms;
+    g_last_forward_lm_head_ms=g_last_lm_head_ms;
     {const float*logits=B_Log.P;
      int top5[5]={0};float top5v[5];update_top5(logits,top5,top5v);
      memcpy(g_last_logits_top5,top5,sizeof(top5));memcpy(g_last_logits_top5_values,top5v,sizeof(top5v));
-     if(nt==1)
+     if(debug_check&&nt==1)
      LOGI("LOGITS top5: %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f)",top5[0],(double)top5v[0],top5[1],(double)top5v[1],top5[2],(double)top5v[2],top5[3],(double)top5v[3],top5[4],(double)top5v[4]);}
-    if(nt>1){const int*top5=g_last_logits_top5;const float*top5v=g_last_logits_top5_values;
+    if(debug_check&&nt>1){const int*top5=g_last_logits_top5;const float*top5v=g_last_logits_top5_values;
      LOGI("PREFILL LOGITS top5: %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f)",top5[0],(double)top5v[0],top5[1],(double)top5v[1],top5[2],(double)top5v[2],top5[3],(double)top5v[3],top5[4],(double)top5v[4]);}
     const double forward_ms=now_ms()-forward_start_ms;
     if(nt>1){
@@ -672,5 +702,5 @@ void osh26_vk_gpu_free(void){
     if(Emb){free(Emb);Emb=NULL;}
     mdl_ok=false;
 }
-int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_lm_head_max_abs_err=g_last_lm_head_max_abs_err;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
+int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_lm_head_max_abs_err=g_last_lm_head_max_abs_err;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
 void osh26_vk_gpu_set_debug_correctness(bool enabled){g_debug_correctness=enabled;if(!enabled)g_last_attention_max_abs_err=0.0f;}

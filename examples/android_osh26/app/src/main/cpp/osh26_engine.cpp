@@ -131,6 +131,11 @@ std::string describe_osh26_vk_stats() {
         << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
+        << "\"last_forward_submit_count\":" << stats.last_forward_submit_count << ","
+        << "\"last_forward_layers_ms\":" << stats.last_forward_layers_ms << ","
+        << "\"last_forward_attention_ms\":" << stats.last_forward_attention_ms << ","
+        << "\"last_forward_kv_update_ms\":" << stats.last_forward_kv_update_ms << ","
+        << "\"last_forward_lm_head_ms\":" << stats.last_forward_lm_head_ms << ","
         << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
         << "\"last_decode_ms\":" << stats.last_decode_ms << ","
         << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
@@ -326,7 +331,7 @@ bool ComputeBackend::warm_prefix_cache_locked() {
         return false;
     }
 
-    if (osh26_vk_gpu_forward((int *) tokens.data(), n_prefix, 0) != 0) {
+    if (osh26_vk_gpu_forward_ex((int *) tokens.data(), n_prefix, 0, OSH26_FORWARD_PREFILL_ONLY) != 0) {
         __android_log_write(ANDROID_LOG_WARN, "OSH26GPU", "prefix cache warmup failed");
         return false;
     }
@@ -416,6 +421,8 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
 
     model_path_ = model_path;
     last_error_.clear();
+    last_prefill_forward_count_ = 0;
+    last_prefill_skipped_lm_head_count_ = 0;
     cancel_requested_.store(false);
     warm_prefix_cache_locked();
     return "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
@@ -443,6 +450,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     last_prefix_cache_hit_ = false;
     last_prefix_tokens_ = 0;
     last_user_prefill_tokens_ = 0;
+    last_prefill_forward_count_ = 0;
+    last_prefill_skipped_lm_head_count_ = 0;
     last_user_prefill_ms_ = 0.0;
     last_first_decode_ms_ = 0.0;
 
@@ -514,7 +523,13 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             if (user_prefill_tokens <= kShortPrefillTokenLimit) {
                 for (int i = 0; i < user_prefill_tokens; ++i) {
                     if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
-                    if (osh26_vk_gpu_forward((int *) (prefill_tokens + i), 1, n_pos) != 0) {
+                    const bool needs_logits = (i + 1 == user_prefill_tokens);
+                    const uint32_t forward_flags = needs_logits ? OSH26_FORWARD_NEED_LOGITS : OSH26_FORWARD_PREFILL_ONLY;
+                    ++last_prefill_forward_count_;
+                    if (!needs_logits) {
+                        ++last_prefill_skipped_lm_head_count_;
+                    }
+                    if (osh26_vk_gpu_forward_ex((int *) (prefill_tokens + i), 1, n_pos, forward_flags) != 0) {
                         result.error = "GPU short prefill failed";
                         hit_limit = false;
                         break;
@@ -522,7 +537,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                     n_pos += 1;
                 }
             } else if (!cancel_requested_.load()) {
-                if (osh26_vk_gpu_forward((int *) prefill_tokens, user_prefill_tokens, n_pos) != 0) {
+                ++last_prefill_forward_count_;
+                if (osh26_vk_gpu_forward_ex((int *) prefill_tokens, user_prefill_tokens, n_pos, OSH26_FORWARD_NEED_LOGITS) != 0) {
                     result.error = "GPU prefill failed";
                     hit_limit = false;
                 } else {
@@ -578,7 +594,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             }
 
             const auto decode_start = std::chrono::steady_clock::now();
-            if (osh26_vk_gpu_forward((int *) &token, 1, n_pos) != 0) {
+            if (osh26_vk_gpu_forward_ex((int *) &token, 1, n_pos, OSH26_FORWARD_NEED_LOGITS) != 0) {
                 result.error = "GPU decode failed";
                 hit_limit = false;
                 break;
@@ -593,6 +609,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         llama_memory_clear(llama_get_memory(ctx_), false);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
         last_user_prefill_tokens_ = n_prompt;
+        last_prefill_forward_count_ = 1;
+        last_prefill_skipped_lm_head_count_ = 0;
         for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
             if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
@@ -702,6 +720,8 @@ void ComputeBackend::release() {
     model_path_.clear();
     active_backend_ = "llama.cpp CPU";
     reset_cache_locked();
+    last_prefill_forward_count_ = 0;
+    last_prefill_skipped_lm_head_count_ = 0;
     running_ = false;
 }
 
@@ -733,6 +753,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"prefix_cached_pos\": " << prefix_cached_pos_ << ",\n"
         << "  \"last_prefix_tokens\": " << last_prefix_tokens_ << ",\n"
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
+        << "  \"last_prefill_forward_count\": " << last_prefill_forward_count_ << ",\n"
+        << "  \"last_prefill_skipped_lm_head_count\": " << last_prefill_skipped_lm_head_count_ << ",\n"
         << "  \"last_user_prefill_ms\": " << last_user_prefill_ms_ << ",\n"
         << "  \"last_first_decode_ms\": " << last_first_decode_ms_ << ",\n"
         << "  \"last_ttft_ms\": " << last_ttft_ms_ << ",\n"

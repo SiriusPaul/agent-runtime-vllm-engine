@@ -79,6 +79,8 @@ private:
     bool last_prefix_cache_hit_ = false;
     int last_prefix_tokens_ = 0;
     int last_user_prefill_tokens_ = 0;
+    int last_prefill_forward_count_ = 0;
+    int last_prefill_skipped_lm_head_count_ = 0;
     double last_user_prefill_ms_ = 0.0;
     double last_first_decode_ms_ = 0.0;
 };

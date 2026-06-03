@@ -1,5 +1,7 @@
 package org.osh26.llama;
 
+import android.util.Log;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -74,43 +76,51 @@ public final class LlmHttpServer {
         try (Socket ignored = socket;
              BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
              BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
-            String requestLine = reader.readLine();
-            if (requestLine == null || requestLine.trim().isEmpty()) {
-                return;
-            }
-
-            String[] parts = requestLine.split(" ");
-            if (parts.length < 2) {
-                writeJson(writer, 400, errorJson("bad_request", "invalid request line"));
-                return;
-            }
-
-            int contentLength = 0;
-            String line;
-            while ((line = reader.readLine()) != null && !line.isEmpty()) {
-                int colon = line.indexOf(':');
-                if (colon > 0 && "content-length".equals(line.substring(0, colon).trim().toLowerCase(Locale.US))) {
-                    contentLength = Integer.parseInt(line.substring(colon + 1).trim());
+            try {
+                String requestLine = reader.readLine();
+                if (requestLine == null || requestLine.trim().isEmpty()) {
+                    return;
                 }
-            }
 
-            String body = "";
-            if (contentLength > 0) {
-                char[] buffer = new char[contentLength];
-                int read = 0;
-                while (read < contentLength) {
-                    int n = reader.read(buffer, read, contentLength - read);
-                    if (n < 0) {
-                        break;
+                String[] parts = requestLine.split(" ");
+                if (parts.length < 2) {
+                    writeJson(writer, 400, errorJson("bad_request", "invalid request line"));
+                    return;
+                }
+
+                int contentLength = 0;
+                String line;
+                while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                    int colon = line.indexOf(':');
+                    if (colon > 0 && "content-length".equals(line.substring(0, colon).trim().toLowerCase(Locale.US))) {
+                        contentLength = Integer.parseInt(line.substring(colon + 1).trim());
                     }
-                    read += n;
                 }
-                body = new String(buffer, 0, read);
-            }
 
-            route(parts[0], parts[1], body, writer);
-        } catch (Exception e) {
-            e.printStackTrace();
+                String body = "";
+                if (contentLength > 0) {
+                    char[] buffer = new char[contentLength];
+                    int read = 0;
+                    while (read < contentLength) {
+                        int n = reader.read(buffer, read, contentLength - read);
+                        if (n < 0) {
+                            break;
+                        }
+                        read += n;
+                    }
+                    body = new String(buffer, 0, read);
+                }
+
+                route(parts[0], parts[1], body, writer);
+            } catch (Throwable t) {
+                Log.e("OSH26HTTP", "request failed: " + t.getMessage(), t);
+                try {
+                    writeJson(writer, 500, errorJson("internal_error", t.toString()));
+                } catch (Exception ignored2) {
+                }
+            }
+        } catch (IOException e) {
+            Log.e("OSH26HTTP", "socket failed: " + e.getMessage(), e);
         }
     }
 
@@ -142,11 +152,13 @@ public final class LlmHttpServer {
             String backend = request.optString("backend", "auto");
             int nGpuLayers = request.optInt("n_gpu_layers", -1);
             boolean debugCorrectness = request.optBoolean("debug_correctness", false);
+            Log.i("OSH26HTTP", "load_model path=" + modelPath + ", backend=" + backend + ", n_gpu_layers=" + nGpuLayers + ", debug_correctness=" + debugCorrectness);
             LlamaNative.configureBackend(backend, nGpuLayers);
             LlamaNative.setDebugCorrectness(debugCorrectness);
             JSONObject json = new JSONObject();
             json.put("result", LlamaNative.loadModel(modelPath));
             json.put("engine", new JSONObject(LlamaNative.getEngineStats()));
+            Log.i("OSH26HTTP", "load_model completed");
             writeJson(writer, 200, json);
             return;
         }
@@ -273,12 +285,11 @@ public final class LlmHttpServer {
             if (message == null) {
                 continue;
             }
-            String role = message.optString("role", "user");
             String content = message.optString("content", "");
             if (content.isEmpty()) {
                 continue;
             }
-            out.append(role).append(": ").append(content).append('\n');
+            out.append(content).append('\n');
         }
         return out.toString().trim();
     }
