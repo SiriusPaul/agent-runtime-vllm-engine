@@ -32,6 +32,11 @@ struct osh26_vk_stats {
     int last_lm_head_ref_top5[5];
 };
 
+struct osh26_vk_candidate {
+    int token;
+    float logit;
+};
+
 typedef enum osh26_vk_forward_flags {
     OSH26_FORWARD_NEED_LOGITS = 1u << 0,
     OSH26_FORWARD_PREFILL_ONLY = 1u << 1,
@@ -45,6 +50,7 @@ static inline int osh26_vk_gpu_forward(const int * tokens, int n_tokens, int pos
     return osh26_vk_gpu_forward_ex(tokens, n_tokens, pos, OSH26_FORWARD_NEED_LOGITS);
 }
 const float * osh26_vk_gpu_logits(void);
+int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate * out, int max_out);
 bool osh26_vk_gpu_ready(void);
 void osh26_vk_gpu_free(void);
 int osh26_vk_get_stats(struct osh26_vk_stats * out);

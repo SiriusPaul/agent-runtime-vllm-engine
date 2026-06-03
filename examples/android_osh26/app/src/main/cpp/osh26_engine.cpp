@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -23,7 +24,12 @@ namespace {
 constexpr int kDefaultContextSize = 1024;
 constexpr int kDefaultBatchSize = 512;
 constexpr int kDefaultMaxSeq = 4;
-constexpr int kShortPrefillTokenLimit = 32;
+constexpr int kShortPrefillTokenLimit = 64;
+constexpr int kMediumPrefillTokenLimit = 256;
+constexpr int kShortPrefillChunkSize = 64;
+constexpr int kLongPrefillChunkSize = 128;
+constexpr int kGpuTopkCandidateCount = 256;
+constexpr int kGpuLowIdStreakFallback = 3;
 
 std::once_flag g_backend_once;
 
@@ -192,6 +198,52 @@ std::string token_to_text(const llama_vocab * vocab, llama_token token) {
     }
     out.resize(static_cast<size_t>(written));
     return out;
+}
+
+int choose_prefill_chunk_size(int remaining_tokens) {
+    if (remaining_tokens <= kShortPrefillTokenLimit) {
+        return remaining_tokens;
+    }
+    if (remaining_tokens <= kMediumPrefillTokenLimit) {
+        return kShortPrefillChunkSize;
+    }
+    return kLongPrefillChunkSize;
+}
+
+bool gpu_logits_look_bad(
+        const osh26_vk_candidate * candidates,
+        int candidate_count,
+        int * low_id_streak,
+        std::string * reason) {
+    if (candidates == nullptr || candidate_count <= 0) {
+        if (reason != nullptr) {
+            *reason = "gpu logits unavailable";
+        }
+        return true;
+    }
+    const int top_count = std::min(candidate_count, 5);
+    for (int i = 0; i < top_count; ++i) {
+        if (!std::isfinite(candidates[i].logit)) {
+            if (reason != nullptr) {
+                *reason = "gpu logits contained non-finite values";
+            }
+            return true;
+        }
+    }
+    if (low_id_streak != nullptr) {
+        if (candidates[0].token >= 0 && candidates[0].token <= 20) {
+            *low_id_streak += 1;
+        } else {
+            *low_id_streak = 0;
+        }
+        if (*low_id_streak >= kGpuLowIdStreakFallback) {
+            if (reason != nullptr) {
+                *reason = "gpu top token stayed in low-id range";
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -618,6 +670,12 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     last_error_.clear();
     last_prefill_forward_count_ = 0;
     last_prefill_skipped_lm_head_count_ = 0;
+    last_prefill_chunk_size_ = 0;
+    last_prefill_chunk_count_ = 0;
+    last_prefill_logits_chunks_ = 0;
+    last_logits_sanity_ok_ = true;
+    last_logits_low_id_streak_ = 0;
+    last_logits_sanity_reason_.clear();
     cancel_requested_.store(false);
     warm_prefix_cache_locked();
     {
@@ -655,8 +713,17 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         last_user_prefill_tokens_ = 0;
         last_prefill_forward_count_ = 0;
         last_prefill_skipped_lm_head_count_ = 0;
+        last_prefill_chunk_size_ = 0;
+        last_prefill_chunk_count_ = 0;
+        last_prefill_logits_chunks_ = 0;
         last_user_prefill_ms_ = 0.0;
         last_first_decode_ms_ = 0.0;
+        last_logits_sanity_ok_ = true;
+        last_logits_low_id_streak_ = 0;
+        last_logits_sanity_reason_.clear();
+    last_logits_sanity_ok_ = true;
+    last_logits_low_id_streak_ = 0;
+    last_logits_sanity_reason_.clear();
 
         const auto prompt_build_start = std::chrono::steady_clock::now();
         prompt = build_prompt(user_prompt, options.enable_thinking);
@@ -770,46 +837,61 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         const int prefill_start = n_pos;
         const int user_prefill_tokens = n_prompt - prefill_start;
         last_user_prefill_tokens_ = std::max(0, user_prefill_tokens);
+        last_prefill_chunk_size_ = 0;
+        last_prefill_chunk_count_ = 0;
+        last_prefill_logits_chunks_ = 0;
+        last_logits_sanity_ok_ = true;
+        last_logits_low_id_streak_ = 0;
+        last_logits_sanity_reason_.clear();
         if (user_prefill_tokens > 0) {
             const auto prefill_time_start = std::chrono::steady_clock::now();
             const llama_token * prefill_tokens = prompt_tokens.data() + prefill_start;
-            if (user_prefill_tokens <= kShortPrefillTokenLimit) {
-                for (int i = 0; i < user_prefill_tokens; ++i) {
-                    if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
-                    const bool needs_logits = (i + 1 == user_prefill_tokens);
-                    const uint32_t forward_flags = needs_logits ? OSH26_FORWARD_NEED_LOGITS : OSH26_FORWARD_PREFILL_ONLY;
-                    ++last_prefill_forward_count_;
-                    if (!needs_logits) {
-                        ++last_prefill_skipped_lm_head_count_;
-                    }
-                    if (osh26_vk_gpu_forward_ex((int *) (prefill_tokens + i), 1, n_pos, forward_flags) != 0) {
-                        result.error = "GPU short prefill failed";
-                        hit_limit = false;
-                        break;
-                    }
-                    n_pos += 1;
-                }
-            } else if (!cancel_requested_.load()) {
+            const int chunk_size = choose_prefill_chunk_size(user_prefill_tokens);
+            last_prefill_chunk_size_ = chunk_size;
+            for (int offset = 0; offset < user_prefill_tokens; offset += chunk_size) {
+                if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
+                const int chunk_tokens = std::min(chunk_size, user_prefill_tokens - offset);
+                const bool needs_logits = (offset + chunk_tokens == user_prefill_tokens);
+                const uint32_t forward_flags = needs_logits ? OSH26_FORWARD_NEED_LOGITS : OSH26_FORWARD_PREFILL_ONLY;
                 ++last_prefill_forward_count_;
-                if (osh26_vk_gpu_forward_ex((int *) prefill_tokens, user_prefill_tokens, n_pos, OSH26_FORWARD_NEED_LOGITS) != 0) {
-                    result.error = "GPU prefill failed";
-                    hit_limit = false;
+                ++last_prefill_chunk_count_;
+                if (needs_logits) {
+                    ++last_prefill_logits_chunks_;
                 } else {
-                    n_pos += user_prefill_tokens;
+                    ++last_prefill_skipped_lm_head_count_;
                 }
-            } else {
-                result.cancelled = true;
-                hit_limit = false;
+                if (osh26_vk_gpu_forward_ex((int *) (prefill_tokens + offset), chunk_tokens, n_pos, forward_flags) != 0) {
+                    if (result.decoded_tokens == 0) {
+                        use_gpu = false;
+                        result.error.clear();
+                        goto cpu_path;
+                    }
+                    result.error = needs_logits ? "GPU prefill failed" : "GPU prefill chunk failed";
+                    hit_limit = false;
+                    break;
+                }
+                n_pos += chunk_tokens;
             }
             last_user_prefill_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - prefill_time_start).count();
         } else {
             last_user_prefill_ms_ = 0.0;
-            if (n_prompt > 0 && last_prefix_cache_hit_) {
+            const bool can_refresh_tail = n_prompt > 0
+                && last_prefix_cache_hit_
+                && prefix_cached_pos_ == n_prompt
+                && n_pos > 0
+                && !prefix_tokens_.empty()
+                && prompt_tokens.back() == prefix_tokens_.back();
+            if (can_refresh_tail) {
                 const auto prefill_time_start = std::chrono::steady_clock::now();
                 int refresh_token = (int) prompt_tokens[n_prompt - 1];
                 ++last_prefill_forward_count_;
                 if (osh26_vk_gpu_forward_ex(&refresh_token, 1, std::max(0, n_pos - 1), OSH26_FORWARD_NEED_LOGITS) != 0) {
+                    if (result.decoded_tokens == 0) {
+                        use_gpu = false;
+                        result.error.clear();
+                        goto cpu_path;
+                    }
                     result.error = "GPU cache refresh failed";
                     hit_limit = false;
                 }
@@ -823,19 +905,47 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
             const auto first_decode_start = first_token ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-            const float * logits = osh26_vk_gpu_logits();
-            int n_vocab = llama_vocab_n_tokens(vocab);
+            osh26_vk_candidate gpu_candidates[kGpuTopkCandidateCount];
+            const int candidate_count = osh26_vk_gpu_collect_topk(gpu_candidates, kGpuTopkCandidateCount);
+            if (candidate_count <= 0) {
+                if (result.decoded_tokens == 0) {
+                    use_gpu = false;
+                    goto cpu_path;
+                }
+                result.error = "GPU logits candidate collection failed";
+                hit_limit = false;
+                break;
+            }
+
+            if (gpu_logits_look_bad(gpu_candidates, candidate_count, &last_logits_low_id_streak_, &last_logits_sanity_reason_)) {
+                last_logits_sanity_ok_ = false;
+                __android_log_print(ANDROID_LOG_WARN, "OSH26GPU", "GPU logits sanity fallback: %s", last_logits_sanity_reason_.c_str());
+                if (result.decoded_tokens == 0) {
+                    use_gpu = false;
+                    result.error.clear();
+                    goto cpu_path;
+                }
+                result.error = "GPU logits sanity check failed: " + last_logits_sanity_reason_;
+                hit_limit = false;
+                break;
+            }
+            last_logits_sanity_ok_ = true;
+            last_logits_sanity_reason_.clear();
+
             static std::vector<llama_token_data> s_candidates;
-            if ((int)s_candidates.size() < n_vocab)
-                s_candidates.resize((size_t)n_vocab);
-            for (int i = 0; i < n_vocab; i++)
-                s_candidates[i] = { (llama_token)i, logits[i], 0.0f };
+            if ((int)s_candidates.size() < candidate_count) {
+                s_candidates.resize((size_t) candidate_count);
+            }
+            for (int i = 0; i < candidate_count; ++i) {
+                s_candidates[i] = { (llama_token) gpu_candidates[i].token, gpu_candidates[i].logit, 0.0f };
+            }
             llama_token_data_array cur_p = {
-                s_candidates.data(), (size_t)n_vocab, -1, false };
+                s_candidates.data(), (size_t) candidate_count, -1, false };
             llama_sampler_apply(sampler, &cur_p);
-            if (cur_p.selected < 0 || (size_t)cur_p.selected >= cur_p.size) {
+            if (cur_p.selected < 0 || (size_t) cur_p.selected >= cur_p.size) {
                 result.error = "sampler returned invalid index";
-                hit_limit = false; break;
+                hit_limit = false;
+                break;
             }
             llama_token token = cur_p.data[cur_p.selected].id;
 
@@ -871,12 +981,21 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                     std::chrono::steady_clock::now() - decode_start).count();
             }
         }
-    } else {
+    }
+cpu_path:
+    if (!use_gpu) {
         llama_memory_clear(llama_get_memory(ctx_), false);
+        n_pos = 0;
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
         last_user_prefill_tokens_ = n_prompt;
         last_prefill_forward_count_ = 1;
         last_prefill_skipped_lm_head_count_ = 0;
+        last_prefill_chunk_size_ = n_prompt;
+        last_prefill_chunk_count_ = n_prompt > 0 ? 1 : 0;
+        last_prefill_logits_chunks_ = n_prompt > 0 ? 1 : 0;
+        last_logits_sanity_ok_ = true;
+        last_logits_low_id_streak_ = 0;
+        last_logits_sanity_reason_.clear();
         for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
             if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
@@ -1042,6 +1161,12 @@ void ComputeBackend::release() {
         reset_cache_locked(true);
         last_prefill_forward_count_ = 0;
         last_prefill_skipped_lm_head_count_ = 0;
+        last_prefill_chunk_size_ = 0;
+        last_prefill_chunk_count_ = 0;
+        last_prefill_logits_chunks_ = 0;
+        last_logits_sanity_ok_ = true;
+        last_logits_low_id_streak_ = 0;
+        last_logits_sanity_reason_.clear();
         running_ = false;
     }
 
@@ -1129,8 +1254,14 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
         << "  \"last_prefill_forward_count\": " << last_prefill_forward_count_ << ",\n"
         << "  \"last_prefill_skipped_lm_head_count\": " << last_prefill_skipped_lm_head_count_ << ",\n"
+        << "  \"last_prefill_chunk_size\": " << last_prefill_chunk_size_ << ",\n"
+        << "  \"last_prefill_chunk_count\": " << last_prefill_chunk_count_ << ",\n"
+        << "  \"last_prefill_logits_chunks\": " << last_prefill_logits_chunks_ << ",\n"
         << "  \"last_user_prefill_ms\": " << last_user_prefill_ms_ << ",\n"
         << "  \"last_first_decode_ms\": " << last_first_decode_ms_ << ",\n"
+        << "  \"last_logits_sanity_ok\": " << (last_logits_sanity_ok_ ? "true" : "false") << ",\n"
+        << "  \"last_logits_low_id_streak\": " << last_logits_low_id_streak_ << ",\n"
+        << "  \"last_logits_sanity_reason\": \"" << json_escape(last_logits_sanity_reason_) << "\",\n"
         << "  \"last_ttft_ms\": " << last_ttft_ms_ << ",\n"
         << "  \"last_tokens_per_second\": " << last_tokens_per_second_ << ",\n"
         << "  \"last_finish_reason\": \"" << json_escape(last_finish_reason_) << "\",\n"

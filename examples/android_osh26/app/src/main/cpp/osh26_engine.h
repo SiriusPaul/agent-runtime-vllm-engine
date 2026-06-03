@@ -192,10 +192,16 @@ private:
     int last_user_prefill_tokens_ = 0;
     int last_prefill_forward_count_ = 0;
     int last_prefill_skipped_lm_head_count_ = 0;
+    int last_prefill_chunk_size_ = 0;
+    int last_prefill_chunk_count_ = 0;
+    int last_prefill_logits_chunks_ = 0;
     double last_user_prefill_ms_ = 0.0;
     double last_first_decode_ms_ = 0.0;
     size_t last_reusable_prefix_tokens_ = 0;
     size_t last_cached_prefix_entries_ = 0;
+    bool last_logits_sanity_ok_ = true;
+    int last_logits_low_id_streak_ = 0;
+    std::string last_logits_sanity_reason_;
 };
 
 class SchedulerLite {

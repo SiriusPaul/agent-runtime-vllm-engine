@@ -41,6 +41,8 @@
 #define MAX_S 1024
 #define HEAD_SHARD 16384
 #define HEAD_SHARDS ((VOCAB + HEAD_SHARD - 1) / HEAD_SHARD)
+#define LM_HEAD_LOCAL_TOPK 64
+#define LM_HEAD_GLOBAL_TOPK 256
 #define F32(n) ((VkDeviceSize)(n)*4)
 
 /* Individual buffer (MNN-style: each tensor gets own VkBuffer, offset always 0) */
@@ -89,6 +91,9 @@ static float g_last_attention_max_abs_err;
 static uint32_t g_attention_fallback_layers;
 static int g_last_logits_top5[5];
 static float g_last_logits_top5_values[5];
+static int g_last_logits_topk_ids[LM_HEAD_GLOBAL_TOPK];
+static float g_last_logits_topk_values[LM_HEAD_GLOBAL_TOPK];
+static int g_last_logits_topk_count;
 static double g_last_prefill_ms;
 static double g_last_decode_ms;
 static double g_last_lm_head_ms;
@@ -119,6 +124,41 @@ static void update_top5(const float*logits,int top5[5],float top5v[5]){
     for(int j=0;j<5;j++){float mx=-1e30f;int ti=0;
         for(int i=0;i<VOCAB;i++){bool dup=false;for(int k=0;k<j;k++)if(i==top5[k]){dup=true;break;}if(!dup&&logits[i]>mx){mx=logits[i];ti=i;}}
         top5[j]=ti;top5v[j]=mx;
+    }
+}
+
+static void topk_insert(int * ids, float * values, int * count, int limit, int token, float logit) {
+    if (!isfinite(logit) || limit <= 0) {
+        return;
+    }
+    if (*count < limit) {
+        int i = *count;
+        while (i > 0 && logit > values[i - 1]) {
+            ids[i] = ids[i - 1];
+            values[i] = values[i - 1];
+            --i;
+        }
+        ids[i] = token;
+        values[i] = logit;
+        *count += 1;
+        return;
+    }
+    if (logit <= values[limit - 1]) {
+        return;
+    }
+    int i = limit - 1;
+    while (i > 0 && logit > values[i - 1]) {
+        ids[i] = ids[i - 1];
+        values[i] = values[i - 1];
+        --i;
+    }
+    ids[i] = token;
+    values[i] = logit;
+}
+
+static void topk_collect(const float * logits, int base, int n, int * ids, float * values, int * count, int limit) {
+    for (int i = 0; i < n; ++i) {
+        topk_insert(ids, values, count, limit, base + i, logits[i]);
     }
 }
 
@@ -340,8 +380,9 @@ static bool read_gguf(struct gguf_context*g,FILE*f,const char*name,float*dst){
 int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_last_attention_max_abs_err=0.0f;g_attention_fallback_layers=0;
     memset(g_last_logits_top5,0,sizeof(g_last_logits_top5));memset(g_last_logits_top5_values,0,sizeof(g_last_logits_top5_values));
+    memset(g_last_logits_topk_ids,0,sizeof(g_last_logits_topk_ids));memset(g_last_logits_topk_values,0,sizeof(g_last_logits_topk_values));g_last_logits_topk_count=0;
     g_last_prefill_ms=0.0;g_last_decode_ms=0.0;g_last_lm_head_ms=0.0;g_last_token_tps=0.0;g_last_lm_head_max_abs_err=0.0f;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));
-    g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
+    g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;g_last_logits_topk_count=0;
     if(!B_Dummy.B && !buf_alloc(&B_Dummy,256)){LOGE("alloc dummy");return -1;}
     if(!B_AttnConst.B && !buf_alloc(&B_AttnConst,sizeof(AttnConst))){LOGE("alloc attn const");return -1;}
     if(!B_KVConst.B && !buf_alloc(&B_KVConst,sizeof(AttnConst))){LOGE("alloc kv const");return -1;}
@@ -636,13 +677,23 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     const double lm_head_start_ms=now_ms();
     VkBuf *head_src=(nt>1)?&B_Tmp:&B_Hid2;
     if(g_gpu_lm_head_enabled){
+      g_last_logits_topk_count = 0;
       for(int s=0;s<HEAD_SHARDS;s++){
         int base=s*HEAD_SHARD;
         int nv=VOCAB-base;
         if(nv>HEAD_SHARD)nv=HEAD_SHARD;
         { VkCommandBuffer cbl=CB();MM(cbl,&W_HeadShard[s],head_src,&B_LogPart,1,nv,HDIM);Sub(cbl); }
         buf_inv(&B_LogPart);
-        memcpy(B_Log.P+base,B_LogPart.P,F32(nv));
+        int shard_ids[LM_HEAD_LOCAL_TOPK];
+        float shard_vals[LM_HEAD_LOCAL_TOPK];
+        int shard_count = 0;
+        topk_collect(B_LogPart.P, base, nv, shard_ids, shard_vals, &shard_count, LM_HEAD_LOCAL_TOPK);
+        for (int i = 0; i < shard_count; ++i) {
+            topk_insert(g_last_logits_topk_ids, g_last_logits_topk_values, &g_last_logits_topk_count, LM_HEAD_GLOBAL_TOPK, shard_ids[i], shard_vals[i]);
+        }
+        if (debug_check) {
+            memcpy(B_Log.P + base, B_LogPart.P, F32(nv));
+        }
       }
     }
     if(!g_gpu_lm_head_enabled || debug_check){
@@ -665,15 +716,39 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
         g_last_lm_head_max_abs_err=maxe;
         int ref5[5]={0};float ref5v[5];update_top5(cpu_logits,ref5,ref5v);memcpy(g_last_lm_head_ref_top5,ref5,sizeof(ref5));
         if(debug_check)LOGI("LM_HEAD gpu_ref max_abs_err=%.3e ref_top1=%d gpu_top1_pending",(double)maxe,ref5[0]);
+        if (debug_check) {
+            g_last_logits_topk_count = 0;
+            for (int v = 0; v < VOCAB; ++v) {
+                topk_insert(g_last_logits_topk_ids, g_last_logits_topk_values, &g_last_logits_topk_count, LM_HEAD_GLOBAL_TOPK, v, cpu_logits[v]);
+            }
+        }
       }else{
         memcpy(B_Log.P,cpu_logits,F32(VOCAB));
+        g_last_logits_topk_count = 0;
+        for (int v = 0; v < VOCAB; ++v) {
+            topk_insert(g_last_logits_topk_ids, g_last_logits_topk_values, &g_last_logits_topk_count, LM_HEAD_GLOBAL_TOPK, v, cpu_logits[v]);
+        }
       }
       free(cpu_logits);
     }
     g_last_lm_head_ms=now_ms()-lm_head_start_ms;
     g_last_forward_lm_head_ms=g_last_lm_head_ms;
-    {const float*logits=B_Log.P;
-     int top5[5]={0};float top5v[5];update_top5(logits,top5,top5v);
+    {
+     int top5[5]={0};float top5v[5];
+     if (g_last_logits_topk_count > 0) {
+         const int top_count = g_last_logits_topk_count < 5 ? g_last_logits_topk_count : 5;
+         for (int i = 0; i < top_count; ++i) {
+             top5[i] = g_last_logits_topk_ids[i];
+             top5v[i] = g_last_logits_topk_values[i];
+         }
+         for (int i = top_count; i < 5; ++i) {
+             top5[i] = 0;
+             top5v[i] = -1e30f;
+         }
+     } else {
+         const float *logits=B_Log.P;
+         update_top5(logits,top5,top5v);
+     }
      memcpy(g_last_logits_top5,top5,sizeof(top5));memcpy(g_last_logits_top5_values,top5v,sizeof(top5v));
      if(debug_check&&nt==1)
      LOGI("LOGITS top5: %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f) %d(%.1f)",top5[0],(double)top5v[0],top5[1],(double)top5v[1],top5[2],(double)top5v[2],top5[3],(double)top5v[3],top5[4],(double)top5v[4]);}
@@ -689,6 +764,20 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     pthread_mutex_unlock(&Mtx);return 0;}
 
 const float*osh26_vk_gpu_logits(void){return B_Log.P;}
+int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate *out, int max_out){
+    if (g_last_logits_topk_count <= 0) {
+        return 0;
+    }
+    if (out == NULL || max_out <= 0) {
+        return g_last_logits_topk_count;
+    }
+    const int n = g_last_logits_topk_count < max_out ? g_last_logits_topk_count : max_out;
+    for (int i = 0; i < n; ++i) {
+        out[i].token = g_last_logits_topk_ids[i];
+        out[i].logit = g_last_logits_topk_values[i];
+    }
+    return n;
+}
 bool osh26_vk_gpu_ready(void){return vk_ok&&mdl_ok;}
 void osh26_vk_gpu_free(void){
     buf_free(&B_LogPart);buf_free(&B_Log);buf_free(&B_Tmp);buf_free(&B_Dwn);buf_free(&B_Up);buf_free(&B_Gat);
