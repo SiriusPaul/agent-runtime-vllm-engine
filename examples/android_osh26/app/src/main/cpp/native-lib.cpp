@@ -2,7 +2,9 @@
 
 #include "osh26_engine.h"
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -23,8 +25,110 @@ std::string jstring_to_string(JNIEnv * env, jstring value) {
     return result;
 }
 
+size_t utf8_valid_prefix_length(const std::string & value) {
+    size_t i = 0;
+    const size_t size = value.size();
+    while (i < size) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+
+        size_t expected = 0;
+        uint32_t codepoint = 0;
+        if ((c >> 5) == 0x6) {
+            expected = 2;
+            codepoint = c & 0x1F;
+        } else if ((c >> 4) == 0xE) {
+            expected = 3;
+            codepoint = c & 0x0F;
+        } else if ((c >> 3) == 0x1E) {
+            expected = 4;
+            codepoint = c & 0x07;
+        } else {
+            break;
+        }
+
+        if (i + expected > size) {
+            break;
+        }
+
+        bool valid = true;
+        for (size_t j = 1; j < expected; ++j) {
+            const unsigned char d = static_cast<unsigned char>(value[i + j]);
+            if ((d >> 6) != 0x2) {
+                valid = false;
+                break;
+            }
+            codepoint = (codepoint << 6) | (d & 0x3F);
+        }
+        if (!valid) {
+            break;
+        }
+
+        if ((expected == 2 && codepoint < 0x80)
+                || (expected == 3 && codepoint < 0x800)
+                || (expected == 4 && codepoint < 0x10000)
+                || (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+                || codepoint > 0x10FFFF) {
+            break;
+        }
+
+        i += expected;
+    }
+    return i;
+}
+
 jstring string_to_jstring(JNIEnv * env, const std::string & value) {
-    return env->NewStringUTF(value.c_str());
+    jbyteArray bytes = env->NewByteArray(static_cast<jsize>(value.size()));
+    if (bytes == nullptr) {
+        return nullptr;
+    }
+    if (!value.empty()) {
+        env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(value.size()), reinterpret_cast<const jbyte *>(value.data()));
+    }
+
+    jclass charset_class = env->FindClass("java/nio/charset/StandardCharsets");
+    if (charset_class == nullptr) {
+        env->DeleteLocalRef(bytes);
+        return nullptr;
+    }
+    jfieldID utf8_field = env->GetStaticFieldID(charset_class, "UTF_8", "Ljava/nio/charset/Charset;");
+    if (utf8_field == nullptr) {
+        env->DeleteLocalRef(charset_class);
+        env->DeleteLocalRef(bytes);
+        return nullptr;
+    }
+    jobject utf8_charset = env->GetStaticObjectField(charset_class, utf8_field);
+    if (utf8_charset == nullptr) {
+        env->DeleteLocalRef(charset_class);
+        env->DeleteLocalRef(bytes);
+        return nullptr;
+    }
+
+    jclass string_class = env->FindClass("java/lang/String");
+    if (string_class == nullptr) {
+        env->DeleteLocalRef(utf8_charset);
+        env->DeleteLocalRef(charset_class);
+        env->DeleteLocalRef(bytes);
+        return nullptr;
+    }
+    jmethodID ctor = env->GetMethodID(string_class, "<init>", "([BLjava/nio/charset/Charset;)V");
+    if (ctor == nullptr) {
+        env->DeleteLocalRef(string_class);
+        env->DeleteLocalRef(utf8_charset);
+        env->DeleteLocalRef(charset_class);
+        env->DeleteLocalRef(bytes);
+        return nullptr;
+    }
+
+    jstring result = static_cast<jstring>(env->NewObject(string_class, ctor, bytes, utf8_charset));
+    env->DeleteLocalRef(string_class);
+    env->DeleteLocalRef(utf8_charset);
+    env->DeleteLocalRef(charset_class);
+    env->DeleteLocalRef(bytes);
+    return result;
 }
 
 std::string json_escape(const std::string & value) {
@@ -74,7 +178,7 @@ void call_stream_callback(jobject callback, const char * method_name, const std:
     jclass callback_class = env->GetObjectClass(callback);
     jmethodID method = env->GetMethodID(callback_class, method_name, "(Ljava/lang/String;)V");
     if (method != nullptr) {
-        jstring payload = env->NewStringUTF(value.c_str());
+        jstring payload = string_to_jstring(env, value);
         env->CallVoidMethod(callback, method, payload);
         env->DeleteLocalRef(payload);
     }
@@ -105,8 +209,8 @@ void call_complete_callback(jobject callback, const std::string & text, const st
     jclass callback_class = env->GetObjectClass(callback);
     jmethodID method = env->GetMethodID(callback_class, "onComplete", "(Ljava/lang/String;Ljava/lang/String;)V");
     if (method != nullptr) {
-        jstring payload = env->NewStringUTF(text.c_str());
-        jstring reason = env->NewStringUTF(finish_reason.c_str());
+        jstring payload = string_to_jstring(env, text);
+        jstring reason = string_to_jstring(env, finish_reason);
         env->CallVoidMethod(callback, method, payload, reason);
         env->DeleteLocalRef(reason);
         env->DeleteLocalRef(payload);
@@ -167,12 +271,23 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_org_osh26_llama_LlamaNative_generateStream(
         JNIEnv * env, jclass, jstring j_prompt, jobject callback, jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
     jobject callback_ref = env->NewGlobalRef(callback);
+    std::string pending_stream_bytes;
     osh26::GenerateResult result = osh26::engine().generate(
             jstring_to_string(env, j_prompt),
             options_from_args(max_tokens, temperature, top_p, seed, thinking),
-            [callback_ref](const std::string & token) {
-                call_stream_callback(callback_ref, "onToken", token);
+            [callback_ref, &pending_stream_bytes](const std::string & token) {
+                pending_stream_bytes += token;
+                const size_t emit_len = utf8_valid_prefix_length(pending_stream_bytes);
+                if (emit_len > 0) {
+                    call_stream_callback(callback_ref, "onToken", pending_stream_bytes.substr(0, emit_len));
+                    pending_stream_bytes.erase(0, emit_len);
+                }
             });
+
+    if (!pending_stream_bytes.empty()) {
+        call_stream_callback(callback_ref, "onToken", pending_stream_bytes);
+        pending_stream_bytes.clear();
+    }
 
     if (result.ok) {
         call_complete_callback(callback_ref, result.text, result.finish_reason);

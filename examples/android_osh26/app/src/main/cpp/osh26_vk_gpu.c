@@ -540,17 +540,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
 
         /* --- KV cache + MNN-style decode attention with CPU correctness gate --- */
         { int kvo=l*2*MAX_S*KVD;bool att_on_host=false;bool att_done=false;const double kv_update_start_ms=now_ms();
-          if(false && nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+          if(nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
               AttnConst kc={{1,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_KVConst.P,&kc,sizeof(kc));
               { VkCommandBuffer cbk=CB();
                 KV_UPDATE(cbk,&B_Kb,&B_Vb,&B_KCache[l],&B_VCache[l],&B_KVConst,nt);
-                BARRIER(cbk);
-                AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
-                memcpy(B_AttnConst.P,&ac,sizeof(ac));
-                DEC_ATTN(cbk,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnConst);
                 Sub(cbk);
-                att_done=true;
               }
           }else{
               memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));memcpy(kv+kvo+MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));

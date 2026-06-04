@@ -6,6 +6,7 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.util.Log;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ScrollView;
@@ -14,9 +15,13 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_IMPORT_MODEL = 1001;
+    private static final String TAG = "OSH26Main";
 
     private TextView engineStatus;
     private TextView chatTranscript;
@@ -25,8 +30,20 @@ public class MainActivity extends Activity {
     private EditText messageInput;
     private Button sendMessage;
     private final LlmHttpServer httpServer = new LlmHttpServer();
-    private final StringBuilder conversationContext = new StringBuilder();
+    private final ArrayDeque<String> conversationTurns = new ArrayDeque<>();
+    private int conversationContextChars = 0;
+    private final ExecutorService nativeExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "osh26-native-control");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ExecutorService generationExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "osh26-generation");
+        thread.setDaemon(true);
+        return thread;
+    });
     private boolean generating = false;
+    private boolean loadingModel = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,7 +66,7 @@ public class MainActivity extends Activity {
         File modelDir = new File(getFilesDir(), "models");
         modelPath.setText(new File(modelDir, "qwen3-0.6b.gguf").getAbsolutePath());
         appendSystemLine(httpServer.start());
-        refreshStats();
+        refreshStatsAsync();
 
         importModel.setOnClickListener(v -> {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -59,16 +76,53 @@ public class MainActivity extends Activity {
         });
 
         loadModel.setOnClickListener(v -> {
-            appendSystemLine(LlamaNative.loadModel(modelPath.getText().toString()));
-            refreshStats();
+            if (loadingModel) {
+                return;
+            }
+            final String path = modelPath.getText().toString();
+            loadingModel = true;
+            loadModel.setEnabled(false);
+            appendSystemLine("loading model: " + path);
+            nativeExecutor.execute(() -> {
+                try {
+                    final String status = LlamaNative.loadModel(path);
+                    runOnUiThread(() -> {
+                        loadingModel = false;
+                        loadModel.setEnabled(true);
+                        appendSystemLine(status);
+                        refreshStatsAsync();
+                    });
+                } catch (Throwable t) {
+                    Log.e(TAG, "loadModel failed", t);
+                    runOnUiThread(() -> {
+                        loadingModel = false;
+                        loadModel.setEnabled(true);
+                        appendSystemLine("load failed: " + t.getMessage());
+                        refreshStatsAsync();
+                    });
+                }
+            });
         });
 
         resetCache.setOnClickListener(v -> {
-            LlamaNative.resetCache();
-            conversationContext.setLength(0);
+            clearConversationContext();
             chatTranscript.setText("");
-            appendSystemLine("KV cache reset");
-            refreshStats();
+            appendSystemLine("resetting KV cache...");
+            nativeExecutor.execute(() -> {
+                try {
+                    LlamaNative.resetCache();
+                    runOnUiThread(() -> {
+                        appendSystemLine("KV cache reset");
+                        refreshStatsAsync();
+                    });
+                } catch (Throwable t) {
+                    Log.e(TAG, "resetCache failed", t);
+                    runOnUiThread(() -> {
+                        appendSystemLine("reset failed: " + t.getMessage());
+                        refreshStatsAsync();
+                    });
+                }
+            });
         });
 
         sendMessage.setOnClickListener(v -> {
@@ -84,41 +138,52 @@ public class MainActivity extends Activity {
             String generationPrompt = buildConversationPrompt(userMessage);
             generating = true;
             sendMessage.setEnabled(false);
-            new Thread(() -> {
-                String status = LlamaNative.generateStream(generationPrompt, new LlamaNative.StreamCallback() {
-                    @Override
-                    public void onToken(String token) {
-                        runOnUiThread(() -> {
-                            chatTranscript.append(token);
-                            scrollChatToBottom();
-                        });
-                    }
+            Log.i(TAG, "generate request: promptChars=" + generationPrompt.length()
+                    + ", historyChars=" + conversationContextChars);
+            generationExecutor.execute(() -> {
+                try {
+                    String status = LlamaNative.generateStream(generationPrompt, new LlamaNative.StreamCallback() {
+                        @Override
+                        public void onToken(String token) {
+                            runOnUiThread(() -> {
+                                chatTranscript.append(token);
+                                scrollChatToBottom();
+                            });
+                        }
 
-                    @Override
-                    public void onComplete(String text, String finishReason) {
-                        runOnUiThread(() -> {
-                            generating = false;
-                            sendMessage.setEnabled(true);
-                            conversationContext.append("User: ").append(userMessage).append('\n')
-                                    .append("Assistant: ").append(text).append("\n\n");
-                            appendSystemLine("complete: " + finishReason);
-                            refreshStats();
-                        });
-                    }
+                        @Override
+                        public void onComplete(String text, String finishReason) {
+                            runOnUiThread(() -> {
+                                generating = false;
+                                sendMessage.setEnabled(true);
+                                appendConversationTurn(userMessage, text);
+                                appendSystemLine("complete: " + finishReason);
+                                refreshStatsAsync();
+                            });
+                        }
 
-                    @Override
-                    public void onError(String error) {
-                        runOnUiThread(() -> {
-                            generating = false;
-                            sendMessage.setEnabled(true);
-                            appendSystemLine("ERROR: " + error);
-                            refreshStats();
-                        });
-                    }
-                }, 128, 0.6f, 0.95f, 0xCAFE, false);
-                runOnUiThread(() -> appendSystemLine(status));
-            }, "osh26-ui-generate").start();
-            refreshStats();
+                        @Override
+                        public void onError(String error) {
+                            runOnUiThread(() -> {
+                                generating = false;
+                                sendMessage.setEnabled(true);
+                                appendSystemLine("ERROR: " + error);
+                                refreshStatsAsync();
+                            });
+                        }
+                    }, 128, 0.6f, 0.95f, 0xCAFE, false);
+                    runOnUiThread(() -> appendSystemLine(status));
+                } catch (Throwable t) {
+                    Log.e(TAG, "generateStream failed", t);
+                    runOnUiThread(() -> {
+                        generating = false;
+                        sendMessage.setEnabled(true);
+                        appendSystemLine("ERROR: " + t.getMessage());
+                        refreshStatsAsync();
+                    });
+                }
+            });
+            refreshStatsAsync();
         });
 
         cancel.setOnClickListener(v -> {
@@ -126,25 +191,34 @@ public class MainActivity extends Activity {
             generating = false;
             sendMessage.setEnabled(true);
             appendSystemLine("cancel requested");
-            refreshStats();
+            refreshStatsAsync();
         });
 
         startServer.setOnClickListener(v -> {
             appendSystemLine(httpServer.start());
-            refreshStats();
+            refreshStatsAsync();
         });
 
         stopServer.setOnClickListener(v -> {
             httpServer.stop();
             appendSystemLine("HTTP server stopped");
-            refreshStats();
+            refreshStatsAsync();
         });
     }
 
     @Override
     protected void onDestroy() {
         httpServer.stop();
-        LlamaNative.release();
+        LlamaNative.cancel();
+        nativeExecutor.execute(() -> {
+            try {
+                LlamaNative.release();
+            } catch (Throwable t) {
+                Log.e(TAG, "release failed", t);
+            }
+        });
+        nativeExecutor.shutdown();
+        generationExecutor.shutdown();
         super.onDestroy();
     }
 
@@ -207,17 +281,42 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    private void refreshStats() {
-        String status = LlamaNative.getEngineStats();
-        status += "\nhttp_server_running=" + httpServer.isRunning() + ", port=" + LlmHttpServer.PORT;
-        engineStatus.setText(status);
+    private void refreshStatsAsync() {
+        if (nativeExecutor.isShutdown()) {
+            return;
+        }
+        nativeExecutor.execute(() -> {
+            try {
+                final String status = LlamaNative.getEngineStats()
+                        + "\nhttp_server_running=" + httpServer.isRunning()
+                        + ", port=" + LlmHttpServer.PORT;
+                runOnUiThread(() -> engineStatus.setText(status));
+            } catch (Throwable t) {
+                Log.e(TAG, "refreshStats failed", t);
+            }
+        });
     }
 
     private String buildConversationPrompt(String userMessage) {
-        if (conversationContext.length() == 0) {
-            return userMessage;
+        StringBuilder prompt = new StringBuilder(Math.max(64, conversationContextChars + userMessage.length() + 32));
+        for (String turn : conversationTurns) {
+            prompt.append(turn);
         }
-        return conversationContext.toString() + "User: " + userMessage;
+        prompt.append("User: ").append(userMessage).append('\n');
+        prompt.append("Assistant: ");
+        return prompt.toString();
+    }
+
+    private void appendConversationTurn(String userMessage, String assistantText) {
+        String turn = "User: " + userMessage + '\n'
+                + "Assistant: " + assistantText + "\n\n";
+        conversationTurns.addLast(turn);
+        conversationContextChars += turn.length();
+    }
+
+    private void clearConversationContext() {
+        conversationTurns.clear();
+        conversationContextChars = 0;
     }
 
     private void appendChatLine(String role, String text) {
