@@ -1,3 +1,7 @@
+#version 450
+#define FLOAT float
+#define FLOAT4 vec4
+
 layout(set=0, binding=0) buffer s0 {
     float data[];
 } uOAcc;

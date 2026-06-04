@@ -140,12 +140,20 @@ public class MainActivity extends Activity {
             sendMessage.setEnabled(false);
             Log.i(TAG, "generate request: promptChars=" + generationPrompt.length()
                     + ", historyChars=" + conversationContextChars);
+            appendSystemLine("generation: tokenizing prompt");
+            appendSystemLine("generation: prefix cache check");
+            appendSystemLine("generation: prefill in progress");
             generationExecutor.execute(() -> {
                 try {
+                    final boolean[] firstTokenSeen = new boolean[] { false };
                     String status = LlamaNative.generateStream(generationPrompt, new LlamaNative.StreamCallback() {
                         @Override
                         public void onToken(String token) {
                             runOnUiThread(() -> {
+                                if (!firstTokenSeen[0]) {
+                                    firstTokenSeen[0] = true;
+                                    appendSystemLine("generation: decoding");
+                                }
                                 chatTranscript.append(token);
                                 scrollChatToBottom();
                             });

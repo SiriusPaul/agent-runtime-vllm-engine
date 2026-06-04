@@ -13,6 +13,7 @@ struct osh26_vk_stats {
     uint64_t buffers_allocated, buffers_freed, current_buffer_bytes, peak_buffer_bytes;
     uint64_t expanded_tensor_uploads, expanded_upload_bytes, f16_uploads, bf16_uploads, q4_k_uploads, q6_k_uploads;
     bool mnn_attention_enabled;
+    bool mnn_prefill_attention_enabled;
     bool debug_correctness;
     float last_attention_max_abs_err;
     uint32_t attention_fallback_layers;
@@ -21,6 +22,10 @@ struct osh26_vk_stats {
     double last_forward_attention_ms;
     double last_forward_kv_update_ms;
     double last_forward_lm_head_ms;
+    double last_prefill_qkv_ms;
+    double last_prefill_cpu_post_ms;
+    double last_prefill_attention_ms;
+    double last_prefill_ffn_ms;
     int last_logits_top5[5];
     float last_logits_top5_values[5];
     double last_prefill_ms;

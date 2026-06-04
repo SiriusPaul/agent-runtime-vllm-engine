@@ -84,17 +84,24 @@ function Stage-Model {
     Write-Host "staging model: $Path -> $appAbsPath"
     Invoke-Adb push $Path $tmpPath
     Invoke-Adb shell chmod 644 $tmpPath
-    Invoke-Adb shell run-as $PackageName mkdir -p files/models
+    try {
+        Invoke-Adb shell run-as $PackageName ls files/models | Out-Null
+    } catch {
+        Invoke-Adb shell run-as $PackageName mkdir files/models
+    }
     Invoke-Adb shell run-as $PackageName cp $tmpPath $appRelPath
 
     return $appAbsPath
 }
 
 function Wait-Health {
-    for ($i = 0; $i -lt 30; $i++) {
+    for ($i = 0; $i -lt 240; $i++) {
         try {
             return Invoke-RestMethod -Method Get -Uri "$BaseUrl/health" -TimeoutSec 2
         } catch {
+            if (($i % 10) -eq 0) {
+                Write-Host "waiting for health... $($i + 1)s"
+            }
             Start-Sleep -Seconds 1
         }
     }
@@ -150,6 +157,24 @@ function Assert-VulkanHealthGate {
     if (-not $vk) {
         throw "missing engine.vulkan health stats"
     }
+    foreach ($field in @(
+        "last_prefill_qkv_ms",
+        "last_prefill_cpu_post_ms",
+        "last_prefill_attention_ms",
+        "last_prefill_ffn_ms"
+    )) {
+        if (-not ($vk.PSObject.Properties.Name -contains $field)) {
+            throw "missing engine.vulkan field: $field"
+        }
+    }
+    foreach ($field in @(
+        "last_load_model_ms",
+        "last_prefix_warm_ms"
+    )) {
+        if (-not ($Health.engine.PSObject.Properties.Name -contains $field)) {
+            throw "missing engine field: $field"
+        }
+    }
     if ($vk.attention_fallback_layers -ne 0) {
         throw "attention_fallback_layers expected 0, got $($vk.attention_fallback_layers)"
     }
@@ -188,6 +213,21 @@ function Get-Health {
     $stats = Invoke-RestMethod -Method Get -Uri "$BaseUrl/health" -TimeoutSec 10
     Write-Host "$Label health:"
     $stats | ConvertTo-Json -Depth 8 | Write-Host
+    if ($stats.engine -and $stats.engine.vulkan) {
+        $vk = $stats.engine.vulkan
+        Write-Host ("{0} timings: load={1}ms prefixWarm={2}ms qkv={3}ms cpuPost={4}ms attn={5}ms ffn={6}ms prefill={7}ms decode={8}ms ttft={9}ms tps={10}" -f `
+            $Label,
+            $stats.engine.last_load_model_ms,
+            $stats.engine.last_prefix_warm_ms,
+            $vk.last_prefill_qkv_ms,
+            $vk.last_prefill_cpu_post_ms,
+            $vk.last_prefill_attention_ms,
+            $vk.last_prefill_ffn_ms,
+            $vk.last_prefill_ms,
+            $vk.last_decode_ms,
+            $stats.engine.last_ttft_ms,
+            $stats.engine.last_tokens_per_second)
+    }
     return $stats
 }
 
@@ -263,6 +303,7 @@ foreach ($casePrompt in $accuracyPrompts) {
     $vulkanHealth = Get-Health "vulkan"
     Assert-VulkanHealthGate $vulkanHealth
     $vulkanTokenIds = Get-LastTokenIds $vulkanHealth
+    Write-Host "vulkan token ids: $vulkanTokenIds"
 }
 
 if (-not $SkipCpu -and -not $RunAccuracySet) {

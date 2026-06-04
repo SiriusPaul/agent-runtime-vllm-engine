@@ -133,6 +133,7 @@ std::string describe_osh26_vk_stats() {
         << "\"q4_k_uploads\":" << stats.q4_k_uploads << ","
         << "\"q6_k_uploads\":" << stats.q6_k_uploads << ","
         << "\"mnn_attention_enabled\":" << (stats.mnn_attention_enabled ? "true" : "false") << ","
+        << "\"mnn_prefill_attention_enabled\":" << (stats.mnn_prefill_attention_enabled ? "true" : "false") << ","
         << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
         << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
@@ -142,6 +143,10 @@ std::string describe_osh26_vk_stats() {
         << "\"last_forward_attention_ms\":" << stats.last_forward_attention_ms << ","
         << "\"last_forward_kv_update_ms\":" << stats.last_forward_kv_update_ms << ","
         << "\"last_forward_lm_head_ms\":" << stats.last_forward_lm_head_ms << ","
+        << "\"last_prefill_qkv_ms\":" << stats.last_prefill_qkv_ms << ","
+        << "\"last_prefill_cpu_post_ms\":" << stats.last_prefill_cpu_post_ms << ","
+        << "\"last_prefill_attention_ms\":" << stats.last_prefill_attention_ms << ","
+        << "\"last_prefill_ffn_ms\":" << stats.last_prefill_ffn_ms << ","
         << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
         << "\"last_decode_ms\":" << stats.last_decode_ms << ","
         << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
@@ -415,6 +420,40 @@ bool ComputeBackend::warm_prefix_cache_locked() {
     return true;
 }
 
+void ComputeBackend::start_prefix_warmup_async_locked() {
+    if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
+        return;
+    }
+    if (prefix_cache_valid_ || prefix_warm_thread_running_) {
+        return;
+    }
+
+    // Keep Vulkan load stable for now; the async warmup path is exercised after the
+    // prefill fast path is validated on-device.
+    return;
+
+    prefix_warm_thread_running_ = true;
+    last_prefix_warm_ms_ = 0.0;
+    prefix_warm_thread_ = std::thread([this] {
+        const auto warm_start = std::chrono::steady_clock::now();
+        bool warmed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (model_ != nullptr && ctx_ != nullptr && requested_backend_ == "vulkan" && !debug_correctness_ && osh26_vk_gpu_ready()) {
+                warmed = warm_prefix_cache_locked();
+                if (warmed) {
+                    last_prefix_warm_ms_ = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - warm_start).count();
+                } else {
+                    last_prefix_warm_ms_ = 0.0;
+                }
+            }
+            prefix_warm_thread_running_ = false;
+        }
+    });
+    prefix_warm_thread_.detach();
+}
+
 size_t ComputeBackend::common_prefix_length(const std::vector<llama_token> & lhs, const std::vector<llama_token> & rhs) const {
     const size_t limit = std::min(lhs.size(), rhs.size());
     size_t n = 0;
@@ -590,6 +629,7 @@ double ComputeBackend::prefix_cache_fragmentation_locked() const {
 
 std::string ComputeBackend::load_model(const std::string & model_path) {
     init_llama_backend();
+    const auto load_model_start = std::chrono::steady_clock::now();
     if (model_path.empty()) {
         return "model path is empty";
     }
@@ -677,7 +717,9 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     last_logits_low_id_streak_ = 0;
     last_logits_sanity_reason_.clear();
     cancel_requested_.store(false);
-    warm_prefix_cache_locked();
+    start_prefix_warmup_async_locked();
+    last_load_model_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - load_model_start).count();
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
         shutdown_requested_ = false;
@@ -716,14 +758,15 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         last_prefill_chunk_size_ = 0;
         last_prefill_chunk_count_ = 0;
         last_prefill_logits_chunks_ = 0;
+        last_prefill_qkv_ms_ = 0.0;
+        last_prefill_cpu_post_ms_ = 0.0;
+        last_prefill_attention_ms_ = 0.0;
+        last_prefill_ffn_ms_ = 0.0;
         last_user_prefill_ms_ = 0.0;
         last_first_decode_ms_ = 0.0;
         last_logits_sanity_ok_ = true;
         last_logits_low_id_streak_ = 0;
         last_logits_sanity_reason_.clear();
-    last_logits_sanity_ok_ = true;
-    last_logits_low_id_streak_ = 0;
-    last_logits_sanity_reason_.clear();
 
         const auto prompt_build_start = std::chrono::steady_clock::now();
         prompt = build_prompt(user_prompt, options.enable_thinking);
@@ -822,7 +865,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     if (use_gpu) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            warm_prefix_cache_locked();
+            start_prefix_warmup_async_locked();
             if (prompt_has_cached_prefix(prompt_tokens)) {
                 last_prefix_cache_hit_ = true;
                 last_prefix_tokens_ = prefix_cached_pos_;
@@ -1238,6 +1281,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"total_completed_requests\": " << total_completed_requests << ",\n"
         << "  \"last_queue_wait_ms\": " << last_queue_wait_ms << ",\n"
         << "  \"avg_queue_wait_ms\": " << (total_submitted_requests > 0 ? total_queue_wait_ms / (double) total_submitted_requests : 0.0) << ",\n"
+        << "  \"last_load_model_ms\": " << last_load_model_ms_ << ",\n"
+        << "  \"last_prefix_warm_ms\": " << last_prefix_warm_ms_ << ",\n"
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
         << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
         << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
@@ -1257,6 +1302,10 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_prefill_chunk_size\": " << last_prefill_chunk_size_ << ",\n"
         << "  \"last_prefill_chunk_count\": " << last_prefill_chunk_count_ << ",\n"
         << "  \"last_prefill_logits_chunks\": " << last_prefill_logits_chunks_ << ",\n"
+        << "  \"last_prefill_qkv_ms\": " << last_prefill_qkv_ms_ << ",\n"
+        << "  \"last_prefill_cpu_post_ms\": " << last_prefill_cpu_post_ms_ << ",\n"
+        << "  \"last_prefill_attention_ms\": " << last_prefill_attention_ms_ << ",\n"
+        << "  \"last_prefill_ffn_ms\": " << last_prefill_ffn_ms_ << ",\n"
         << "  \"last_user_prefill_ms\": " << last_user_prefill_ms_ << ",\n"
         << "  \"last_first_decode_ms\": " << last_first_decode_ms_ << ",\n"
         << "  \"last_logits_sanity_ok\": " << (last_logits_sanity_ok_ ? "true" : "false") << ",\n"

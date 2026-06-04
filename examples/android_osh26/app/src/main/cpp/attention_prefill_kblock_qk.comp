@@ -1,3 +1,7 @@
+#version 450
+#define FLOAT float
+#define FLOAT4 vec4
+
 layout(set=0, binding=0) writeonly buffer s0 {
     FLOAT4 data[];
 } uQK;
@@ -32,7 +36,7 @@ const int MAX_D4 = 64; // headDim <= 256
 const float NEG_INF = -3.402823466e38;
 
 // QK block prefill (q4 x k4 tile) with K-offset:
-// - Qtmp: [headNum, headDim/4, qLen4] packed over D (FLOAT4), q is innermost contiguous dim.
+// - query: [qLen, headNum, headDim/4] packed over D (FLOAT4), q-major layout from B_Qb.
 // - cacheK: [kvHeadNum, headDim/4, maxLen] packed over D (FLOAT4), k is innermost contiguous dim.
 // Output QK is packed over K (FLOAT4): [qLen, headNum, blockLen4/4, 4].
 void main() {
@@ -83,8 +87,6 @@ void main() {
         return;
     }
 
-    const int qLen4 = ((qLen + 3) / 4) * 4;
-
     const int gk0 = kStart + k0;
     const bool v0 = (gk0 + 0) < totalLen;
     const bool v1 = (gk0 + 1) < totalLen;
@@ -96,13 +98,27 @@ void main() {
     vec4 out2 = vec4(0.0);
     vec4 out3 = vec4(0.0);
 
-    // Qtmp base: [h, d4, q]
     for (int i = 0; i < d4Size; ++i) {
-        const int qBase = (h * d4Size + i) * qLen4 + q0;
-        vec4 qv0 = vec4(uQuery.data[qBase + 0]);
-        vec4 qv1 = vec4(uQuery.data[qBase + 1]);
-        vec4 qv2 = vec4(uQuery.data[qBase + 2]);
-        vec4 qv3 = vec4(uQuery.data[qBase + 3]);
+        vec4 qv0 = vec4(0.0);
+        vec4 qv1 = vec4(0.0);
+        vec4 qv2 = vec4(0.0);
+        vec4 qv3 = vec4(0.0);
+        if ((q0 + 0) < qLen) {
+            const int qBase0 = (((q0 + 0) * headNum + h) * d4Size) + i;
+            qv0 = vec4(uQuery.data[qBase0]);
+        }
+        if ((q0 + 1) < qLen) {
+            const int qBase1 = (((q0 + 1) * headNum + h) * d4Size) + i;
+            qv1 = vec4(uQuery.data[qBase1]);
+        }
+        if ((q0 + 2) < qLen) {
+            const int qBase2 = (((q0 + 2) * headNum + h) * d4Size) + i;
+            qv2 = vec4(uQuery.data[qBase2]);
+        }
+        if ((q0 + 3) < qLen) {
+            const int qBase3 = (((q0 + 3) * headNum + h) * d4Size) + i;
+            qv3 = vec4(uQuery.data[qBase3]);
+        }
 
         const int kBase = (kvh * d4Size + i) * maxLen + gk0;
         vec4 kv0 = v0 ? vec4(uCacheKey.data[kBase + 0]) : vec4(0.0);

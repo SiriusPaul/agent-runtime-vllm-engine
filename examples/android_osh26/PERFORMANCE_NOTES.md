@@ -16,6 +16,37 @@ Method:
 
 ## Current Snapshot
 
+### Latest Vulkan validation run
+
+The current on-device Vulkan path still falls back to CPU attention during prefill because the new prefill pipelines are not yet enabled on the device (`prefill pipelines: qk=-13 softmax=-13 qkvacc=-13 enabled=false`).
+
+| Metric | Value |
+| --- | ---: |
+| Load model ms | 64765.4 ms |
+| Prefix warm ms | 0 ms |
+| TTFT | 85991.8 ms |
+| Tokens/s | 0.255006 |
+| Prefill ms | 85971 ms |
+| First decode ms | 0.355364 ms |
+| Decoded tokens | 24 |
+| User prefill tokens | 40 |
+| Prefill qkv ms | 0 ms |
+| Prefill cpu post ms | 0 ms |
+| Prefill attention ms | 0 ms |
+| Prefill ffn ms | 0 ms |
+| Prefill chunk size | 40 |
+| Prefill chunk count | 1 |
+| Prefill forwards | 1 |
+| Submit count | 123 |
+
+Notes:
+- Full token output for the benchmark prompt was checked end to end.
+- The 24-token completion was coherent and deterministic:
+  `151667,271,151668,271,16609,287,85864,9318,1760,6147,369,803,11050,20898,323,4722,5101,10431,11,892,646,5263,11211,817`
+- The output text was:
+  `Reducing Vulkan submit count allows for more efficient rendering and lower resource usage, which can increase tokens per`
+- Prefill GPU pipeline creation is still blocked, so the current TTFT number is from the CPU fallback path.
+
 ### Cold first request after model load
 
 | Metric | Value |

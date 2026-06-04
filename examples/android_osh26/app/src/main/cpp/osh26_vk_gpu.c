@@ -24,6 +24,10 @@
 #include "add.spv.h"
 #include "attn_decode_q1.spv.h"
 #include "attn_kvcache.spv.h"
+#include "attention_prefill_kblock_qk.spv.h"
+#include "attention_prefill_kblock_softmax_online.spv.h"
+#include "attention_prefill_kblock_qkv_acc.spv.h"
+#include "attention_prefill_kblock_finalize.spv.h"
 
 #define TAG "OSH26GPU"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
@@ -74,18 +78,23 @@ static VkBuf W_rf[N_LAY],W_Gate[N_LAY],W_Up[N_LAY],W_Down[N_LAY];
 static VkBuf W_Fnorm,W_HeadShard[HEAD_SHARDS]; static float *Emb;
 
 /* Activation buffers */
-static VkBuf B_KV,B_Hid,B_Hid2,B_Qb,B_Kb,B_Vb,B_Sc,B_Att,B_Gat,B_Up,B_Dwn,B_Tmp,B_Log,B_LogPart;
+static VkBuf B_KV,B_Hid,B_Hid2,B_Qb,B_Kb,B_Vb,B_Sc,B_Att,B_PrefillOAcc,B_Gat,B_Up,B_Dwn,B_Tmp,B_Log,B_LogPart;
 static VkBuf B_KCache[N_LAY],B_VCache[N_LAY],B_AttnConst,B_KVConst;
 
 static VkInstance V;static VkQueue Q;static VkCommandPool CP;static VkDescriptorPool DP;
 static VkDescriptorSetLayout DSL;static VkPipelineLayout PL;
 static VkDescriptorSetLayout DSL_Dec;static VkPipelineLayout PL_Dec;
 static VkDescriptorSetLayout DSL_KV;static VkPipelineLayout PL_KV;
-static VkPipeline P_MMt,P_MMr,P_GMV,P_RMS,P_RoPE,P_RoPENeox,P_SMax,P_SiLU,P_Add,P_AttnDec,P_KVUpdate;
+static VkDescriptorSetLayout DSL_AttnQK;static VkPipelineLayout PL_AttnQK;
+static VkDescriptorSetLayout DSL_AttnSoftmax;static VkPipelineLayout PL_AttnSoftmax;
+static VkDescriptorSetLayout DSL_AttnQKVAcc;static VkPipelineLayout PL_AttnQKVAcc;
+static VkDescriptorSetLayout DSL_AttnFinalize;static VkPipelineLayout PL_AttnFinalize;
+static VkPipeline P_MMt,P_MMr,P_GMV,P_RMS,P_RoPE,P_RoPENeox,P_SMax,P_SiLU,P_Add,P_AttnDec,P_KVUpdate,P_AttnPrefillQK,P_AttnPrefillSoftmax,P_AttnPrefillQKVAcc,P_AttnPrefillFinalize;
 static uint32_t QFI;
 static pthread_mutex_t Mtx=PTHREAD_MUTEX_INITIALIZER;
 static bool vk_ok,mdl_ok;
 static bool g_mnn_attention_enabled;
+static bool g_mnn_prefill_attention_enabled;
 static bool g_debug_correctness;
 static float g_last_attention_max_abs_err;
 static uint32_t g_attention_fallback_layers;
@@ -103,6 +112,10 @@ static double g_last_forward_layers_ms;
 static double g_last_forward_attention_ms;
 static double g_last_forward_kv_update_ms;
 static double g_last_forward_lm_head_ms;
+static double g_last_prefill_qkv_ms;
+static double g_last_prefill_cpu_post_ms;
+static double g_last_prefill_attention_ms;
+static double g_last_prefill_ffn_ms;
 static bool g_gpu_lm_head_enabled=true;
 static float g_last_lm_head_max_abs_err;
 static int g_last_lm_head_ref_top5[5];
@@ -249,6 +262,82 @@ static void BIND_KV(VkCommandBuffer cb,VkBuf*b0,VkBuf*b1,VkBuf*b2,VkBuf*b3,VkBuf
     vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL_KV,0,1,&ds,0,0);
 }
 
+static void BIND_PREFILL_QK(VkCommandBuffer cb,VkBuf*out,VkBuf*query,VkBuf*cache_key,VkBuf*mask,VkBuf*const_buf){
+    VkBuf* b[5]={out,query,cache_key,mask,const_buf};
+    for(int i=0;i<5;i++)if(!b[i])b[i]=&B_Dummy;
+    VkDescriptorSet ds=0;VkDescriptorSetAllocateInfo da={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,0,DP,1,&DSL_AttnQK};
+    VkResult ar=vkAllocateDescriptorSets(D,&da,&ds);if(ar!=VK_SUCCESS){LOGE("ATTN QK DS alloc fail!");return;}
+    if(g_n<16)g_ds[g_n++]=ds;
+    VkDescriptorBufferInfo bi[5];
+    VkWriteDescriptorSet wr[5];memset(wr,0,sizeof(wr));
+    for(int j=0;j<5;j++){
+        bi[j]=(VkDescriptorBufferInfo){b[j]->B,0,b[j]->size};
+        wr[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[j].dstSet=ds;wr[j].dstBinding=(uint32_t)j;wr[j].descriptorCount=1;
+        wr[j].descriptorType=(j==4)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[j].pBufferInfo=&bi[j];
+    }
+    vkUpdateDescriptorSets(D,5,wr,0,0);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL_AttnQK,0,1,&ds,0,0);
+}
+
+static void BIND_PREFILL_SOFTMAX(VkCommandBuffer cb,VkBuf*w,VkBuf*qk,VkBuf*m,VkBuf*l,VkBuf*alpha,VkBuf*const_buf){
+    VkBuf* b[6]={w,qk,m,l,alpha,const_buf};
+    for(int i=0;i<6;i++)if(!b[i])b[i]=&B_Dummy;
+    VkDescriptorSet ds=0;VkDescriptorSetAllocateInfo da={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,0,DP,1,&DSL_AttnSoftmax};
+    VkResult ar=vkAllocateDescriptorSets(D,&da,&ds);if(ar!=VK_SUCCESS){LOGE("ATTN softmax DS alloc fail!");return;}
+    if(g_n<16)g_ds[g_n++]=ds;
+    VkDescriptorBufferInfo bi[6];
+    VkWriteDescriptorSet wr[6];memset(wr,0,sizeof(wr));
+    for(int j=0;j<6;j++){
+        bi[j]=(VkDescriptorBufferInfo){b[j]->B,0,b[j]->size};
+        wr[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[j].dstSet=ds;wr[j].dstBinding=(uint32_t)j;wr[j].descriptorCount=1;
+        wr[j].descriptorType=(j==5)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[j].pBufferInfo=&bi[j];
+    }
+    vkUpdateDescriptorSets(D,6,wr,0,0);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL_AttnSoftmax,0,1,&ds,0,0);
+}
+
+static void BIND_PREFILL_QKV_ACC(VkCommandBuffer cb,VkBuf*out_acc,VkBuf*w,VkBuf*cache_value,VkBuf*alpha,VkBuf*const_buf){
+    VkBuf* b[5]={out_acc,w,cache_value,alpha,const_buf};
+    for(int i=0;i<5;i++)if(!b[i])b[i]=&B_Dummy;
+    VkDescriptorSet ds=0;VkDescriptorSetAllocateInfo da={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,0,DP,1,&DSL_AttnQKVAcc};
+    VkResult ar=vkAllocateDescriptorSets(D,&da,&ds);if(ar!=VK_SUCCESS){LOGE("ATTN qkv acc DS alloc fail!");return;}
+    if(g_n<16)g_ds[g_n++]=ds;
+    VkDescriptorBufferInfo bi[5];
+    VkWriteDescriptorSet wr[5];memset(wr,0,sizeof(wr));
+    for(int j=0;j<5;j++){
+        bi[j]=(VkDescriptorBufferInfo){b[j]->B,0,b[j]->size};
+        wr[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[j].dstSet=ds;wr[j].dstBinding=(uint32_t)j;wr[j].descriptorCount=1;
+        wr[j].descriptorType=(j==4)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[j].pBufferInfo=&bi[j];
+    }
+    vkUpdateDescriptorSets(D,5,wr,0,0);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL_AttnQKVAcc,0,1,&ds,0,0);
+}
+
+static void BIND_PREFILL_FINALIZE(VkCommandBuffer cb,VkBuf*out,VkBuf*out_acc,VkBuf*l,VkBuf*const_buf){
+    VkBuf* b[4]={out,out_acc,l,const_buf};
+    for(int i=0;i<4;i++)if(!b[i])b[i]=&B_Dummy;
+    VkDescriptorSet ds=0;VkDescriptorSetAllocateInfo da={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,0,DP,1,&DSL_AttnFinalize};
+    VkResult ar=vkAllocateDescriptorSets(D,&da,&ds);if(ar!=VK_SUCCESS){LOGE("ATTN finalize DS alloc fail!");return;}
+    if(g_n<16)g_ds[g_n++]=ds;
+    VkDescriptorBufferInfo bi[4];
+    VkWriteDescriptorSet wr[4];memset(wr,0,sizeof(wr));
+    for(int j=0;j<4;j++){
+        bi[j]=(VkDescriptorBufferInfo){b[j]->B,0,b[j]->size};
+        wr[j].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[j].dstSet=ds;wr[j].dstBinding=(uint32_t)j;wr[j].descriptorCount=1;
+        wr[j].descriptorType=(j==3)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[j].pBufferInfo=&bi[j];
+    }
+    vkUpdateDescriptorSets(D,4,wr,0,0);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL_AttnFinalize,0,1,&ds,0,0);
+}
+
 /* Dispatch macros — pipeline FIRST (MNN order: bind pipeline, then descriptors) */
 #define RMS(cb,rows,cols,x,w,y) do{uint32_t p[4]={rows,cols,0,0};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_RMS);BIND(cb,x,w,y,p);vkCmdDispatch(cb,(uint32_t)(rows),1,1);}while(0)
 #define BARRIER(cb) do{VkMemoryBarrier mb_={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT};vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb_,0,0,0,0);}while(0)
@@ -321,6 +410,117 @@ static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv
     }
 }
 
+static bool prefill_attention_gpu(int l, int nt, int pos) {
+    if (!g_mnn_prefill_attention_enabled) {
+        if (l == 0) {
+            LOGI("PREFILL stage: attention disabled, CPU fallback (pipeline creation failed)");
+        }
+        return false;
+    }
+    const int total_len = pos + nt;
+    const int block_len = 128;
+    const int block_len4 = ((block_len + 3) / 4) * 4;
+    const int block_len4_4 = block_len4 / 4;
+    const int q4_count = (nt + 3) / 4;
+    const int q2_count = (nt + 1) / 2;
+    const int d4_size = HD / 4;
+    AttnConst ac = {{nt, block_len, N_HD, N_KVH}, {HD, N_HD / N_KVH, pos, total_len}, {nt, total_len, 2, MAX_S}, {1.0f / sqrtf((float)HD), 0, 0, 0}};
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention begin");
+        LOGI("PREFILL stage: ptrs att=%p oacc=%p up=%p dwn=%p tmp=%p kvconst=%p",
+             (void *)B_Att.P, (void *)B_PrefillOAcc.P, (void *)B_Up.P, (void *)B_Dwn.P, (void *)B_Tmp.P, (void *)B_KVConst.P);
+    }
+    memcpy(B_KVConst.P, &ac, sizeof(ac));
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention const copied");
+    }
+    buf_flush(&B_KVConst);
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention const flushed");
+    }
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 zero B_PrefillOAcc");
+    }
+    memset(B_PrefillOAcc.P, 0, F32((VkDeviceSize)nt * QDIM));
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 zero B_Up");
+    }
+    memset(B_Up.P, 0, F32((VkDeviceSize)nt * N_HD));
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 zero B_Dwn");
+    }
+    memset(B_Dwn.P, 0, F32((VkDeviceSize)nt * N_HD));
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 zero B_Tmp");
+    }
+    memset(B_Tmp.P, 0, F32((VkDeviceSize)nt * N_HD));
+    buf_flush(&B_PrefillOAcc);
+    buf_flush(&B_Up);
+    buf_flush(&B_Dwn);
+    buf_flush(&B_Tmp);
+
+    const double start_ms = now_ms();
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention CB begin");
+    }
+    VkCommandBuffer cb = CB();
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention CB acquired");
+    }
+    for (int k_start = 0; k_start < total_len; k_start += block_len) {
+        const int cur_block = (total_len - k_start < block_len) ? (total_len - k_start) : block_len;
+        const uint32_t qk_pc[4] = {(uint32_t)k_start, (uint32_t)cur_block, 0, 0};
+        if (l == 0 && k_start == 0) {
+            LOGI("PREFILL stage: layer0 qk bind begin");
+        }
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, P_AttnPrefillQK);
+        BIND_PREFILL_QK(cb, &B_Sc, &B_Qb, &B_KCache[l], &B_Dummy, &B_KVConst);
+        if (l == 0 && k_start == 0) {
+            LOGI("PREFILL stage: layer0 qk bind done");
+        }
+        vkCmdPushConstants(cb, PL_AttnQK, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, qk_pc);
+        if (l == 0 && k_start == 0) {
+            LOGI("PREFILL stage: layer0 qk push done");
+        }
+        vkCmdDispatch(cb, (uint32_t)((block_len4_4 + 7) / 8), (uint32_t)((q4_count + 7) / 8), N_HD);
+        if (l == 0 && k_start == 0) {
+            LOGI("PREFILL stage: layer0 qk dispatch done");
+        }
+        BARRIER(cb);
+        if (l == 0 && k_start == 0) {
+            LOGI("PREFILL stage: layer0 qk barrier done");
+        }
+
+        const uint32_t softmax_pc[4] = {(uint32_t)cur_block, 0, 0, 0};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, P_AttnPrefillSoftmax);
+        BIND_PREFILL_SOFTMAX(cb, &B_Gat, &B_Sc, &B_Up, &B_Dwn, &B_Tmp, &B_KVConst);
+        vkCmdPushConstants(cb, PL_AttnSoftmax, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, softmax_pc);
+        vkCmdDispatch(cb, N_HD, (uint32_t)nt, 1);
+        BARRIER(cb);
+
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, P_AttnPrefillQKVAcc);
+        BIND_PREFILL_QKV_ACC(cb, &B_PrefillOAcc, &B_Gat, &B_VCache[l], &B_Tmp, &B_KVConst);
+        vkCmdPushConstants(cb, PL_AttnQKVAcc, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, qk_pc);
+        vkCmdDispatch(cb, (uint32_t)((d4_size + 7) / 8), (uint32_t)((q2_count + 7) / 8), N_HD);
+        BARRIER(cb);
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, P_AttnPrefillFinalize);
+    BIND_PREFILL_FINALIZE(cb, &B_Att, &B_PrefillOAcc, &B_Dwn, &B_KVConst);
+    vkCmdDispatch(cb, (uint32_t)((d4_size + 7) / 8), (uint32_t)((q2_count + 7) / 8), N_HD);
+    BARRIER(cb);
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention CB recorded");
+    }
+    Sub(cb);
+    if (l == 0) {
+        LOGI("PREFILL stage: layer0 attention submit done");
+    }
+    const double elapsed_ms = now_ms() - start_ms;
+    g_last_prefill_attention_ms += elapsed_ms;
+    g_last_forward_attention_ms += elapsed_ms;
+    return true;
+}
+
 /* ---- Init ---- */
 int osh26_vk_gpu_init(void){if(vk_ok)return 0;
     if(!InitVulkan()){LOGE("InitVulkan failed");return -1;}
@@ -347,6 +547,20 @@ int osh26_vk_gpu_init(void){if(vk_ok)return 0;
     VkDescriptorSetLayoutBinding bdk[5];for(int i=0;i<5;i++)bdk[i]=(VkDescriptorSetLayoutBinding){(uint32_t)i,(i==4)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0};
     VkDescriptorSetLayoutCreateInfo dlk={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,5,bdk};vkCreateDescriptorSetLayout(D,&dlk,0,&DSL_KV);
     VkPipelineLayoutCreateInfo plk={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&DSL_KV,0,0};vkCreatePipelineLayout(D,&plk,0,&PL_KV);
+    VkDescriptorSetLayoutBinding bdqk[5];for(int i=0;i<5;i++)bdqk[i]=(VkDescriptorSetLayoutBinding){(uint32_t)i,(i==4)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0};
+    VkDescriptorSetLayoutCreateInfo dlqk={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,5,bdqk};VkResult dlr1=vkCreateDescriptorSetLayout(D,&dlqk,0,&DSL_AttnQK);
+    VkDescriptorSetLayoutBinding bdsm[6];for(int i=0;i<6;i++)bdsm[i]=(VkDescriptorSetLayoutBinding){(uint32_t)i,(i==5)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0};
+    VkDescriptorSetLayoutCreateInfo dlsm={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,6,bdsm};VkResult dlr2=vkCreateDescriptorSetLayout(D,&dlsm,0,&DSL_AttnSoftmax);
+    VkDescriptorSetLayoutBinding bdqa[5];for(int i=0;i<5;i++)bdqa[i]=(VkDescriptorSetLayoutBinding){(uint32_t)i,(i==4)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0};
+    VkDescriptorSetLayoutCreateInfo dlqa={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,5,bdqa};VkResult dlr3=vkCreateDescriptorSetLayout(D,&dlqa,0,&DSL_AttnQKVAcc);
+    VkDescriptorSetLayoutBinding bdfn[4];for(int i=0;i<4;i++)bdfn[i]=(VkDescriptorSetLayoutBinding){(uint32_t)i,(i==3)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,0};
+    VkDescriptorSetLayoutCreateInfo dlfn={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,4,bdfn};VkResult dlr4=vkCreateDescriptorSetLayout(D,&dlfn,0,&DSL_AttnFinalize);
+    VkPushConstantRange pc8={VK_SHADER_STAGE_COMPUTE_BIT,0,8};
+    VkPipelineLayoutCreateInfo plqk={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&DSL_AttnQK,1,&pc8};VkResult plr1=vkCreatePipelineLayout(D,&plqk,0,&PL_AttnQK);
+    VkPipelineLayoutCreateInfo plsm={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&DSL_AttnSoftmax,1,&pc8};VkResult plr2=vkCreatePipelineLayout(D,&plsm,0,&PL_AttnSoftmax);
+    VkPipelineLayoutCreateInfo plqa={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&DSL_AttnQKVAcc,1,&pc8};VkResult plr3=vkCreatePipelineLayout(D,&plqa,0,&PL_AttnQKVAcc);
+    VkPipelineLayoutCreateInfo plfn={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&DSL_AttnFinalize,0,0};VkResult plr4=vkCreatePipelineLayout(D,&plfn,0,&PL_AttnFinalize);
+    LOGI("prefill layouts: dsl=%d/%d/%d/%d pl=%d/%d/%d/%d", (int)dlr1, (int)dlr2, (int)dlr3, (int)dlr4, (int)plr1, (int)plr2, (int)plr3, (int)plr4);
     { VkShaderModuleCreateInfo s={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,0,0,0,0};VkShaderModule m;
       s.codeSize=examples_android_osh26_app_src_main_cpp_mulmat_tiled_spv_len;s.pCode=(const uint32_t*)examples_android_osh26_app_src_main_cpp_mulmat_tiled_spv;vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo pi={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL,0,(uint32_t)-1};vkCreateComputePipelines(D,0,1,&pi,0,&P_MMt);
       s.codeSize=examples_android_osh26_app_src_main_cpp_mulmat_reduce_spv_len;s.pCode=(const uint32_t*)examples_android_osh26_app_src_main_cpp_mulmat_reduce_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_MMr);
@@ -358,6 +572,15 @@ int osh26_vk_gpu_init(void){if(vk_ok)return 0;
       s.codeSize=_tmp_silu_mul_spv_len;s.pCode=(const uint32_t*)_tmp_silu_mul_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_SiLU);
       s.codeSize=_tmp_add_spv_len;s.pCode=(const uint32_t*)_tmp_add_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_Add);
       s.codeSize=_tmp_attn_decode_q1_spv_len;s.pCode=(const uint32_t*)_tmp_attn_decode_q1_spv;vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo pid={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_Dec,0,(uint32_t)-1};if(vkCreateComputePipelines(D,0,1,&pid,0,&P_AttnDec)==VK_SUCCESS)g_mnn_attention_enabled=true; }
+    { VkShaderModuleCreateInfo s={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,0,0,0,0};VkShaderModule m;
+      VkResult sm1,sm2,sm3,sm4,r1,r2,r3,r4;
+      s.codeSize=_tmp_attention_prefill_kblock_qk_spv_len;s.pCode=(const uint32_t*)_tmp_attention_prefill_kblock_qk_spv;sm1=vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo piqk={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_AttnQK,0,(uint32_t)-1};r1=vkCreateComputePipelines(D,0,1,&piqk,0,&P_AttnPrefillQK);
+      s.codeSize=_tmp_attention_prefill_kblock_softmax_online_spv_len;s.pCode=(const uint32_t*)_tmp_attention_prefill_kblock_softmax_online_spv;sm2=vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo pism={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_AttnSoftmax,0,(uint32_t)-1};r2=vkCreateComputePipelines(D,0,1,&pism,0,&P_AttnPrefillSoftmax);
+      s.codeSize=_tmp_attention_prefill_kblock_qkv_acc_spv_len;s.pCode=(const uint32_t*)_tmp_attention_prefill_kblock_qkv_acc_spv;sm3=vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo piqa={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_AttnQKVAcc,0,(uint32_t)-1};r3=vkCreateComputePipelines(D,0,1,&piqa,0,&P_AttnPrefillQKVAcc);
+      s.codeSize=_tmp_attention_prefill_kblock_finalize_spv_len;s.pCode=(const uint32_t*)_tmp_attention_prefill_kblock_finalize_spv;sm4=vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo pifn={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_AttnFinalize,0,(uint32_t)-1};r4=vkCreateComputePipelines(D,0,1,&pifn,0,&P_AttnPrefillFinalize);
+      LOGI("prefill shader modules: qk=%d softmax=%d qkvacc=%d final=%d", (int)sm1, (int)sm2, (int)sm3, (int)sm4);
+      g_mnn_prefill_attention_enabled = (r1 == VK_SUCCESS && r2 == VK_SUCCESS && r3 == VK_SUCCESS && r4 == VK_SUCCESS);
+      LOGI("prefill pipelines: qk=%d softmax=%d qkvacc=%d final=%d enabled=%s", (int)r1, (int)r2, (int)r3, (int)r4, g_mnn_prefill_attention_enabled ? "true" : "false"); }
     { VkShaderModuleCreateInfo s={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,0,0,_tmp_attn_kvcache_spv_len,(const uint32_t*)_tmp_attn_kvcache_spv};VkShaderModule m;vkCreateShaderModule(D,&s,0,&m);VkComputePipelineCreateInfo pik={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,0,0,{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_COMPUTE_BIT,m,"main",0},PL_KV,0,(uint32_t)-1};vkCreateComputePipelines(D,0,1,&pik,0,&P_KVUpdate); }
     buf_alloc(&B_Dummy,256);
     buf_alloc(&B_AttnConst,sizeof(AttnConst));
@@ -382,6 +605,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     memset(g_last_logits_top5,0,sizeof(g_last_logits_top5));memset(g_last_logits_top5_values,0,sizeof(g_last_logits_top5_values));
     memset(g_last_logits_topk_ids,0,sizeof(g_last_logits_topk_ids));memset(g_last_logits_topk_values,0,sizeof(g_last_logits_topk_values));g_last_logits_topk_count=0;
     g_last_prefill_ms=0.0;g_last_decode_ms=0.0;g_last_lm_head_ms=0.0;g_last_token_tps=0.0;g_last_lm_head_max_abs_err=0.0f;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));
+    g_last_prefill_qkv_ms=0.0;g_last_prefill_cpu_post_ms=0.0;g_last_prefill_attention_ms=0.0;g_last_prefill_ffn_ms=0.0;
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;g_last_logits_topk_count=0;
     if(!B_Dummy.B && !buf_alloc(&B_Dummy,256)){LOGE("alloc dummy");return -1;}
     if(!B_AttnConst.B && !buf_alloc(&B_AttnConst,sizeof(AttnConst))){LOGE("alloc attn const");return -1;}
@@ -440,6 +664,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     ALLOC_BUF(B_Vb,((VkDeviceSize)MAX_S*KVD)*4,"B_Vb");
     ALLOC_BUF(B_Sc,((VkDeviceSize)N_HD*MAX_S*MAX_S)*4,"B_Sc");
     ALLOC_BUF(B_Att,((VkDeviceSize)MAX_S*QDIM)*4,"B_Att");
+    ALLOC_BUF(B_PrefillOAcc,((VkDeviceSize)MAX_S*QDIM)*4,"B_PrefillOAcc");
     ALLOC_BUF(B_Gat,((VkDeviceSize)MAX_S*IDIM)*4,"B_Gat");
     ALLOC_BUF(B_Up,((VkDeviceSize)MAX_S*IDIM)*4,"B_Up");
     ALLOC_BUF(B_Dwn,((VkDeviceSize)MAX_S*IDIM)*4,"B_Dwn");
@@ -453,6 +678,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
 /* ---- Forward pass ---- */
 int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const bool debug_check=(g_debug_correctness||(flags&OSH26_FORWARD_DEBUG_CHECK)!=0);static int fc=0;if(debug_check&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
+    g_last_prefill_qkv_ms=0.0;g_last_prefill_cpu_post_ms=0.0;g_last_prefill_attention_ms=0.0;g_last_prefill_ffn_ms=0.0;
     const double forward_start_ms=now_ms();
     float*hidden=B_Hid.P,*hnorm=B_Hid2.P,*qb=B_Qb.P,*kb=B_Kb.P,*vb=B_Vb.P,*sc=B_Sc.P,*att=B_Att.P,*gate=B_Gat.P,*up=B_Up.P,*dwn=B_Dwn.P,*kv=B_KV.P,*tmp=B_Tmp.P;
     for(int i=0;i<nt;i++){int tok=tokens[i];if(tok<0||tok>=VOCAB)tok=0;memcpy(hidden+i*HDIM,Emb+tok*HDIM,HDIM*sizeof(float));}
@@ -484,22 +710,47 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
          float ecpu0=cpu[0]*inv*w[0],egpu0=hnorm[0];LOGI("D01 RMS: err=%.2e",(double)fabsf(ecpu0-egpu0));}
 
         /* --- Submit 1b: Q,K,V matmul (no RoPE) --- */
+        if (nt > 1 && !debug_check && l == 0) {
+            LOGI("PREFILL stage: layer0 qkv begin");
+        }
+        const double prefill_qkv_start_ms = (nt > 1 && !debug_check) ? now_ms() : 0.0;
         if(!(nt==1 && !debug_check)){
           VkCommandBuffer cb1b=CB();
           MM(cb1b,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
+          if (nt > 1 && !debug_check && l == 0) {
+              LOGI("PREFILL stage: layer0 q matmul recorded");
+          }
           MM(cb1b,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
+          if (nt > 1 && !debug_check && l == 0) {
+              LOGI("PREFILL stage: layer0 k matmul recorded");
+          }
           MM(cb1b,&W_V[l],&B_Hid2,&B_Vb,nt,KVD,HDIM);
+          if (nt > 1 && !debug_check && l == 0) {
+              LOGI("PREFILL stage: layer0 v matmul recorded");
+          }
           Sub(cb1b);
+          if (nt > 1 && !debug_check && l == 0) {
+              LOGI("PREFILL stage: layer0 qkv submit done");
+          }
+        }
+        if (prefill_qkv_start_ms > 0.0) {
+            g_last_prefill_qkv_ms += now_ms() - prefill_qkv_start_ms;
+        }
+        if (nt > 1 && !debug_check && l == 0) {
+            LOGI("PREFILL stage: layer0 qkv done");
         }
         if(nt==1){buf_inv(&B_Qb);buf_inv(&B_Kb);}
         if(do_diag && (l==0||l==1||l==27)){float*qw=W_Q[l].P,*kw=W_K[l].P;float cq0=0,ck0=0;
          for(int k=0;k<HDIM;k++){cq0+=qw[k]*hnorm[k];ck0+=kw[k]*hnorm[k];}
          LOGI("L%d Q0 e=%.1e K0 e=%.1e",l,(double)fabsf(cq0-qb[0]),(double)fabsf(ck0-kb[0]));}
 
-        /* --- CPU: per-head Q/K RMSNorm required by Qwen3 --- */
         if(nt==1 && !debug_check){
           buf_inv(&B_Kb);buf_inv(&B_Vb);
         }else{
+          double prefill_cpu_post_start_ms = 0.0;
+          if (nt > 1 && !debug_check) {
+              prefill_cpu_post_start_ms = now_ms();
+          }
           buf_inv(&B_Qb);buf_inv(&B_Kb);
           for(int t=0;t<nt;t++){
             for(int h=0;h<N_HD;h++){
@@ -523,6 +774,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
             for(int d=0;d<HD;d++){ float v = qb[d]; ssq += v*v; }
             LOGI("D04 QNorm: q_rms=%.4f q0=%.4f k0=%.4f",(double)sqrtf(ssq/(float)HD),(double)qb[0],(double)kb[0]);
           }
+          if (prefill_cpu_post_start_ms > 0.0) {
+              g_last_prefill_cpu_post_ms += now_ms() - prefill_cpu_post_start_ms;
+          }
+          if (nt > 1 && !debug_check && l == 0) {
+              LOGI("PREFILL stage: layer0 cpu post done");
+          }
         }
 
         /* --- CPU: Qwen3 uses NEOX RoPE layout, not adjacent even/odd pairs --- */
@@ -538,9 +795,22 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
            LOGI("D05 RoPE: pos=%d preQ=%.4f/%.4f exp=%.4f got=%.4f err=%.2e",pos,(double)qpre0,(double)qpre64,(double)r0,(double)qb[0],(double)fabsf(r0-qb[0]));}
         }
 
-        /* --- KV cache + MNN-style decode attention with CPU correctness gate --- */
+        /* --- KV cache + attention --- */
         { int kvo=l*2*MAX_S*KVD;bool att_on_host=false;bool att_done=false;const double kv_update_start_ms=now_ms();
-          if(nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+          if(nt>1 && !debug_check){
+              AttnConst kc={{nt,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{nt,pos+nt,2,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
+              memcpy(B_KVConst.P,&kc,sizeof(kc));buf_flush(&B_KVConst);
+              if (l == 0) {
+                  LOGI("PREFILL stage: layer0 kv update begin");
+              }
+              { VkCommandBuffer cbk=CB();
+                KV_UPDATE(cbk,&B_Kb,&B_Vb,&B_KCache[l],&B_VCache[l],&B_KVConst,nt);
+                Sub(cbk);
+              }
+              if (l == 0) {
+                  LOGI("PREFILL stage: layer0 kv update submit done");
+              }
+          }else if(nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
               AttnConst kc={{1,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_KVConst.P,&kc,sizeof(kc));
               { VkCommandBuffer cbk=CB();
@@ -552,30 +822,54 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               pack_mnn_kv_cache(l,pos,nt,kb,vb);
           }
           g_last_forward_kv_update_ms += now_ms()-kv_update_start_ms;
-          const double attention_start_ms=now_ms();
-          if(!att_done && nt==1 && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
-              AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
-              memcpy(B_AttnConst.P,&ac,sizeof(ac));buf_flush(&B_AttnConst);
-              { VkCommandBuffer cba=CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnConst);Sub(cba); }
-              if(debug_check){
-                  cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
-                  buf_inv(&B_Att);
-                  float maxe=0.0f;for(int i=0;i<QDIM;i++){float e=fabsf(att[i]-tmp[i]);if(e>maxe)maxe=e;}
-                  g_last_attention_max_abs_err=maxe;
-                  if(maxe>1e-3f){
-                      g_attention_fallback_layers|=(1u<<l);
-                      memcpy(att,tmp,nt*QDIM*sizeof(float));att_on_host=true;
-                      LOGE("L%d MNN decode attention fallback max_abs_err=%.3e",l,(double)maxe);
-                  }else if(do_diag && (l==0||l==27)){
-                      LOGI("L%d MNN decode attention max_abs_err=%.3e",l,(double)maxe);
+          if (nt>1 && !debug_check) {
+              if (!prefill_attention_gpu(l, nt, pos)) {
+                  if (l == 0) {
+                      LOGI("PREFILL stage: layer0 attention fallback to CPU");
+                  }
+                  memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));
+                  memcpy(kv+kvo+MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));
+                  pack_mnn_kv_cache(l,pos,nt,kb,vb);
+                  cpu_attention_ref(nt, pos, l, qb, kv, sc, att);
+                  memcpy(B_Att.P, att, nt * QDIM * sizeof(float));
+                  buf_flush(&B_Att);
+                  att_on_host = true;
+                  att_done = true;
+                  if (l == 0) {
+                      LOGI("PREFILL stage: layer0 attention fallback done");
+                  }
+              } else {
+                  att_done = true;
+                  if (l == 0) {
+                      LOGI("PREFILL stage: layer0 attention done");
                   }
               }
-          }else{
-              cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
-              memcpy(att,tmp,nt*QDIM*sizeof(float));att_on_host=true;
+          } else {
+              const double attention_start_ms=now_ms();
+              if(!att_done && nt==1 && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+                  AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
+                  memcpy(B_AttnConst.P,&ac,sizeof(ac));buf_flush(&B_AttnConst);
+                  { VkCommandBuffer cba=CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnConst);Sub(cba); }
+                  if(debug_check){
+                      cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
+                      buf_inv(&B_Att);
+                      float maxe=0.0f;for(int i=0;i<QDIM;i++){float e=fabsf(att[i]-tmp[i]);if(e>maxe)maxe=e;}
+                      g_last_attention_max_abs_err=maxe;
+                      if(maxe>1e-3f){
+                          g_attention_fallback_layers|=(1u<<l);
+                          memcpy(att,tmp,nt*QDIM*sizeof(float));att_on_host=true;
+                          LOGE("L%d MNN decode attention fallback max_abs_err=%.3e",l,(double)maxe);
+                      }else if(do_diag && (l==0||l==27)){
+                          LOGI("L%d MNN decode attention max_abs_err=%.3e",l,(double)maxe);
+                      }
+                  }
+              }else{
+                  cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
+                  memcpy(att,tmp,nt*QDIM*sizeof(float));att_on_host=true;
+              }
+              g_last_forward_attention_ms += now_ms()-attention_start_ms;
+              if(att_on_host)buf_flush(&B_Att);
           }
-          g_last_forward_attention_ms += now_ms()-attention_start_ms;
-          if(att_on_host)buf_flush(&B_Att);
         }
         /* GPU output projection reads B_Att for both prefill and decode. */
         if(do_diag && l==0){int kvo=0;int slen=pos+nt;
@@ -620,6 +914,10 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
            LOGI("D10 ResA err=%.2e",(double)fabsf((oh0+B_Tmp.P[0])-B_Hid.P[0]));}
         }
 
+        double prefill_ffn_start_ms = 0.0;
+        if (nt > 1 && !debug_check) {
+            prefill_ffn_start_ms = now_ms();
+        }
         /* --- Submit 2b: RMS_FFN + Gate + Up + SiLU --- */
         { VkCommandBuffer cb2b=CB();
           RMS(cb2b,nt,HDIM,&B_Hid,&W_rf[l],&B_Hid2);
@@ -649,6 +947,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           if(do_diag&&l==0){float*dw=W_Down[0].P;float cd=0;for(int k=0;k<IDIM;k++)cd+=dw[k]*B_Dwn.P[k];
            LOGI("D15 Down err=%.2e",(double)fabsf(cd-B_Tmp.P[0]));
            LOGI("D16 ResF err=%.2e",(double)fabsf((ph0+B_Tmp.P[0])-B_Hid.P[0]));}
+        }
+        if (prefill_ffn_start_ms > 0.0) {
+            g_last_prefill_ffn_ms += now_ms() - prefill_ffn_start_ms;
+        }
+        if (nt > 1 && !debug_check && l == 0) {
+            LOGI("PREFILL stage: layer0 ffn done");
         }
         }
     }
@@ -776,7 +1080,7 @@ int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate *out, int max_out){
 bool osh26_vk_gpu_ready(void){return vk_ok&&mdl_ok;}
 void osh26_vk_gpu_free(void){
     buf_free(&B_LogPart);buf_free(&B_Log);buf_free(&B_Tmp);buf_free(&B_Dwn);buf_free(&B_Up);buf_free(&B_Gat);
-    buf_free(&B_Att);buf_free(&B_Sc);buf_free(&B_Vb);buf_free(&B_Kb);buf_free(&B_Qb);
+    buf_free(&B_PrefillOAcc);buf_free(&B_Att);buf_free(&B_Sc);buf_free(&B_Vb);buf_free(&B_Kb);buf_free(&B_Qb);
     buf_free(&B_Hid2);buf_free(&B_Hid);buf_free(&B_KV);
     buf_free(&B_KVConst);buf_free(&B_AttnConst);
     for(int l=0;l<N_LAY;l++){buf_free(&B_VCache[l]);buf_free(&B_KCache[l]);}
@@ -786,5 +1090,5 @@ void osh26_vk_gpu_free(void){
     if(Emb){free(Emb);Emb=NULL;}
     mdl_ok=false;
 }
-int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_lm_head_max_abs_err=g_last_lm_head_max_abs_err;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
+int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_ms=g_last_prefill_ffn_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_lm_head_max_abs_err=g_last_lm_head_max_abs_err;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
 void osh26_vk_gpu_set_debug_correctness(bool enabled){g_debug_correctness=enabled;if(!enabled)g_last_attention_max_abs_err=0.0f;}

@@ -104,6 +104,7 @@ private:
     std::string build_prompt(const std::string & user_prompt, bool enable_thinking) const;
     std::string build_prompt_prefix() const;
     bool warm_prefix_cache_locked();
+    void start_prefix_warmup_async_locked();
     bool prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const;
     size_t common_prefix_length(const std::vector<llama_token> & lhs, const std::vector<llama_token> & rhs) const;
     std::shared_ptr<GenerationRequest> enqueue_request(
@@ -189,12 +190,18 @@ private:
     bool last_prefix_cache_hit_ = false;
     int last_prefix_tokens_ = 0;
     double last_queue_wait_ms_ = 0.0;
+    double last_load_model_ms_ = 0.0;
+    double last_prefix_warm_ms_ = 0.0;
     int last_user_prefill_tokens_ = 0;
     int last_prefill_forward_count_ = 0;
     int last_prefill_skipped_lm_head_count_ = 0;
     int last_prefill_chunk_size_ = 0;
     int last_prefill_chunk_count_ = 0;
     int last_prefill_logits_chunks_ = 0;
+    double last_prefill_qkv_ms_ = 0.0;
+    double last_prefill_cpu_post_ms_ = 0.0;
+    double last_prefill_attention_ms_ = 0.0;
+    double last_prefill_ffn_ms_ = 0.0;
     double last_user_prefill_ms_ = 0.0;
     double last_first_decode_ms_ = 0.0;
     size_t last_reusable_prefix_tokens_ = 0;
@@ -202,6 +209,8 @@ private:
     bool last_logits_sanity_ok_ = true;
     int last_logits_low_id_streak_ = 0;
     std::string last_logits_sanity_reason_;
+    std::thread prefix_warm_thread_;
+    bool prefix_warm_thread_running_ = false;
 };
 
 class SchedulerLite {
