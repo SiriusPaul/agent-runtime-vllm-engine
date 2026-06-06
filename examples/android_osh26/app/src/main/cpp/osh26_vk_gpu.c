@@ -20,6 +20,8 @@
 #include "gemv_q4_packed.spv.h"
 #include "mulmat_fp16_packed.spv.h"
 #include "mulmat_q4_packed.spv.h"
+#include "act_quant_q8.spv.h"
+#include "mulmat_q8_w8a8.spv.h"
 #include "lm_head_topk_local.spv.h"
 #include "lm_head_topk_merge.spv.h"
 #include "rms_norm.spv.h"
@@ -83,10 +85,12 @@ static VkBuf B_Dummy;
 static VkBuf W_ra[N_LAY],W_Q[N_LAY],W_K[N_LAY],W_V[N_LAY],W_O[N_LAY];
 static VkBuf W_Qn[N_LAY],W_Kn[N_LAY];
 static VkBuf W_rf[N_LAY],W_Gate[N_LAY],W_Up[N_LAY],W_Down[N_LAY];
+static VkBuf WQ_Q[N_LAY],WQ_K[N_LAY],WQ_V[N_LAY],WQ_O[N_LAY];
+static VkBuf WQ_Gate[N_LAY],WQ_Up[N_LAY],WQ_Down[N_LAY];
 static VkBuf W_Fnorm,W_HeadShard[HEAD_SHARDS]; static float *Emb;
 
 /* Activation buffers */
-static VkBuf B_KV,B_Hid,B_Hid2,B_Qb,B_Kb,B_Vb,B_Sc,B_Att,B_PrefillOAcc,B_Gat,B_Up,B_Dwn,B_Tmp,B_Last,B_LogPart,B_LmShardTopk,B_LmTopk;
+static VkBuf B_KV,B_Hid,B_Hid2,B_Qb,B_Kb,B_Vb,B_Sc,B_Att,B_PrefillOAcc,B_Gat,B_Up,B_Dwn,B_Tmp,B_Q8In,B_Last,B_LogPart,B_LmShardTopk,B_LmTopk;
 static VkBuf B_KCache[N_LAY],B_VCache[N_LAY],B_AttnConst,B_KVConst;
 static VkBuf B_KVUpdateConst[N_LAY],B_AttnRunConst[N_LAY];
 
@@ -99,7 +103,7 @@ static VkDescriptorSetLayout DSL_AttnQK;static VkPipelineLayout PL_AttnQK;
 static VkDescriptorSetLayout DSL_AttnSoftmax;static VkPipelineLayout PL_AttnSoftmax;
 static VkDescriptorSetLayout DSL_AttnQKVAcc;static VkPipelineLayout PL_AttnQKVAcc;
 static VkDescriptorSetLayout DSL_AttnFinalize;static VkPipelineLayout PL_AttnFinalize;
-static VkPipeline P_MMt,P_MMr,P_GMV,P_GMVFp16,P_GMVQ4,P_MMFp16,P_MMQ4,P_RMS,P_RoPE,P_RoPENeox,P_SMax,P_SiLU,P_Add,P_AttnDec,P_KVUpdate,P_AttnPrefillQK,P_AttnPrefillSoftmax,P_AttnPrefillQKVAcc,P_AttnPrefillFinalize,P_LmTopKLocal,P_LmTopKMerge;
+static VkPipeline P_MMt,P_MMr,P_GMV,P_GMVFp16,P_GMVQ4,P_MMFp16,P_MMQ4,P_ActQ8,P_MMQ8,P_RMS,P_RoPE,P_RoPENeox,P_SMax,P_SiLU,P_Add,P_AttnDec,P_KVUpdate,P_AttnPrefillQK,P_AttnPrefillSoftmax,P_AttnPrefillQKVAcc,P_AttnPrefillFinalize,P_LmTopKLocal,P_LmTopKMerge;
 static uint32_t QFI;
 static pthread_mutex_t Mtx=PTHREAD_MUTEX_INITIALIZER;
 static bool vk_ok,mdl_ok;
@@ -138,7 +142,13 @@ static double g_last_prefill_down_ms;
 static double g_last_prefill_cpu_post_ms;
 static double g_last_prefill_attention_ms;
 static double g_last_prefill_ffn_gate_up_silu_ms;
+static bool g_prefill_q8_enabled;
 static bool g_gpu_lm_head_enabled=true;
+static bool g_last_q8_benchmark_ran;
+static bool g_last_q8_gate_pass;
+static double g_last_q8_weighted_f32_ms;
+static double g_last_q8_weighted_total_ms;
+static double g_last_q8_weighted_speedup;
 static bool g_last_lm_head_validation_ran;
 static bool g_last_lm_head_validation_ok;
 static int g_last_lm_head_validation_stage;
@@ -166,6 +176,8 @@ static double now_ms(void){
     clock_gettime(CLOCK_MONOTONIC,&ts);
     return (double)ts.tv_sec*1000.0+(double)ts.tv_nsec/1000000.0;
 }
+
+static void q8_pack_weight_cpu(const float *w,uint32_t *wq,uint32_t n,uint32_t k);
 
 static void topk_insert(int * ids, float * values, int * count, int limit, int token, float logit) {
     if (!isfinite(logit) || limit <= 0 || token < 0 || token >= VOCAB) {
@@ -577,7 +589,16 @@ static void BIND_PREFILL_FINALIZE(VkCommandBuffer cb,VkBuf*out,VkBuf*out_acc,VkB
 /* Dispatch macros — pipeline FIRST (MNN order: bind pipeline, then descriptors) */
 #define RMS(cb,rows,cols,x,w,y) do{uint32_t p[4]={rows,cols,0,0};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_RMS);BIND(cb,x,w,y,p);vkCmdDispatch(cb,(uint32_t)(rows),1,1);}while(0)
 #define BARRIER(cb) do{VkMemoryBarrier mb_={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT};vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb_,0,0,0,0);}while(0)
+#define CLEAR_FLOAT_BUF(cb,buf,nfloats) do{ \
+    VkMemoryBarrier mb0_={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT}; \
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb0_,0,0,0,0); \
+    vkCmdFillBuffer(cb,(buf)->B,0,F32((VkDeviceSize)(nfloats)),0u); \
+    VkMemoryBarrier mb1_={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT}; \
+    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb1_,0,0,0,0); \
+}while(0)
 #define MM(cb,w,x,y,M,N,K) do{uint32_t p[4]={M,N,K,K};if((M)==1){vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_GMV);}else if((M)<=4&&(N)<=65535){vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_MMr);}else{vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_MMt);}BIND(cb,w,x,y,p);if((M)==1){vkCmdDispatch(cb,(N),1,1);}else if((M)<=4&&(N)<=65535){vkCmdDispatch(cb,(N),(M),1);}else{vkCmdDispatch(cb,((N)+7)/8,((M)+7)/8,1);}}while(0)
+#define ACT_Q8(cb,x,q,M,K) do{uint32_t p[4]={M,K,K,(((K)+31u)/32u)};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_ActQ8);BIND(cb,x,q,&B_Dummy,p);vkCmdDispatch(cb,(((K)+31u)/32u),(M),1);BARRIER(cb);}while(0)
+#define MMQ8(cb,wq,q,y,M,N,K) do{uint32_t p[4]={M,N,K,K};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_MMQ8);BIND(cb,wq,q,y,p);vkCmdDispatch(cb,((N)+7u)/8u,((M)+7u)/8u,1);}while(0)
 #define ROPE(cb,x,nt,nh,posv,hd) do{uint32_t p[4]={nt,nh,(uint32_t)(posv),hd};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_RoPE);BIND(cb,x,NULL,NULL,p);uint32_t tot_=(nt)*(nh)*((hd)/2);vkCmdDispatch(cb,(tot_+63)/64,1,1);}while(0)
 #define ROPE_NEOX(cb,x,nt,nh,posv,hd) do{uint32_t p[4]={nt,nh,(uint32_t)(posv),hd};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_RoPENeox);BIND(cb,x,NULL,NULL,p);uint32_t tot_=(nt)*(nh)*((hd)/2);vkCmdDispatch(cb,(tot_+63)/64,1,1);}while(0)
 #define ADD(cb,y,x,n) do{uint32_t p[4]={n,0,0,0};vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_Add);BIND(cb,y,x,NULL,p);vkCmdDispatch(cb,((n)+63)/64,1,1);}while(0)
@@ -646,8 +667,12 @@ static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv
     }
 }
 
-static bool prefill_attention_gpu(int l, int nt, int pos) {
+static bool prefill_attention_gpu_record(VkCommandBuffer cb, int l, int nt, int pos) {
     const bool verbose_prefill = g_debug_correctness;
+    if (cb == VK_NULL_HANDLE) {
+        LOGE("PREFILL stage: attention command buffer is null");
+        return false;
+    }
     if (!g_mnn_prefill_attention_enabled) {
         if (l == 0) {
             LOGE("PREFILL stage: attention disabled (pipeline creation failed)");
@@ -678,32 +703,23 @@ static bool prefill_attention_gpu(int l, int nt, int pos) {
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 zero B_PrefillOAcc");
     }
-    WaitSubmittedForHostAccess("prefill attention scratch zero");
-    memset(B_PrefillOAcc.P, 0, F32((VkDeviceSize)nt * QDIM));
+    CLEAR_FLOAT_BUF(cb, &B_PrefillOAcc, (VkDeviceSize)nt * QDIM);
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 zero B_Up");
     }
-    memset(B_Up.P, 0, F32((VkDeviceSize)nt * N_HD));
+    CLEAR_FLOAT_BUF(cb, &B_Up, (VkDeviceSize)nt * N_HD);
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 zero B_Dwn");
     }
-    memset(B_Dwn.P, 0, F32((VkDeviceSize)nt * N_HD));
+    CLEAR_FLOAT_BUF(cb, &B_Dwn, (VkDeviceSize)nt * N_HD);
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 zero B_Tmp");
     }
-    memset(B_Tmp.P, 0, F32((VkDeviceSize)nt * N_HD));
-    buf_flush(&B_PrefillOAcc);
-    buf_flush(&B_Up);
-    buf_flush(&B_Dwn);
-    buf_flush(&B_Tmp);
+    CLEAR_FLOAT_BUF(cb, &B_Tmp, (VkDeviceSize)nt * N_HD);
 
     const double start_ms = now_ms();
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 attention CB begin");
-    }
-    VkCommandBuffer cb = CB();
-    if (l == 0 && verbose_prefill) {
-        LOGI("PREFILL stage: layer0 attention CB acquired");
     }
     for (int k_start = 0; k_start < total_len; k_start += block_len) {
         const int cur_block = (total_len - k_start < block_len) ? (total_len - k_start) : block_len;
@@ -749,13 +765,18 @@ static bool prefill_attention_gpu(int l, int nt, int pos) {
     if (l == 0 && verbose_prefill) {
         LOGI("PREFILL stage: layer0 attention CB recorded");
     }
-    SubmitNoWait(cb);
-    if (l == 0 && verbose_prefill) {
-        LOGI("PREFILL stage: layer0 attention submit done");
-    }
     const double elapsed_ms = now_ms() - start_ms;
     g_last_prefill_attention_ms += elapsed_ms;
     g_last_forward_attention_ms += elapsed_ms;
+    return true;
+}
+
+static bool prefill_attention_gpu(int l, int nt, int pos) {
+    VkCommandBuffer cb = CB();
+    if (!prefill_attention_gpu_record(cb, l, nt, pos)) {
+        return false;
+    }
+    SubmitNoWait(cb);
     return true;
 }
 
@@ -817,6 +838,9 @@ int osh26_vk_gpu_init(void){if(vk_ok)return 0;
       s.codeSize=_tmp_mulmat_fp16_packed_spv_len;s.pCode=(const uint32_t*)_tmp_mulmat_fp16_packed_spv;VkResult mm_fp16_sm=vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;VkResult mm_fp16_p=mm_fp16_sm==VK_SUCCESS?vkCreateComputePipelines(D,0,1,&pi,0,&P_MMFp16):mm_fp16_sm;
       s.codeSize=_tmp_mulmat_q4_packed_spv_len;s.pCode=(const uint32_t*)_tmp_mulmat_q4_packed_spv;VkResult mm_q4_sm=vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;VkResult mm_q4_p=mm_q4_sm==VK_SUCCESS?vkCreateComputePipelines(D,0,1,&pi,0,&P_MMQ4):mm_q4_sm;
       if(mm_fp16_p!=VK_SUCCESS||mm_q4_p!=VK_SUCCESS){LOGE("quant GEMM pipeline creation failed: fp16=%d q4=%d",(int)mm_fp16_p,(int)mm_q4_p);return -1;}
+      s.codeSize=_tmp_act_quant_q8_spv_len;s.pCode=(const uint32_t*)_tmp_act_quant_q8_spv;VkResult act_q8_sm=vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;VkResult act_q8_p=act_q8_sm==VK_SUCCESS?vkCreateComputePipelines(D,0,1,&pi,0,&P_ActQ8):act_q8_sm;
+      s.codeSize=_tmp_mulmat_q8_w8a8_spv_len;s.pCode=(const uint32_t*)_tmp_mulmat_q8_w8a8_spv;VkResult mm_q8_sm=vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;VkResult mm_q8_p=mm_q8_sm==VK_SUCCESS?vkCreateComputePipelines(D,0,1,&pi,0,&P_MMQ8):mm_q8_sm;
+      if(act_q8_p!=VK_SUCCESS||mm_q8_p!=VK_SUCCESS){LOGE("Q8 W8A8 benchmark pipeline creation failed: act=%d gemm=%d",(int)act_q8_p,(int)mm_q8_p);return -1;}
       s.codeSize=_tmp_rms_norm_spv_len;s.pCode=(const uint32_t*)_tmp_rms_norm_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_RMS);
       s.codeSize=_tmp_rope_spv_len;s.pCode=(const uint32_t*)_tmp_rope_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_RoPE);
       s.codeSize=_tmp_rope_neox_spv_len;s.pCode=(const uint32_t*)_tmp_rope_neox_spv;vkCreateShaderModule(D,&s,0,&m);pi.stage.module=m;vkCreateComputePipelines(D,0,1,&pi,0,&P_RoPENeox);
@@ -854,7 +878,72 @@ static bool read_gguf(struct gguf_context*g,FILE*f,const char*name,float*dst){
     else if(type==GGML_TYPE_F16){ggml_fp16_t*buf=(ggml_fp16_t*)malloc(tsize);fread(buf,1,tsize,f);ggml_fp16_to_fp32_row(buf,dst,n_el);free(buf);}
     else{void*buf=malloc(tsize);fread(buf,1,tsize,f);ggml_get_type_traits(type)->to_float(buf,dst,n_el);free(buf);}
     return true;}
+static bool read_gguf_q8_packed(struct gguf_context*g,FILE*f,const char*name,VkBuf*dst,uint32_t n,uint32_t k){
+    int idx=gguf_find_tensor(g,name);if(idx<0){LOGE("Tensor not found: %s",name);return false;}
+    enum ggml_type type=gguf_get_tensor_type(g,idx);
+    if(type!=GGML_TYPE_Q8_0){LOGI("Tensor %s is not Q8_0 (type=%d); Q8 prefill unavailable for this model",name,(int)type);return false;}
+    if((k%32u)!=0u){LOGE("Tensor %s K is not divisible by 32: %u",name,k);return false;}
+    const uint32_t blocks=k/32u;
+    size_t expected=(size_t)n*(size_t)blocks*(sizeof(ggml_fp16_t)+32u);
+    size_t tsize=gguf_get_tensor_size(g,idx);
+    if(tsize!=expected){LOGE("Tensor %s Q8_0 size mismatch expected=%zu actual=%zu",name,expected,tsize);return false;}
+    const VkDeviceSize words=(VkDeviceSize)n*blocks*9u;
+    if(!buf_alloc(dst,words*sizeof(uint32_t))){LOGE("alloc q8 %s",name);return false;}
+    uint32_t*out=(uint32_t*)dst->P;
+    size_t off=gguf_get_data_offset(g)+gguf_get_tensor_offset(g,idx);
+    fseek(f,(long)off,SEEK_SET);
+    for(uint32_t row=0;row<n;row++){
+        for(uint32_t block=0;block<blocks;block++){
+            ggml_fp16_t h=0;
+            uint8_t qs[32];
+            if(fread(&h,1,sizeof(h),f)!=sizeof(h)||fread(qs,1,sizeof(qs),f)!=sizeof(qs)){
+                LOGE("read q8 tensor failed: %s",name);
+                return false;
+            }
+            float scale=ggml_fp16_to_fp32(h);
+            uint32_t scale_bits;
+            memcpy(&scale_bits,&scale,sizeof(scale_bits));
+            out[row*blocks+block]=scale_bits;
+            const uint32_t word_base=n*blocks+(row*blocks+block)*8u;
+            for(uint32_t wi=0;wi<8u;wi++){
+                uint32_t packed=0u;
+                for(uint32_t t=0;t<4u;t++){
+                    packed|=((uint32_t)qs[wi*4u+t])<<(t*8u);
+                }
+                out[word_base+wi]=packed;
+            }
+        }
+    }
+    buf_flush(dst);
+    return true;
+}
+static bool pack_f32_q8_buffer(const char*name,const VkBuf*src,VkBuf*dst,uint32_t n,uint32_t k){
+    if(src==NULL||src->P==NULL||dst==NULL||n==0u||k==0u||(k%32u)!=0u){
+        LOGE("Invalid F32 to Q8 pack request for %s",name);
+        return false;
+    }
+    const VkDeviceSize words=(VkDeviceSize)n*(k/32u)*9u;
+    if(!buf_alloc(dst,words*sizeof(uint32_t))){
+        LOGE("alloc converted q8 %s",name);
+        return false;
+    }
+    const double start_ms=now_ms();
+    q8_pack_weight_cpu(src->P,(uint32_t*)dst->P,n,k);
+    buf_flush(dst);
+    LOGI("Converted %s F32 to packed Q8 in %.2f ms",name,now_ms()-start_ms);
+    return true;
+}
 #define LOAD_BUF(name,buf,nelem) do{if(!buf_alloc(&(buf),((VkDeviceSize)(nelem))*4)){LOGE("alloc %s",name);return -1;}if(!read_gguf(gctx,f,name,(buf).P)){LOGE("read %s",name);return -1;}buf_flush(&(buf));}while(0)
+#define TRY_LOAD_Q8(name,qbuf,fbuf,n,k) do{ \
+    if(q8_load_ok){ \
+        int q8_idx_=gguf_find_tensor(gctx,name); \
+        enum ggml_type q8_type_=q8_idx_>=0?gguf_get_tensor_type(gctx,q8_idx_):GGML_TYPE_COUNT; \
+        bool q8_ok_=q8_type_==GGML_TYPE_Q8_0 \
+            ? read_gguf_q8_packed(gctx,f,name,&(qbuf),(uint32_t)(n),(uint32_t)(k)) \
+            : pack_f32_q8_buffer(name,&(fbuf),&(qbuf),(uint32_t)(n),(uint32_t)(k)); \
+        if(!q8_ok_)q8_load_ok=false; \
+    } \
+}while(0)
 int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_last_attention_max_abs_err=0.0f;g_attention_fallback_layers=0;
     memset(g_last_logits_top5,0,sizeof(g_last_logits_top5));memset(g_last_logits_top5_values,0,sizeof(g_last_logits_top5_values));
@@ -875,18 +964,19 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     if(!validate_qwen3_06b_gguf(gctx)){gguf_free(gctx);fclose(f);return -1;}
     Emb=(float*)malloc(((VkDeviceSize)VOCAB*HDIM)*4);if(!read_gguf(gctx,f,"token_embd.weight",Emb)){free(Emb);gguf_free(gctx);fclose(f);return -1;}
     char n[128];
+    bool q8_load_ok=true;
     for(int l=0;l<N_LAY;l++){
         snprintf(n,sizeof(n),"blk.%d.attn_norm.weight",l);LOAD_BUF(n,W_ra[l],HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_q.weight",l);LOAD_BUF(n,W_Q[l],QDIM*HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_k.weight",l);LOAD_BUF(n,W_K[l],KVD*HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_v.weight",l);LOAD_BUF(n,W_V[l],KVD*HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_output.weight",l);LOAD_BUF(n,W_O[l],HDIM*QDIM);
+        snprintf(n,sizeof(n),"blk.%d.attn_q.weight",l);LOAD_BUF(n,W_Q[l],QDIM*HDIM);TRY_LOAD_Q8(n,WQ_Q[l],W_Q[l],QDIM,HDIM);
+        snprintf(n,sizeof(n),"blk.%d.attn_k.weight",l);LOAD_BUF(n,W_K[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_K[l],W_K[l],KVD,HDIM);
+        snprintf(n,sizeof(n),"blk.%d.attn_v.weight",l);LOAD_BUF(n,W_V[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_V[l],W_V[l],KVD,HDIM);
+        snprintf(n,sizeof(n),"blk.%d.attn_output.weight",l);LOAD_BUF(n,W_O[l],HDIM*QDIM);TRY_LOAD_Q8(n,WQ_O[l],W_O[l],HDIM,QDIM);
         snprintf(n,sizeof(n),"blk.%d.attn_q_norm.weight",l);LOAD_BUF(n,W_Qn[l],HD);
         snprintf(n,sizeof(n),"blk.%d.attn_k_norm.weight",l);LOAD_BUF(n,W_Kn[l],HD);
         snprintf(n,sizeof(n),"blk.%d.ffn_norm.weight",l);LOAD_BUF(n,W_rf[l],HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_gate.weight",l);LOAD_BUF(n,W_Gate[l],IDIM*HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_up.weight",l);LOAD_BUF(n,W_Up[l],IDIM*HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_down.weight",l);LOAD_BUF(n,W_Down[l],HDIM*IDIM);
+        snprintf(n,sizeof(n),"blk.%d.ffn_gate.weight",l);LOAD_BUF(n,W_Gate[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Gate[l],W_Gate[l],IDIM,HDIM);
+        snprintf(n,sizeof(n),"blk.%d.ffn_up.weight",l);LOAD_BUF(n,W_Up[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Up[l],W_Up[l],IDIM,HDIM);
+        snprintf(n,sizeof(n),"blk.%d.ffn_down.weight",l);LOAD_BUF(n,W_Down[l],HDIM*IDIM);TRY_LOAD_Q8(n,WQ_Down[l],W_Down[l],HDIM,IDIM);
     }
     LOAD_BUF("output_norm.weight",W_Fnorm,HDIM);
     float *head_tmp=(float*)malloc(F32((VkDeviceSize)VOCAB*HDIM));
@@ -932,6 +1022,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     ALLOC_BUF(B_Up,((VkDeviceSize)MAX_S*IDIM)*4,"B_Up");
     ALLOC_BUF(B_Dwn,((VkDeviceSize)MAX_S*IDIM)*4,"B_Dwn");
     ALLOC_BUF(B_Tmp,((VkDeviceSize)MAX_S*HDIM)*4,"B_Tmp");
+    ALLOC_BUF(B_Q8In,((VkDeviceSize)MAX_S*((IDIM+31)/32)*9)*sizeof(uint32_t),"B_Q8In");
     ALLOC_BUF(B_Last,((VkDeviceSize)HDIM)*4,"B_Last");
     ALLOC_BUF(B_LogPart,((VkDeviceSize)HEAD_SHARD)*4,"B_LogPart");
     ALLOC_BUF(B_LmShardTopk,((VkDeviceSize)HEAD_SHARDS*LM_HEAD_LOCAL_TOPK*2)*4,"B_LmShardTopk");
@@ -939,7 +1030,10 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     if(!create_lm_descriptor_sets()){LOGE("create LM head descriptors");osh26_vk_gpu_free();return -1;}
 #undef ALLOC_BUF
 #undef ALLOC_ZERO_BUF
+    g_prefill_q8_enabled=q8_load_ok;
+    LOGI("Q8 prefill enabled: %s",g_prefill_q8_enabled?"true":"false");
     mdl_ok=true;LOGI("Model loaded");return 0;}
+#undef TRY_LOAD_Q8
 
 /* ---- Forward pass ---- */
 int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const int validation_stage=(flags&OSH26_FORWARD_VALIDATE_PREFILL)?1:((flags&OSH26_FORWARD_VALIDATE_FIRST_DECODE)?2:0);const bool correctness_check=g_debug_correctness&&validation_stage!=0;const bool debug_check=((flags&OSH26_FORWARD_DEBUG_CHECK)!=0);static int fc=0;if((correctness_check||debug_check)&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
@@ -959,18 +1053,34 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     buf_flush(&B_Hid);
     int do_diag=(nt==1 && debug_check); /* expensive decode diagnostics */
     for(int l=0;l<N_LAY;l++){
+        VkCommandBuffer prefill_cb = VK_NULL_HANDLE;
+        if (nt > 1 && !debug_check) {
+            prefill_cb = CB();
+            if (prefill_cb == VK_NULL_HANDLE) {
+                g_current_forward_is_prefill=false;
+                pthread_mutex_unlock(&Mtx);
+                return -1;
+            }
+        }
         /* --- RMS attn + Q,K,V projection --- */
         if (nt > 1 && !debug_check) {
           if (l == 0 && verbose_prefill) {
               LOGI("PREFILL stage: layer0 qkv begin");
           }
           const double prefill_qkv_start_ms = now_ms();
-          VkCommandBuffer cb1 = CB();
+          VkCommandBuffer cb1 = prefill_cb;
           RMS(cb1,nt,HDIM,&B_Hid,&W_ra[l],&B_Hid2);
           BARRIER(cb1);
-          MM(cb1,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
-          MM(cb1,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
-          MM(cb1,&W_V[l],&B_Hid2,&B_Vb,nt,KVD,HDIM);
+          if(g_prefill_q8_enabled){
+            ACT_Q8(cb1,&B_Hid2,&B_Q8In,nt,HDIM);
+            MMQ8(cb1,&WQ_Q[l],&B_Q8In,&B_Qb,nt,QDIM,HDIM);
+            MMQ8(cb1,&WQ_K[l],&B_Q8In,&B_Kb,nt,KVD,HDIM);
+            MMQ8(cb1,&WQ_V[l],&B_Q8In,&B_Vb,nt,KVD,HDIM);
+          }else{
+            MM(cb1,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
+            MM(cb1,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
+            MM(cb1,&W_V[l],&B_Hid2,&B_Vb,nt,KVD,HDIM);
+          }
           BARRIER(cb1);
           const double prefill_qk_norm_rope_start_ms = now_ms();
           RMS(cb1,nt * N_HD,HD,&B_Qb,&W_Qn[l],&B_Qb);
@@ -979,11 +1089,10 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           ROPE_NEOX(cb1,&B_Qb,nt,N_HD,pos,HD);
           ROPE_NEOX(cb1,&B_Kb,nt,N_KVH,pos,HD);
           BARRIER(cb1);
-          SubmitNoWait(cb1);
           g_last_prefill_qkv_ms += prefill_qk_norm_rope_start_ms - prefill_qkv_start_ms;
           g_last_prefill_qk_norm_rope_ms += now_ms() - prefill_qk_norm_rope_start_ms;
           if (l == 0 && verbose_prefill) {
-              LOGI("PREFILL stage: layer0 qkv queued");
+              LOGI("PREFILL stage: layer0 qkv recorded");
           }
         } else if (nt == 1 && !debug_check) {
           VkCommandBuffer cb1=CB();
@@ -1025,13 +1134,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               if (l == 0 && verbose_prefill) {
                   LOGI("PREFILL stage: layer0 kv update begin");
               }
-              { VkCommandBuffer cbk=CB();
+              { VkCommandBuffer cbk=prefill_cb;
                 KV_UPDATE(cbk,&B_Kb,&B_Vb,&B_KCache[l],&B_VCache[l],&B_KVUpdateConst[l],nt);
                 BARRIER(cbk);
-                SubmitNoWait(cbk);
               }
               if (l == 0 && verbose_prefill) {
-                  LOGI("PREFILL stage: layer0 kv update submit done");
+                  LOGI("PREFILL stage: layer0 kv update recorded");
               }
           }else if(nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
               AttnConst kc={{1,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
@@ -1047,9 +1155,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           }
           g_last_forward_kv_update_ms += now_ms()-kv_update_start_ms;
           if (nt>1 && !debug_check) {
-              if (!prefill_attention_gpu(l, nt, pos)) {
+              if (!prefill_attention_gpu_record(prefill_cb, l, nt, pos)) {
                   LOGE("PREFILL stage: layer%d GPU attention failed", l);
-                  WaitAndRecycleAtEnd();
+                  vkEndCommandBuffer(prefill_cb);
+                  vkResetCommandPool(D, CP, 0);
+                  vkResetDescriptorPool(D, DP, 0);
+                  g_submit_cursor = 0;
                   g_current_forward_is_prefill=false;
                   pthread_mutex_unlock(&Mtx);
                   return -1;
@@ -1119,21 +1230,37 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           SubmitNoWait(cb2);
         }else if (nt > 1 && !debug_check) {
           const double prefill_o_proj_start_ms = now_ms();
-          VkCommandBuffer cb2=CB();
-          MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
+          VkCommandBuffer cb2=prefill_cb;
+          if(g_prefill_q8_enabled){
+            ACT_Q8(cb2,&B_Att,&B_Q8In,nt,QDIM);
+            MMQ8(cb2,&WQ_O[l],&B_Q8In,&B_Tmp,nt,HDIM,QDIM);
+          }else{
+            MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
+          }
           BARRIER(cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           const double prefill_ffn_start_ms = now_ms();
           BARRIER(cb2);
           RMS(cb2,nt,HDIM,&B_Hid,&W_rf[l],&B_Hid2);
           BARRIER(cb2);
-          MM(cb2,&W_Gate[l],&B_Hid2,&B_Gat,nt,IDIM,HDIM);
-          MM(cb2,&W_Up[l],&B_Hid2,&B_Up,nt,IDIM,HDIM);
+          if(g_prefill_q8_enabled){
+            ACT_Q8(cb2,&B_Hid2,&B_Q8In,nt,HDIM);
+            MMQ8(cb2,&WQ_Gate[l],&B_Q8In,&B_Gat,nt,IDIM,HDIM);
+            MMQ8(cb2,&WQ_Up[l],&B_Q8In,&B_Up,nt,IDIM,HDIM);
+          }else{
+            MM(cb2,&W_Gate[l],&B_Hid2,&B_Gat,nt,IDIM,HDIM);
+            MM(cb2,&W_Up[l],&B_Hid2,&B_Up,nt,IDIM,HDIM);
+          }
           BARRIER(cb2);
           SILU(cb2,&B_Gat,&B_Up,&B_Dwn,nt*IDIM);
           const double prefill_down_start_ms = now_ms();
           BARRIER(cb2);
-          MM(cb2,&W_Down[l],&B_Dwn,&B_Tmp,nt,HDIM,IDIM);
+          if(g_prefill_q8_enabled){
+            ACT_Q8(cb2,&B_Dwn,&B_Q8In,nt,IDIM);
+            MMQ8(cb2,&WQ_Down[l],&B_Q8In,&B_Tmp,nt,HDIM,IDIM);
+          }else{
+            MM(cb2,&W_Down[l],&B_Dwn,&B_Tmp,nt,HDIM,IDIM);
+          }
           BARRIER(cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           BARRIER(cb2);
@@ -1142,7 +1269,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           g_last_prefill_ffn_gate_up_silu_ms += prefill_down_start_ms - prefill_ffn_start_ms;
           g_last_prefill_down_ms += now_ms() - prefill_down_start_ms;
           if (l == 0 && verbose_prefill) {
-              LOGI("PREFILL stage: layer0 ffn queued");
+              LOGI("PREFILL stage: layer0 ffn recorded");
           }
         }else{
         /* --- Submit 2a: O projection + residual --- */
@@ -1421,6 +1548,80 @@ static double benchmark_gemm_pipeline(VkPipeline pipeline,VkDescriptorSet ds,uin
     return elapsed/(double)iterations;
 }
 
+static double benchmark_act_q8_pipeline(VkDescriptorSet ds,uint32_t m,uint32_t k,int iterations){
+    VkCommandBuffer cb=g_submit_cbs[0];
+    VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,0,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,0};
+    if(vkBeginCommandBuffer(cb,&begin)!=VK_SUCCESS)return -1.0;
+    const uint32_t blocks=(k+31u)/32u;
+    uint32_t pc[4]={m,k,k,blocks};
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_ActQ8);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL,0,1,&ds,0,0);
+    vkCmdPushConstants(cb,PL,VK_SHADER_STAGE_COMPUTE_BIT,0,16,pc);
+    for(int i=0;i<iterations;i++){
+        vkCmdDispatch(cb,blocks,m,1);
+        if(i+1<iterations)BARRIER(cb);
+    }
+    if(vkEndCommandBuffer(cb)!=VK_SUCCESS)return -1.0;
+    VkSubmitInfo submit={VK_STRUCTURE_TYPE_SUBMIT_INFO,0,0,0,0,1,&cb,0,0};
+    const double start=now_ms();
+    if(vkQueueSubmit(Q,1,&submit,VK_NULL_HANDLE)!=VK_SUCCESS)return -1.0;
+    if(vkQueueWaitIdle(Q)!=VK_SUCCESS)return -1.0;
+    const double elapsed=now_ms()-start;
+    vkResetCommandPool(D,CP,0);
+    return elapsed/(double)iterations;
+}
+
+static double benchmark_q8_gemm_pipeline(VkDescriptorSet ds,uint32_t m,uint32_t n,uint32_t k,int iterations){
+    VkCommandBuffer cb=g_submit_cbs[0];
+    VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,0,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,0};
+    if(vkBeginCommandBuffer(cb,&begin)!=VK_SUCCESS)return -1.0;
+    uint32_t pc[4]={m,n,k,k};
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_MMQ8);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL,0,1,&ds,0,0);
+    vkCmdPushConstants(cb,PL,VK_SHADER_STAGE_COMPUTE_BIT,0,16,pc);
+    for(int i=0;i<iterations;i++){
+        vkCmdDispatch(cb,(n+7u)/8u,(m+7u)/8u,1);
+        if(i+1<iterations)BARRIER(cb);
+    }
+    if(vkEndCommandBuffer(cb)!=VK_SUCCESS)return -1.0;
+    VkSubmitInfo submit={VK_STRUCTURE_TYPE_SUBMIT_INFO,0,0,0,0,1,&cb,0,0};
+    const double start=now_ms();
+    if(vkQueueSubmit(Q,1,&submit,VK_NULL_HANDLE)!=VK_SUCCESS)return -1.0;
+    if(vkQueueWaitIdle(Q)!=VK_SUCCESS)return -1.0;
+    const double elapsed=now_ms()-start;
+    vkResetCommandPool(D,CP,0);
+    return elapsed/(double)iterations;
+}
+
+static double benchmark_q8_total_pipeline(VkDescriptorSet ds_act,VkDescriptorSet ds_q8,uint32_t m,uint32_t n,uint32_t k,int iterations){
+    VkCommandBuffer cb=g_submit_cbs[0];
+    VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,0,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,0};
+    if(vkBeginCommandBuffer(cb,&begin)!=VK_SUCCESS)return -1.0;
+    const uint32_t blocks=(k+31u)/32u;
+    uint32_t pc_act[4]={m,k,k,blocks};
+    uint32_t pc_mm[4]={m,n,k,k};
+    for(int i=0;i<iterations;i++){
+        vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_ActQ8);
+        vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL,0,1,&ds_act,0,0);
+        vkCmdPushConstants(cb,PL,VK_SHADER_STAGE_COMPUTE_BIT,0,16,pc_act);
+        vkCmdDispatch(cb,blocks,m,1);
+        BARRIER(cb);
+        vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_MMQ8);
+        vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,PL,0,1,&ds_q8,0,0);
+        vkCmdPushConstants(cb,PL,VK_SHADER_STAGE_COMPUTE_BIT,0,16,pc_mm);
+        vkCmdDispatch(cb,(n+7u)/8u,(m+7u)/8u,1);
+        if(i+1<iterations)BARRIER(cb);
+    }
+    if(vkEndCommandBuffer(cb)!=VK_SUCCESS)return -1.0;
+    VkSubmitInfo submit={VK_STRUCTURE_TYPE_SUBMIT_INFO,0,0,0,0,1,&cb,0,0};
+    const double start=now_ms();
+    if(vkQueueSubmit(Q,1,&submit,VK_NULL_HANDLE)!=VK_SUCCESS)return -1.0;
+    if(vkQueueWaitIdle(Q)!=VK_SUCCESS)return -1.0;
+    const double elapsed=now_ms()-start;
+    vkResetCommandPool(D,CP,0);
+    return elapsed/(double)iterations;
+}
+
 static void benchmark_error(const float *actual,const float *reference,int n,float *max_abs,float *rmse){
     double sum_sq=0.0;float maxe=0.0f;
     for(int i=0;i<n;i++){float e=fabsf(actual[i]-reference[i]);if(e>maxe)maxe=e;sum_sq+=(double)e*(double)e;}
@@ -1609,6 +1810,225 @@ cleanup:
     return strstr(out_json,"\"ok\":true")?0:-1;
 }
 
+static int unpack_i8_cpu(uint32_t word,uint32_t idx){
+    uint32_t b=(word>>(idx*8u))&255u;
+    return (b&128u)?((int)b-256):(int)b;
+}
+
+static void q8_pack_weight_cpu(const float *w,uint32_t *wq,uint32_t n,uint32_t k){
+    const uint32_t blocks=(k+31u)/32u;
+    const uint32_t words_offset=n*blocks;
+    memset(wq,0,(size_t)n*blocks*9u*sizeof(uint32_t));
+    for(uint32_t row=0;row<n;row++){
+        for(uint32_t block=0;block<blocks;block++){
+            float maxabs=0.0f;
+            for(uint32_t j=0;j<32u;j++){
+                const uint32_t col=block*32u+j;
+                const float v=(col<k)?w[(VkDeviceSize)row*k+col]:0.0f;
+                const float a=fabsf(v);
+                if(a>maxabs)maxabs=a;
+            }
+            float scale=fmaxf(maxabs/127.0f,1.0e-12f);
+            uint32_t scale_bits;
+            memcpy(&scale_bits,&scale,sizeof(scale_bits));
+            wq[row*blocks+block]=scale_bits;
+            const uint32_t word_base=words_offset+(row*blocks+block)*8u;
+            for(uint32_t wi=0;wi<8u;wi++){
+                uint32_t packed=0u;
+                for(uint32_t t=0;t<4u;t++){
+                    const uint32_t col=block*32u+wi*4u+t;
+                    const float v=(col<k)?w[(VkDeviceSize)row*k+col]:0.0f;
+                    int qi=(int)lrintf(fmaxf(-127.0f,fminf(127.0f,v/scale)));
+                    packed|=(uint32_t)(qi&255)<<(t*8u);
+                }
+                wq[word_base+wi]=packed;
+            }
+        }
+    }
+}
+
+static float q8_ref_dot_cpu(const uint32_t *wq,const uint32_t *xq,uint32_t m_count,uint32_t n_count,uint32_t k,uint32_t row,uint32_t col){
+    (void)m_count;
+    const uint32_t blocks=(k+31u)/32u;
+    const uint32_t w_words_offset=n_count*blocks;
+    const uint32_t x_words_offset=m_count*blocks;
+    float sum=0.0f;
+    for(uint32_t block=0;block<blocks;block++){
+        uint32_t w_scale_bits=wq[col*blocks+block];
+        uint32_t x_scale_bits=xq[row*blocks+block];
+        float ws,xs;
+        memcpy(&ws,&w_scale_bits,sizeof(ws));
+        memcpy(&xs,&x_scale_bits,sizeof(xs));
+        int dot=0;
+        const uint32_t wbase=w_words_offset+(col*blocks+block)*8u;
+        const uint32_t xbase=x_words_offset+(row*blocks+block)*8u;
+        for(uint32_t wi=0;wi<8u;wi++){
+            const uint32_t ww=wq[wbase+wi];
+            const uint32_t xw=xq[xbase+wi];
+            dot+=unpack_i8_cpu(ww,0u)*unpack_i8_cpu(xw,0u);
+            dot+=unpack_i8_cpu(ww,1u)*unpack_i8_cpu(xw,1u);
+            dot+=unpack_i8_cpu(ww,2u)*unpack_i8_cpu(xw,2u);
+            dot+=unpack_i8_cpu(ww,3u)*unpack_i8_cpu(xw,3u);
+        }
+        sum+=(float)dot*ws*xs;
+    }
+    return sum;
+}
+
+typedef struct {
+    const char *name;
+    uint32_t m,n,k,repeats;
+    double f32_ms,quant_ms,q8_ms,q8_total_ms,speedup;
+    float sample_impl_max_abs_err,sample_impl_rmse;
+    float sample_vs_f32_max_abs_err,sample_vs_f32_rmse;
+    bool ok;
+    char json[1024];
+} Q8ShapeBench;
+
+static bool q8_run_shape(Q8ShapeBench *r,char *err,size_t err_size){
+    const uint32_t m=r->m,n=r->n,k=r->k,blocks=(k+31u)/32u,total=m*n;
+    const int warmup_iterations=1,iterations=3,sample_count=64;
+    VkBuf wf32={0},wq={0},x={0},xq={0},y={0};
+    bool success=false;
+    const VkDeviceSize q_weight_words=(VkDeviceSize)n*blocks*9u;
+    const VkDeviceSize q_act_words=(VkDeviceSize)m*blocks*9u;
+    if(!buf_alloc(&wf32,F32((VkDeviceSize)n*k))||
+       !buf_alloc(&wq,q_weight_words*sizeof(uint32_t))||
+       !buf_alloc(&x,F32((VkDeviceSize)m*k))||
+       !buf_alloc(&xq,q_act_words*sizeof(uint32_t))||
+       !buf_alloc(&y,F32(total))){
+        snprintf(err,err_size,"Q8 shape %s buffer allocation failed",r->name);
+        goto cleanup;
+    }
+    for(uint32_t row=0;row<m;row++){
+        for(uint32_t col=0;col<k;col++){
+            x.P[(VkDeviceSize)row*k+col]=sinf((float)(row*17u+col)*0.013f)*0.75f+cosf((float)(row+col*5u)*0.003f)*0.25f;
+        }
+    }
+    for(uint32_t row=0;row<n;row++){
+        for(uint32_t col=0;col<k;col++){
+            wf32.P[(VkDeviceSize)row*k+col]=sinf((float)(row*13u+col*7u)*0.0013f)*0.12f+cosf((float)(row+col*3u)*0.007f)*0.03f;
+        }
+    }
+    q8_pack_weight_cpu(wf32.P,(uint32_t*)wq.P,n,k);
+    VkDescriptorSet ds_f32=VK_NULL_HANDLE,ds_act=VK_NULL_HANDLE,ds_q8=VK_NULL_HANDLE;
+    vkResetDescriptorPool(D,DP,0);
+    if(!benchmark_descriptor_set(&wf32,&x,&y,&ds_f32)||
+       !benchmark_descriptor_set(&x,&xq,&y,&ds_act)||
+       !benchmark_descriptor_set(&wq,&xq,&y,&ds_q8)){
+        snprintf(err,err_size,"Q8 shape %s descriptor allocation failed",r->name);
+        goto cleanup;
+    }
+    benchmark_gemm_pipeline(P_MMt,ds_f32,m,n,k,warmup_iterations);
+    benchmark_q8_total_pipeline(ds_act,ds_q8,m,n,k,warmup_iterations);
+    r->f32_ms=benchmark_gemm_pipeline(P_MMt,ds_f32,m,n,k,iterations);
+    r->quant_ms=benchmark_act_q8_pipeline(ds_act,m,k,iterations);
+    r->q8_ms=benchmark_q8_gemm_pipeline(ds_q8,m,n,k,iterations);
+    r->q8_total_ms=benchmark_q8_total_pipeline(ds_act,ds_q8,m,n,k,iterations);
+    if(r->f32_ms<=0.0||r->quant_ms<=0.0||r->q8_ms<=0.0||r->q8_total_ms<=0.0){
+        snprintf(err,err_size,"Q8 shape %s benchmark dispatch failed",r->name);
+        goto cleanup;
+    }
+    r->speedup=r->f32_ms/r->q8_total_ms;
+    {
+        float impl_max=0.0f,vs_f32_max=0.0f;
+        double impl_sq=0.0,vs_f32_sq=0.0;
+        for(int sample=0;sample<sample_count;sample++){
+            uint32_t out_index=(uint32_t)(((uint64_t)sample*(uint64_t)(total-1))/(uint64_t)(sample_count-1));
+            uint32_t out_m=out_index/n,out_n=out_index%n;
+            float ref_q8=q8_ref_dot_cpu((const uint32_t*)wq.P,(const uint32_t*)xq.P,m,n,k,out_m,out_n);
+            float ref_f32=0.0f;
+            for(uint32_t col=0;col<k;col++){
+                ref_f32+=wf32.P[(VkDeviceSize)out_n*k+col]*x.P[(VkDeviceSize)out_m*k+col];
+            }
+            const float gpu=y.P[out_index];
+            const float e_impl=fabsf(gpu-ref_q8);
+            const float e_f32=fabsf(gpu-ref_f32);
+            if(e_impl>impl_max)impl_max=e_impl;
+            if(e_f32>vs_f32_max)vs_f32_max=e_f32;
+            impl_sq+=(double)e_impl*(double)e_impl;
+            vs_f32_sq+=(double)e_f32*(double)e_f32;
+        }
+        r->sample_impl_max_abs_err=impl_max;
+        r->sample_impl_rmse=(float)sqrt(impl_sq/(double)sample_count);
+        r->sample_vs_f32_max_abs_err=vs_f32_max;
+        r->sample_vs_f32_rmse=(float)sqrt(vs_f32_sq/(double)sample_count);
+    }
+    r->ok=(r->sample_impl_max_abs_err<1.0e-3f||r->sample_impl_rmse<1.0e-4f);
+    snprintf(r->json,sizeof(r->json),
+        "{\"name\":\"%s\",\"repeats\":%u,\"shape\":{\"m\":%u,\"n\":%u,\"k\":%u},"
+        "\"f32_ms\":%.6f,\"q8\":{\"quant_ms\":%.6f,\"gemm_ms\":%.6f,\"total_ms\":%.6f,"
+        "\"speedup\":%.4f,\"sample_impl_max_abs_err\":%.8g,\"sample_impl_rmse\":%.8g,"
+        "\"sample_vs_f32_max_abs_err\":%.8g,\"sample_vs_f32_rmse\":%.8g,\"ok\":%s}}",
+        r->name,r->repeats,m,n,k,r->f32_ms,r->quant_ms,r->q8_ms,r->q8_total_ms,r->speedup,
+        (double)r->sample_impl_max_abs_err,(double)r->sample_impl_rmse,
+        (double)r->sample_vs_f32_max_abs_err,(double)r->sample_vs_f32_rmse,r->ok?"true":"false");
+    success=true;
+
+cleanup:
+    buf_free(&y);buf_free(&xq);buf_free(&x);buf_free(&wq);buf_free(&wf32);
+    vkResetDescriptorPool(D,DP,0);
+    return success;
+}
+
+int osh26_vk_gpu_q8_gemm_benchmark(char *out_json,size_t out_size){
+    if(out_json==NULL||out_size==0)return -1;
+    out_json[0]='\0';
+    if(!vk_ok){snprintf(out_json,out_size,"{\"ok\":false,\"error\":\"Vulkan is not ready\"}");return -1;}
+    pthread_mutex_lock(&Mtx);
+    vkQueueWaitIdle(Q);vkResetCommandPool(D,CP,0);vkResetDescriptorPool(D,DP,0);g_submit_cursor=0;
+
+    Q8ShapeBench shapes[]={
+        {.name="q_proj",.m=32,.n=2048,.k=1024,.repeats=1},
+        {.name="k_v_proj",.m=32,.n=1024,.k=1024,.repeats=2},
+        {.name="o_proj",.m=32,.n=1024,.k=2048,.repeats=1},
+        {.name="gate_up",.m=32,.n=3072,.k=1024,.repeats=2},
+        {.name="down",.m=32,.n=1024,.k=3072,.repeats=1},
+    };
+    const int shape_count=(int)(sizeof(shapes)/sizeof(shapes[0]));
+    char err[256]={0};
+    double weighted_f32=0.0,weighted_q8=0.0;
+    bool all_ok=true;
+    for(int i=0;i<shape_count;i++){
+        if(!q8_run_shape(&shapes[i],err,sizeof(err))){
+            snprintf(out_json,out_size,"{\"ok\":false,\"error\":\"%s\"}",err[0]?err:"Q8 benchmark failed");
+            pthread_mutex_unlock(&Mtx);
+            return -1;
+        }
+        weighted_f32+=shapes[i].f32_ms*(double)shapes[i].repeats;
+        weighted_q8+=shapes[i].q8_total_ms*(double)shapes[i].repeats;
+        if(!shapes[i].ok)all_ok=false;
+    }
+    const double weighted_speedup=weighted_q8>0.0?weighted_f32/weighted_q8:0.0;
+    const bool gate_pass=all_ok&&weighted_speedup>=2.0;
+    g_last_q8_benchmark_ran=true;
+    g_last_q8_gate_pass=gate_pass;
+    g_last_q8_weighted_f32_ms=weighted_f32;
+    g_last_q8_weighted_total_ms=weighted_q8;
+    g_last_q8_weighted_speedup=weighted_speedup;
+    char shape_json[5200];
+    size_t off=0;
+    off+=(size_t)snprintf(shape_json+off,sizeof(shape_json)-off,"[");
+    for(int i=0;i<shape_count&&off<sizeof(shape_json);i++){
+        off+=(size_t)snprintf(shape_json+off,sizeof(shape_json)-off,"%s%s",i?",":"",shapes[i].json);
+    }
+    if(off<sizeof(shape_json)){
+        snprintf(shape_json+off,sizeof(shape_json)-off,"]");
+    }else{
+        shape_json[sizeof(shape_json)-2]=']';
+        shape_json[sizeof(shape_json)-1]='\0';
+    }
+    snprintf(out_json,out_size,
+        "{\"ok\":true,\"method\":\"Q8_0 W8A8 dynamic activation quantization\","
+        "\"prompt_tokens\":32,\"iterations\":3,\"gate\":{\"required_speedup\":2.0,"
+        "\"weighted_f32_ms\":%.6f,\"weighted_q8_total_ms\":%.6f,\"weighted_speedup\":%.4f,"
+        "\"correctness_ok\":%s,\"pass\":%s},\"shapes\":%s}",
+        weighted_f32,weighted_q8,weighted_speedup,all_ok?"true":"false",gate_pass?"true":"false",shape_json);
+    vkResetDescriptorPool(D,DP,0);g_submit_cursor=0;
+    pthread_mutex_unlock(&Mtx);
+    return 0;
+}
+
 int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate *out, int max_out){
     if (g_last_logits_topk_count <= 0) {
         return 0;
@@ -1642,16 +2062,16 @@ int osh26_vk_gpu_reset_cache(void){
 }
 void osh26_vk_gpu_free(void){
     if(DP_Lm)vkResetDescriptorPool(D,DP_Lm,0);DS_LmLocal=VK_NULL_HANDLE;DS_LmMerge=VK_NULL_HANDLE;
-    buf_free(&B_LmTopk);buf_free(&B_LmShardTopk);buf_free(&B_LogPart);buf_free(&B_Last);buf_free(&B_Tmp);buf_free(&B_Dwn);buf_free(&B_Up);buf_free(&B_Gat);
+    buf_free(&B_LmTopk);buf_free(&B_LmShardTopk);buf_free(&B_LogPart);buf_free(&B_Last);buf_free(&B_Q8In);buf_free(&B_Tmp);buf_free(&B_Dwn);buf_free(&B_Up);buf_free(&B_Gat);
     buf_free(&B_PrefillOAcc);buf_free(&B_Att);buf_free(&B_Sc);buf_free(&B_Vb);buf_free(&B_Kb);buf_free(&B_Qb);
     buf_free(&B_Hid2);buf_free(&B_Hid);buf_free(&B_KV);
     buf_free(&B_KVConst);buf_free(&B_AttnConst);
     for(int l=0;l<N_LAY;l++){buf_free(&B_AttnRunConst[l]);buf_free(&B_KVUpdateConst[l]);buf_free(&B_VCache[l]);buf_free(&B_KCache[l]);}
     for(int s=0;s<HEAD_SHARDS;s++)buf_free(&W_HeadShard[s]);
     buf_free(&W_Fnorm);
-    for(int l=0;l<N_LAY;l++){buf_free(&W_Down[l]);buf_free(&W_Up[l]);buf_free(&W_Gate[l]);buf_free(&W_rf[l]);buf_free(&W_Kn[l]);buf_free(&W_Qn[l]);buf_free(&W_O[l]);buf_free(&W_V[l]);buf_free(&W_K[l]);buf_free(&W_Q[l]);buf_free(&W_ra[l]);}
+    for(int l=0;l<N_LAY;l++){buf_free(&WQ_Down[l]);buf_free(&WQ_Up[l]);buf_free(&WQ_Gate[l]);buf_free(&WQ_O[l]);buf_free(&WQ_V[l]);buf_free(&WQ_K[l]);buf_free(&WQ_Q[l]);buf_free(&W_Down[l]);buf_free(&W_Up[l]);buf_free(&W_Gate[l]);buf_free(&W_rf[l]);buf_free(&W_Kn[l]);buf_free(&W_Qn[l]);buf_free(&W_O[l]);buf_free(&W_V[l]);buf_free(&W_K[l]);buf_free(&W_Q[l]);buf_free(&W_ra[l]);}
     if(Emb){free(Emb);Emb=NULL;}
-    mdl_ok=false;
+    mdl_ok=false;g_prefill_q8_enabled=false;
 }
-int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
+int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->prefill_q8_enabled=g_prefill_q8_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_q8_benchmark_ran=g_last_q8_benchmark_ran;o->last_q8_gate_pass=g_last_q8_gate_pass;o->last_q8_weighted_f32_ms=g_last_q8_weighted_f32_ms;o->last_q8_weighted_total_ms=g_last_q8_weighted_total_ms;o->last_q8_weighted_speedup=g_last_q8_weighted_speedup;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
 void osh26_vk_gpu_set_debug_correctness(bool enabled){g_debug_correctness=enabled;if(!enabled){g_last_attention_max_abs_err=0.0f;g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;}}

@@ -69,6 +69,16 @@ Write-SpvHeader `
     -SymbolName "_tmp_mulmat_q4_packed_spv"
 
 Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/act_quant_q8.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/act_quant_q8.spv.h" `
+    -SymbolName "_tmp_act_quant_q8_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/mulmat_q8_w8a8.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/mulmat_q8_w8a8.spv.h" `
+    -SymbolName "_tmp_mulmat_q8_w8a8_spv"
+
+Write-SpvHeader `
     -SourcePath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.comp" `
     -HeaderPath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.spv.h" `
     -SymbolName "_tmp_attention_prefill_kblock_qk_spv"

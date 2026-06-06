@@ -76,6 +76,7 @@ extern PFN_vkCmdDispatch vkCmdDispatch;
 extern PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
 extern PFN_vkCmdPushConstants vkCmdPushConstants;
 extern PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
+extern PFN_vkCmdFillBuffer vkCmdFillBuffer;
 
 #ifdef __cplusplus
 }

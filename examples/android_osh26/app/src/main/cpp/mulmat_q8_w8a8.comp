@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint stride;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer WQ { uint wq[]; };
+layout(set=0,binding=1,std430) readonly buffer XQ { uint xq[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+
+int unpack_i8(uint word, uint idx) {
+    return bitfieldExtract(int(word), int(idx * 8u), 8);
+}
+
+void main() {
+    const uint m = gl_WorkGroupID.y * 8u + gl_LocalInvocationID.x;
+    const uint n = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.y;
+    if (m >= pc.M || n >= pc.N) {
+        return;
+    }
+
+    const uint blocks = (pc.K + 31u) / 32u;
+    const uint w_words_offset = pc.N * blocks;
+    const uint x_words_offset = pc.M * blocks;
+    float sum = 0.0;
+
+    for (uint block = 0u; block < blocks; ++block) {
+        const float w_scale = uintBitsToFloat(wq[n * blocks + block]);
+        const float x_scale = uintBitsToFloat(xq[m * blocks + block]);
+        int dot = 0;
+        const uint w_base = w_words_offset + (n * blocks + block) * 8u;
+        const uint x_base = x_words_offset + (m * blocks + block) * 8u;
+        for (uint wi = 0u; wi < 8u; ++wi) {
+            const uint w_word = wq[w_base + wi];
+            const uint x_word = xq[x_base + wi];
+            dot += unpack_i8(w_word, 0u) * unpack_i8(x_word, 0u);
+            dot += unpack_i8(w_word, 1u) * unpack_i8(x_word, 1u);
+            dot += unpack_i8(w_word, 2u) * unpack_i8(x_word, 2u);
+            dot += unpack_i8(w_word, 3u) * unpack_i8(x_word, 3u);
+        }
+        sum += float(dot) * w_scale * x_scale;
+    }
+
+    y[m * pc.N + n] = sum;
+}

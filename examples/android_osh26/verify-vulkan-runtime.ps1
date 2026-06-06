@@ -64,7 +64,7 @@ function Invoke-JsonPost {
     )
 
     $json = $Body | ConvertTo-Json -Depth 8 -Compress
-    Invoke-RestMethod -Method Post -Uri "$BaseUrl$Path" -ContentType "application/json" -Body $json -TimeoutSec 300
+    Invoke-RestMethod -Method Post -Uri "$BaseUrl$Path" -ContentType "application/json" -Body $json -TimeoutSec 600
 }
 
 function Stage-Model {

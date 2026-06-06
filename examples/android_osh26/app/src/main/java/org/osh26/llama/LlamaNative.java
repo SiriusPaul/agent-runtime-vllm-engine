@@ -26,4 +26,5 @@ public final class LlamaNative {
     public static native String getEngineStats();
     public static native String runQuantBenchmark();
     public static native String runQuantGemmBenchmark();
+    public static native String runQ8GemmBenchmark();
 }

@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint K;
+    uint stride;
+    uint blocks;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer X { float x[]; };
+layout(set=0,binding=1,std430) buffer Q { uint q[]; };
+layout(set=0,binding=2,std430) buffer Dummy { uint dummy[]; };
+
+shared float s_abs[32];
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint block = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.M || block >= pc.blocks) {
+        return;
+    }
+
+    const uint k = block * 32u + lane;
+    float v = 0.0;
+    if (k < pc.K) {
+        v = x[row * pc.stride + k];
+    }
+    s_abs[lane] = abs(v);
+    barrier();
+
+    for (uint step = 16u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            s_abs[lane] = max(s_abs[lane], s_abs[lane + step]);
+        }
+        barrier();
+    }
+
+    const float scale = max(s_abs[0] / 127.0, 1.0e-12);
+    const uint scale_base = row * pc.blocks + block;
+    const uint word_base = pc.M * pc.blocks + scale_base * 8u;
+    if (lane == 0u) {
+        q[scale_base] = floatBitsToUint(scale);
+    }
+    barrier();
+
+    if (lane < 8u) {
+        uint packed = 0u;
+        for (uint i = 0u; i < 4u; ++i) {
+            const uint kk = block * 32u + lane * 4u + i;
+            float xv = 0.0;
+            if (kk < pc.K) {
+                xv = x[row * pc.stride + kk];
+            }
+            int qi = int(round(clamp(xv / scale, -127.0, 127.0)));
+            packed |= (uint(qi) & 255u) << (i * 8u);
+        }
+        q[word_base + lane] = packed;
+    }
+}

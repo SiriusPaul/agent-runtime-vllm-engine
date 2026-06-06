@@ -334,3 +334,10 @@ Java_org_osh26_llama_LlamaNative_runQuantGemmBenchmark(JNIEnv * env, jclass) {
     osh26_vk_gpu_quant_gemm_benchmark(json, sizeof(json));
     return string_to_jstring(env, json);
 }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_osh26_llama_LlamaNative_runQ8GemmBenchmark(JNIEnv * env, jclass) {
+    char json[8192];
+    osh26_vk_gpu_q8_gemm_benchmark(json, sizeof(json));
+    return string_to_jstring(env, json);
+}

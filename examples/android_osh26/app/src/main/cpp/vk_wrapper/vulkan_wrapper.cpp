@@ -44,7 +44,7 @@ int InitVulkan(void) {
     LOAD(BeginCommandBuffer); LOAD(EndCommandBuffer);
     LOAD(CmdBindPipeline); LOAD(CmdBindDescriptorSets);
     LOAD(CmdDispatch); LOAD(CmdPipelineBarrier); LOAD(CmdPushConstants);
-    LOAD(CmdCopyBuffer);
+    LOAD(CmdCopyBuffer); LOAD(CmdFillBuffer);
     LOGI("Vulkan functions loaded OK");
     done = 1; return 1;
 }
@@ -109,3 +109,4 @@ PFN_vkCmdDispatch vkCmdDispatch;
 PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
 PFN_vkCmdPushConstants vkCmdPushConstants;
 PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
+PFN_vkCmdFillBuffer vkCmdFillBuffer;

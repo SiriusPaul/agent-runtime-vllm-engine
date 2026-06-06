@@ -15,6 +15,7 @@ struct osh26_vk_stats {
     uint64_t expanded_tensor_uploads, expanded_upload_bytes, f16_uploads, bf16_uploads, q4_k_uploads, q6_k_uploads;
     bool mnn_attention_enabled;
     bool mnn_prefill_attention_enabled;
+    bool prefill_q8_enabled;
     bool debug_correctness;
     float last_attention_max_abs_err;
     uint32_t attention_fallback_layers;
@@ -46,6 +47,11 @@ struct osh26_vk_stats {
     double last_lm_head_wait_ms;
     double last_token_tps;
     bool gpu_lm_head_enabled;
+    bool last_q8_benchmark_ran;
+    bool last_q8_gate_pass;
+    double last_q8_weighted_f32_ms;
+    double last_q8_weighted_total_ms;
+    double last_q8_weighted_speedup;
     bool last_lm_head_validation_ran;
     bool last_lm_head_validation_ok;
     int last_lm_head_validation_stage;
@@ -80,6 +86,7 @@ static inline int osh26_vk_gpu_forward(const int * tokens, int n_tokens, int pos
 int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate * out, int max_out);
 int osh26_vk_gpu_quant_benchmark(char * out_json, size_t out_size);
 int osh26_vk_gpu_quant_gemm_benchmark(char * out_json, size_t out_size);
+int osh26_vk_gpu_q8_gemm_benchmark(char * out_json, size_t out_size);
 bool osh26_vk_gpu_ready(void);
 int osh26_vk_gpu_reset_cache(void);
 void osh26_vk_gpu_free(void);

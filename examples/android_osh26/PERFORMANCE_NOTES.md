@@ -376,3 +376,270 @@ Conclusions:
   thread, or subgroup operations that reduce the number of scalar F32
   operations and barriers. Packed storage plus scalar dequantization alone is
   insufficient on this Adreno 650 path.
+
+## 2026-06-06 Q8 W8A8 Prefill Gate and TTFT Retest
+
+This run used the freshly installed debug APK on the connected Redmi K40 /
+Snapdragon 870. Commands:
+
+- `.\examples\android_osh26\generate_spv_headers.ps1`
+- `cd examples\android_osh26; .\gradlew.bat assembleDebug`
+- `cd examples\android_osh26; .\gradlew.bat installDebug`
+- `.\verify-vulkan-runtime.ps1 -SkipCpu -MaxTokens 2 -Prompt "Explain briefly why local inference is useful."`
+
+The normal runtime stayed in `debug_correctness=false`; CPU correctness checks
+did not run:
+
+- `last_lm_head_validation_ran=false`
+- `last_e2e_compare_ran=false`
+
+### Implemented Runtime Changes
+
+- Added a Q8_0 W8A8 prefill path gated by native GGUF tensor type. The path is
+  enabled only when every projection tensor needed by prefill is `Q8_0`.
+- Added `act_quant_q8.comp` for per-token dynamic activation quantization and
+  `mulmat_q8_w8a8.comp` for packed int8 dot products with F32 accumulation.
+- Added `POST /benchmark/q8_gemm` to benchmark representative single-layer
+  prefill GEMM shapes and publish `last_q8_*` health fields.
+- Replaced the prefill attention scratch host `memset + vkQueueWaitIdle` with
+  `vkCmdFillBuffer` recorded into the same layer command buffer.
+- Kept the stable path at one prefill command buffer per layer. A previous
+  whole-prefill single-command-buffer experiment caused `VK_ERROR_DEVICE_LOST`
+  on the Adreno 650 driver and is not part of this implementation.
+
+### Current Model Constraint
+
+The installed model is still not native Q8_0:
+
+`Tensor blk.0.attn_q.weight is not Q8_0 (type=1); Q8 prefill unavailable for this model`
+
+Therefore full generation below used the existing F16-expanded projection
+weights, and health reported `prefill_q8_enabled=false`. The Q8 prefill path is
+compiled and gated, but real TTFT acceleration requires loading a native Q8_0
+GGUF or providing a safe one-time model-load conversion path.
+
+### Short Normal-Mode Run
+
+Prompt: `Explain briefly why local inference is useful.`
+
+Configuration: `temperature=0`, `max_tokens=2`, `-SkipCpu`.
+
+| Metric | Value |
+| --- | ---: |
+| Prompt tokens | 46 |
+| Completion tokens | 2 |
+| TTFT | 7361.61 ms |
+| User prefill | 7352.16 ms |
+| Vulkan prefill wall | 7352.15 ms |
+| Decode | 143.057 ms |
+| LM head | 105.053 ms |
+| LM head wait | 102.785 ms |
+| Prefill submits | 28 |
+| TTFT submits | 30 |
+| Last decode layer submits | 112 |
+| Logits sanity | ok |
+
+Token IDs:
+
+`151667,271`
+
+The rendered text was empty because both sampled tokens are special /
+whitespace-like for this prompt. The candidate logits were still finite and
+ordered:
+
+`271(32.3286), 1406(19.4395), 1022(17.8653), 4710(17.8236), 89253(17.6942)`
+
+### 16-Token Output Sanity Run
+
+Prompt:
+
+`Please answer in one short English sentence: why is local inference useful?`
+
+Configuration: `temperature=0`, `top_p=1`, `seed=51966`, `max_tokens=16`.
+
+Output text:
+
+`Local inference is useful because it allows for precise and contextually`
+
+The output is syntactically reasonable and was cut off only because
+`max_tokens=16` forced `finish_reason=length`.
+
+| Metric | Value |
+| --- | ---: |
+| Prompt tokens | 51 |
+| Completion tokens | 16 |
+| TTFT | 8250.09 ms |
+| User prefill | 8232.07 ms |
+| Last token TPS | 6.73746 |
+| End-to-end tokens/s | 1.5314 |
+| Prefill submits | 28 |
+| TTFT submits | 30 |
+| Logits sanity | ok |
+| Q8 prefill enabled | false |
+
+Token IDs:
+
+`151667,271,151668,271,7319,44378,374,5390,1576,432,6147,369,23560,323,2266,1832`
+
+Final top5:
+
+`18906(27.0014), 65004(25.9520), 1832(24.9573), 56667(24.6431), 5980(23.8910)`
+
+### Q8 W8A8 GEMM Microbenchmark
+
+Endpoint: `POST /benchmark/q8_gemm`
+
+The benchmark quantizes activations dynamically, consumes packed Q8_0-style
+weights, immediately multiplies by the activation, and accumulates in F32.
+
+Gate result:
+
+| Metric | Value |
+| --- | ---: |
+| Weighted F32 | 236.349357 ms |
+| Weighted Q8 total | 15.954167 ms |
+| Weighted speedup | 14.8143x |
+| Correctness | ok |
+| Gate | pass |
+
+Per-shape result:
+
+| Shape | Repeats | M | N | K | F32 ms | Q8 total ms | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q_proj | 1 | 32 | 2048 | 1024 | 23.858438 | 2.117170 | 11.2690x |
+| k_v_proj | 2 | 32 | 1024 | 1024 | 26.379913 | 1.148142 | 22.9762x |
+| o_proj | 1 | 32 | 1024 | 2048 | 24.050347 | 2.161146 | 11.1285x |
+| gate_up | 2 | 32 | 3072 | 1024 | 49.846736 | 3.102899 | 16.0646x |
+| down | 1 | 32 | 1024 | 3072 | 35.987274 | 3.173767 | 11.3390x |
+
+Correctness samples stayed within shader-vs-packed-Q8 CPU error of about
+`7.7e-6` max abs error or lower per shape. Quantization-vs-F32 sampled RMSE was
+roughly `0.0051` to `0.0086`.
+
+### Interpretation
+
+Q8 W8A8 is viable on this device for the projection GEMM shapes; unlike the
+earlier Q4 scalar-dequant path, this benchmark shows a large kernel-level speed
+advantage. It has not improved current TTFT yet because the installed GGUF is
+F16 (`type=1`) and the production path correctly keeps `prefill_q8_enabled=false`.
+
+The next meaningful TTFT test is to load a native Q8_0 GGUF and verify that
+`prefill_q8_enabled=true`. If that passes correctness and output sanity, the
+expected first target is reducing the current single-chunk TTFT from about
+`7.4-8.3 s` into the low-second range. Sub-second TTFT still requires further
+work beyond Q8 projection GEMM, especially queue/submit behavior, decode LM head
+wait, and any remaining non-projection overhead.
+
+## 2026-06-06 Production Q8 Prefill From Load-Time Conversion
+
+The installed F16 GGUF was switched to the production Q8 prefill path by
+converting every projection tensor to the shader's packed Q8 layout during
+model loading. Decode remains on the existing F32-expanded weights, while
+prefill uses dynamic Q8 activation quantization and Q8 W8A8 projection GEMMs.
+
+All required Q, K, V, O, gate, up, and down tensors across 28 layers converted
+successfully. Runtime health and logs confirmed:
+
+- `prefill_q8_enabled=true`
+- `Q8 prefill enabled: true`
+- no Vulkan device loss
+- no NaN/Inf logits
+- no logits sanity failures
+
+### Load-Time Cost
+
+| Metric | Value |
+| --- | ---: |
+| Model load and Q8 conversion | 343577 ms |
+| Process RSS near end of conversion | about 4.5 GB |
+
+The conversion is currently repeated after each process restart. It is a test
+path, not the desired deployment format. A native Q8_0 GGUF or persistent packed
+weight cache is required to remove this startup cost and reduce memory usage.
+The verification script HTTP timeout was increased from 300 to 600 seconds so
+the first converted load is not reported as a false timeout.
+
+### F16 Versus Q8 TTFT
+
+Same prompt and sampling:
+
+`Explain briefly why local inference is useful.`
+
+`temperature=0`, `top_p=1`, `seed=51966`, `max_tokens=2`.
+
+| Metric | F16 prefill | Q8 prefill | Improvement |
+| --- | ---: | ---: | ---: |
+| TTFT | 7361.61 ms | 788.56 ms | 9.34x |
+| User prefill | 7352.16 ms | 762.47 ms | 9.64x |
+| Prefill submits | 28 | 28 | unchanged |
+| TTFT submits | 30 | 30 | unchanged |
+| LM head | 105.05 ms | 106.93 ms | unchanged |
+
+Both paths produced the exact same token IDs:
+
+`151667,271`
+
+F16 top5:
+
+`271(32.3286), 1406(19.4395), 1022(17.8653), 4710(17.8236), 89253(17.6942)`
+
+Q8 top5:
+
+`271(32.2548), 1406(19.3725), 1022(17.8486), 89253(17.7325), 4710(17.6810)`
+
+The top three candidates and sampled result were unchanged. Only candidates
+four and five exchanged order.
+
+### Repeated Q8 TTFT
+
+Three warm, identical requests:
+
+| Run | TTFT | User prefill | Token IDs | Sanity |
+| --- | ---: | ---: | --- | --- |
+| 1 | 745.439 ms | 727.795 ms | `151667,271` | ok |
+| 2 | 739.765 ms | 727.500 ms | `151667,271` | ok |
+| 3 | 702.461 ms | 693.851 ms | `151667,271` | ok |
+
+Mean TTFT: `729.222 ms`.
+
+### Full Token Sequence Validation
+
+English prompt:
+
+`Please answer in one short English sentence: why is local inference useful?`
+
+Q8 output:
+
+`Local inference is useful because it allows for precise and contextually`
+
+Q8 token IDs:
+
+`151667,271,151668,271,7319,44378,374,5390,1576,432,6147,369,23560,323,2266,1832`
+
+This is exactly the same text and token sequence as the previous F16 run.
+TTFT was `837.995 ms`, compared with `8250.09 ms` for F16, a `9.85x`
+improvement.
+
+Arithmetic prompt:
+
+`Answer only with the result: 17 + 25 = ?`
+
+Output:
+
+`17 + 25 = 42`
+
+Token IDs:
+
+`151667,271,151668,271,16,22,488,220,17,20,284,220,19,17`
+
+The request ended normally with `finish_reason=stop`, TTFT `831.918 ms`, and
+`last_logits_sanity_ok=true`.
+
+### Result
+
+The Q8 W8A8 production prefill path is correct for the tested deterministic
+prompts and reduces single-chunk TTFT to approximately `0.7-0.84 s` on this
+device. Remaining first-token time is now dominated by roughly `0.69-0.82 s`
+prefill plus about `0.105 s` LM head wait. The immediate deployment issue is
+the `343.6 s` load-time conversion and duplicated F32/Q8 weight memory, not
+prefill execution speed.

@@ -215,6 +215,11 @@ public final class LlmHttpServer {
             return;
         }
 
+        if ("POST".equals(method) && "/benchmark/q8_gemm".equals(path)) {
+            writeJson(writer, 200, new JSONObject(LlamaNative.runQ8GemmBenchmark()));
+            return;
+        }
+
         if ("POST".equals(method) && "/v1/chat/completions".equals(path)) {
             handleChatCompletion(body, writer);
             return;
