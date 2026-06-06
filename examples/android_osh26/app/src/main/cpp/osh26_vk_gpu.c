@@ -143,6 +143,7 @@ static double g_last_prefill_cpu_post_ms;
 static double g_last_prefill_attention_ms;
 static double g_last_prefill_ffn_gate_up_silu_ms;
 static bool g_prefill_q8_enabled;
+static bool g_decode_q8_enabled;
 static bool g_gpu_lm_head_enabled=true;
 static bool g_last_q8_benchmark_ran;
 static bool g_last_q8_gate_pass;
@@ -1031,7 +1032,8 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
 #undef ALLOC_BUF
 #undef ALLOC_ZERO_BUF
     g_prefill_q8_enabled=q8_load_ok;
-    LOGI("Q8 prefill enabled: %s",g_prefill_q8_enabled?"true":"false");
+    g_decode_q8_enabled=q8_load_ok;
+    LOGI("Q8 prefill/decode enabled: %s",g_prefill_q8_enabled?"true":"false");
     mdl_ok=true;LOGI("Model loaded");return 0;}
 #undef TRY_LOAD_Q8
 
@@ -1054,9 +1056,20 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     int do_diag=(nt==1 && debug_check); /* expensive decode diagnostics */
     for(int l=0;l<N_LAY;l++){
         VkCommandBuffer prefill_cb = VK_NULL_HANDLE;
+        const bool decode_gpu_attention = (nt == 1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers & (1u << l)) == 0));
+        const bool decode_grouped_layer = decode_gpu_attention && !correctness_check && !g_debug_correctness;
+        const bool decode_q8_layer = decode_grouped_layer && g_decode_q8_enabled;
+        VkCommandBuffer decode_cb = VK_NULL_HANDLE;
         if (nt > 1 && !debug_check) {
             prefill_cb = CB();
             if (prefill_cb == VK_NULL_HANDLE) {
+                g_current_forward_is_prefill=false;
+                pthread_mutex_unlock(&Mtx);
+                return -1;
+            }
+        } else if (decode_grouped_layer) {
+            decode_cb = CB();
+            if (decode_cb == VK_NULL_HANDLE) {
                 g_current_forward_is_prefill=false;
                 pthread_mutex_unlock(&Mtx);
                 return -1;
@@ -1095,12 +1108,19 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               LOGI("PREFILL stage: layer0 qkv recorded");
           }
         } else if (nt == 1 && !debug_check) {
-          VkCommandBuffer cb1=CB();
+          VkCommandBuffer cb1=decode_grouped_layer?decode_cb:CB();
           RMS(cb1,nt,HDIM,&B_Hid,&W_ra[l],&B_Hid2);
           BARRIER(cb1);
-          MM(cb1,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
-          MM(cb1,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
-          MM(cb1,&W_V[l],&B_Hid2,&B_Vb,nt,KVD,HDIM);
+          if(decode_q8_layer){
+            ACT_Q8(cb1,&B_Hid2,&B_Q8In,nt,HDIM);
+            MMQ8(cb1,&WQ_Q[l],&B_Q8In,&B_Qb,nt,QDIM,HDIM);
+            MMQ8(cb1,&WQ_K[l],&B_Q8In,&B_Kb,nt,KVD,HDIM);
+            MMQ8(cb1,&WQ_V[l],&B_Q8In,&B_Vb,nt,KVD,HDIM);
+          }else{
+            MM(cb1,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
+            MM(cb1,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
+            MM(cb1,&W_V[l],&B_Hid2,&B_Vb,nt,KVD,HDIM);
+          }
           BARRIER(cb1);
           RMS(cb1,N_HD,HD,&B_Qb,&W_Qn[l],&B_Qb);
           RMS(cb1,N_KVH,HD,&B_Kb,&W_Kn[l],&B_Kb);
@@ -1108,7 +1128,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           ROPE_NEOX(cb1,&B_Qb,nt,N_HD,pos,HD);
           ROPE_NEOX(cb1,&B_Kb,nt,N_KVH,pos,HD);
           BARRIER(cb1);
-          SubmitNoWait(cb1);
+          if(!decode_grouped_layer)SubmitNoWait(cb1);
         }else{
           VkCommandBuffer cb1a=CB();
           RMS(cb1a,nt,HDIM,&B_Hid,&W_ra[l],&B_Hid2);
@@ -1117,12 +1137,12 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
         if(do_diag)buf_inv(&B_Hid2);
         if(do_diag && l==0){float*cpu=B_Hid.P,*w=W_ra[0].P;float ss=0;for(int i=0;i<HDIM;i++){float v=cpu[i];ss+=v*v;}float inv=1.0f/sqrtf(ss/(float)HDIM+1e-6f);
          float ecpu0=cpu[0]*inv*w[0],egpu0=hnorm[0];LOGI("D01 RMS: err=%.2e",(double)fabsf(ecpu0-egpu0));}
-        if(nt==1){buf_inv(&B_Qb);buf_inv(&B_Kb);}
+        if(nt==1 && !decode_grouped_layer){buf_inv(&B_Qb);buf_inv(&B_Kb);}
         if(do_diag && (l==0||l==1||l==27)){float*qw=W_Q[l].P,*kw=W_K[l].P;float cq0=0,ck0=0;
          for(int k=0;k<HDIM;k++){cq0+=qw[k]*hnorm[k];ck0+=kw[k]*hnorm[k];}
          LOGI("L%d Q0 e=%.1e K0 e=%.1e",l,(double)fabsf(cq0-qb[0]),(double)fabsf(ck0-kb[0]));}
 
-        if(nt==1 && !debug_check){
+        if(nt==1 && !debug_check && !decode_grouped_layer){
           buf_inv(&B_Kb);buf_inv(&B_Vb);
         }
 
@@ -1141,13 +1161,13 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               if (l == 0 && verbose_prefill) {
                   LOGI("PREFILL stage: layer0 kv update recorded");
               }
-          }else if(nt==1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+          }else if(decode_gpu_attention){
               AttnConst kc={{1,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_KVUpdateConst[l].P,&kc,sizeof(kc));buf_flush(&B_KVUpdateConst[l]);
-              { VkCommandBuffer cbk=CB();
+              { VkCommandBuffer cbk=decode_grouped_layer?decode_cb:CB();
                 KV_UPDATE(cbk,&B_Kb,&B_Vb,&B_KCache[l],&B_VCache[l],&B_KVUpdateConst[l],nt);
                 BARRIER(cbk);
-                SubmitNoWait(cbk);
+                if(!decode_grouped_layer)SubmitNoWait(cbk);
               }
           }else{
               memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));memcpy(kv+kvo+MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));
@@ -1172,10 +1192,10 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               }
           } else {
               const double attention_start_ms=now_ms();
-              if(!att_done && nt==1 && g_mnn_attention_enabled && ((g_attention_fallback_layers&(1u<<l))==0)){
+              if(!att_done && decode_gpu_attention){
                   AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
                   memcpy(B_AttnRunConst[l].P,&ac,sizeof(ac));buf_flush(&B_AttnRunConst[l]);
-                  { VkCommandBuffer cba=CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnRunConst[l]);BARRIER(cba);SubmitNoWait(cba); }
+                  { VkCommandBuffer cba=decode_grouped_layer?decode_cb:CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnRunConst[l]);BARRIER(cba);if(!decode_grouped_layer)SubmitNoWait(cba); }
                   if(debug_check){
                       cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
                       buf_inv(&B_Att);
@@ -1211,19 +1231,35 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
          free(score_cpu);free(att_cpu);}
 
         if(nt==1 && !debug_check){
-          VkCommandBuffer cb2=CB();
-          MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
+          VkCommandBuffer cb2=decode_grouped_layer?decode_cb:CB();
+          if(decode_q8_layer){
+            ACT_Q8(cb2,&B_Att,&B_Q8In,nt,QDIM);
+            MMQ8(cb2,&WQ_O[l],&B_Q8In,&B_Tmp,nt,HDIM,QDIM);
+          }else{
+            MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
+          }
           BARRIER(cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           BARRIER(cb2);
           RMS(cb2,nt,HDIM,&B_Hid,&W_rf[l],&B_Hid2);
           BARRIER(cb2);
-          MM(cb2,&W_Gate[l],&B_Hid2,&B_Gat,nt,IDIM,HDIM);
-          MM(cb2,&W_Up[l],&B_Hid2,&B_Up,nt,IDIM,HDIM);
+          if(decode_q8_layer){
+            ACT_Q8(cb2,&B_Hid2,&B_Q8In,nt,HDIM);
+            MMQ8(cb2,&WQ_Gate[l],&B_Q8In,&B_Gat,nt,IDIM,HDIM);
+            MMQ8(cb2,&WQ_Up[l],&B_Q8In,&B_Up,nt,IDIM,HDIM);
+          }else{
+            MM(cb2,&W_Gate[l],&B_Hid2,&B_Gat,nt,IDIM,HDIM);
+            MM(cb2,&W_Up[l],&B_Hid2,&B_Up,nt,IDIM,HDIM);
+          }
           BARRIER(cb2);
           SILU(cb2,&B_Gat,&B_Up,&B_Dwn,nt*IDIM);
           BARRIER(cb2);
-          MM(cb2,&W_Down[l],&B_Dwn,&B_Tmp,nt,HDIM,IDIM);
+          if(decode_q8_layer){
+            ACT_Q8(cb2,&B_Dwn,&B_Q8In,nt,IDIM);
+            MMQ8(cb2,&WQ_Down[l],&B_Q8In,&B_Tmp,nt,HDIM,IDIM);
+          }else{
+            MM(cb2,&W_Down[l],&B_Dwn,&B_Tmp,nt,HDIM,IDIM);
+          }
           BARRIER(cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           BARRIER(cb2);
@@ -1355,45 +1391,49 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     const double lm_head_start_ms=now_ms();
     g_last_lm_head_gemv_ms=0.0;g_last_lm_head_local_topk_ms=0.0;g_last_lm_head_merge_ms=0.0;g_last_lm_head_wait_ms=0.0;
     VkBuf *head_src = &B_Hid2;
-    { VkCommandBuffer cbf=CB();
-      if(nt>1){
+    VkCommandBuffer lm_cb=CB();
+    if(lm_cb==VK_NULL_HANDLE){
+      g_current_forward_is_prefill=false;
+      pthread_mutex_unlock(&Mtx);
+      return -1;
+    }
+    if(nt>1){
         VkBufferCopy rgn={F32((uint32_t)(nt-1)*HDIM),0,F32(HDIM)};
-        vkCmdCopyBuffer(cbf,B_Hid.B,B_Last.B,1,&rgn);
+        vkCmdCopyBuffer(lm_cb,B_Hid.B,B_Last.B,1,&rgn);
         VkMemoryBarrier mb={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT};
-        vkCmdPipelineBarrier(cbf,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
-        RMS(cbf,1,HDIM,&B_Last,&W_Fnorm,&B_Hid2);
-      }else{
-        RMS(cbf,1,HDIM,&B_Hid,&W_Fnorm,&B_Hid2);
-      }
-      BARRIER(cbf);
-      SubmitNoWait(cbf); }
+        vkCmdPipelineBarrier(lm_cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        RMS(lm_cb,1,HDIM,&B_Last,&W_Fnorm,&B_Hid2);
+    }else{
+        RMS(lm_cb,1,HDIM,&B_Hid,&W_Fnorm,&B_Hid2);
+    }
+    BARRIER(lm_cb);
     if(g_gpu_lm_head_enabled){
       g_last_logits_topk_count = 0;
-      { VkCommandBuffer cbl=CB();
+      {
         for(int s=0;s<HEAD_SHARDS;s++){
           int base=s*HEAD_SHARD;
           int nv=VOCAB-base;
           if(nv>HEAD_SHARD)nv=HEAD_SHARD;
           const double gemv_encode_start=now_ms();
-          MM(cbl,&W_HeadShard[s],head_src,&B_LogPart,1,nv,HDIM);
+          MM(lm_cb,&W_HeadShard[s],head_src,&B_LogPart,1,nv,HDIM);
           g_last_lm_head_gemv_ms+=now_ms()-gemv_encode_start;
-          BARRIER(cbl);
+          BARRIER(lm_cb);
           uint32_t p_local[4]={(uint32_t)nv,(uint32_t)LM_HEAD_LOCAL_TOPK,(uint32_t)base,(uint32_t)(s*LM_HEAD_LOCAL_TOPK)};
           const double local_encode_start=now_ms();
-          vkCmdBindPipeline(cbl,VK_PIPELINE_BIND_POINT_COMPUTE,P_LmTopKLocal);
-          BIND_LM(cbl,DS_LmLocal,p_local);
-          vkCmdDispatch(cbl,1,1,1);
+          vkCmdBindPipeline(lm_cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_LmTopKLocal);
+          BIND_LM(lm_cb,DS_LmLocal,p_local);
+          vkCmdDispatch(lm_cb,1,1,1);
           g_last_lm_head_local_topk_ms+=now_ms()-local_encode_start;
-          BARRIER(cbl);
+          BARRIER(lm_cb);
         }
         uint32_t p_merge[4]={(uint32_t)(HEAD_SHARDS*LM_HEAD_LOCAL_TOPK),(uint32_t)LM_HEAD_GLOBAL_TOPK,0,(1u<<31)};
         const double merge_encode_start=now_ms();
-        vkCmdBindPipeline(cbl,VK_PIPELINE_BIND_POINT_COMPUTE,P_LmTopKMerge);
-        BIND_LM(cbl,DS_LmMerge,p_merge);
-        vkCmdDispatch(cbl,1,1,1);
+        vkCmdBindPipeline(lm_cb,VK_PIPELINE_BIND_POINT_COMPUTE,P_LmTopKMerge);
+        BIND_LM(lm_cb,DS_LmMerge,p_merge);
+        vkCmdDispatch(lm_cb,1,1,1);
         g_last_lm_head_merge_ms=now_ms()-merge_encode_start;
-        BARRIER(cbl);
-        SubmitNoWait(cbl); }
+        BARRIER(lm_cb);
+        SubmitNoWait(lm_cb); }
       const double lm_wait_start=now_ms();
       WaitAndRecycleAtEnd();
       g_last_lm_head_wait_ms=now_ms()-lm_wait_start;
@@ -1456,6 +1496,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
         }
       }
     } else {
+      SubmitNoWait(lm_cb);
       WaitAndRecycleAtEnd();
       buf_inv(head_src);
       compute_lm_head_cpu_topk(head_src, g_last_logits_topk_ids, g_last_logits_topk_values, &g_last_logits_topk_count, LM_HEAD_GLOBAL_TOPK);
@@ -2071,7 +2112,7 @@ void osh26_vk_gpu_free(void){
     buf_free(&W_Fnorm);
     for(int l=0;l<N_LAY;l++){buf_free(&WQ_Down[l]);buf_free(&WQ_Up[l]);buf_free(&WQ_Gate[l]);buf_free(&WQ_O[l]);buf_free(&WQ_V[l]);buf_free(&WQ_K[l]);buf_free(&WQ_Q[l]);buf_free(&W_Down[l]);buf_free(&W_Up[l]);buf_free(&W_Gate[l]);buf_free(&W_rf[l]);buf_free(&W_Kn[l]);buf_free(&W_Qn[l]);buf_free(&W_O[l]);buf_free(&W_V[l]);buf_free(&W_K[l]);buf_free(&W_Q[l]);buf_free(&W_ra[l]);}
     if(Emb){free(Emb);Emb=NULL;}
-    mdl_ok=false;g_prefill_q8_enabled=false;
+    mdl_ok=false;g_prefill_q8_enabled=false;g_decode_q8_enabled=false;
 }
-int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->prefill_q8_enabled=g_prefill_q8_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_q8_benchmark_ran=g_last_q8_benchmark_ran;o->last_q8_gate_pass=g_last_q8_gate_pass;o->last_q8_weighted_f32_ms=g_last_q8_weighted_f32_ms;o->last_q8_weighted_total_ms=g_last_q8_weighted_total_ms;o->last_q8_weighted_speedup=g_last_q8_weighted_speedup;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
+int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->prefill_q8_enabled=g_prefill_q8_enabled;o->decode_q8_enabled=g_decode_q8_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_q8_benchmark_ran=g_last_q8_benchmark_ran;o->last_q8_gate_pass=g_last_q8_gate_pass;o->last_q8_weighted_f32_ms=g_last_q8_weighted_f32_ms;o->last_q8_weighted_total_ms=g_last_q8_weighted_total_ms;o->last_q8_weighted_speedup=g_last_q8_weighted_speedup;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
 void osh26_vk_gpu_set_debug_correctness(bool enabled){g_debug_correctness=enabled;if(!enabled){g_last_attention_max_abs_err=0.0f;g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;}}

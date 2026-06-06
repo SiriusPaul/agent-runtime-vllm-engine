@@ -643,3 +643,96 @@ device. Remaining first-token time is now dominated by roughly `0.69-0.82 s`
 prefill plus about `0.105 s` LM head wait. The immediate deployment issue is
 the `343.6 s` load-time conversion and duplicated F32/Q8 weight memory, not
 prefill execution speed.
+
+## 2026-06-06 Native Q8_0 GGUF Test
+
+Model:
+
+`D:\下载\qwen3-0.6b-base-q8_0.gguf`
+
+Device path:
+
+`/data/data/org.osh26.llama/files/models/qwen3-0.6b-base-q8_0.gguf`
+
+File size: `639446784` bytes.
+
+The model loaded through the native Q8_0 reader without any
+`Converted ... F32 to packed Q8` log messages. Runtime state:
+
+- `prefill_q8_enabled=true`
+- `Q8 prefill enabled: true`
+- model load time: `38834.3 ms`
+- no Vulkan device loss
+- no logits sanity failure
+
+Compared with the F16 load-time conversion path, native Q8 reduced model load
+time from `343577 ms` to `38834.3 ms`, an `8.85x` improvement.
+
+Current process memory after load was still high:
+
+| Metric | Value |
+| --- | ---: |
+| Total PSS | 4874314 KiB |
+| Total RSS | 4946496 KiB |
+| Native heap PSS | 1551849 KiB |
+| Graphics device PSS | 3271556 KiB |
+
+The reason is that the current implementation still expands the Q8 model to
+F32 buffers for decode and LM-head support while retaining native packed Q8
+weights for prefill. Native Q8 removes conversion time but does not yet remove
+the duplicate expanded weights.
+
+### Output Validation
+
+The downloaded model is a base model, so its initial token sequence differs
+from the previously tested chat/instruct model. This is a model behavior
+difference rather than a Q8 correctness failure.
+
+Prompt:
+
+`Please answer in one short English sentence: why is local inference useful?`
+
+Output:
+
+`Local inference is useful because it helps in understanding patterns and relationships within a specific domain, allowing for more accurate predictions and decisions based on local data rather than broad,`
+
+Token IDs:
+
+`7319,44378,374,5390,1576,432,8609,304,8660,12624,323,11871,2878,264,3151,7947,11,10693,369,803,13382,19898,323,11181,3118,389,2205,821,4751,1091,7205,11`
+
+TTFT was `836.513 ms`; the request ended at the configured 32-token limit.
+The sequence was coherent, finite, and free of repetition or malformed text.
+
+Arithmetic prompt:
+
+`Answer only with the result: 17 + 25 = ?`
+
+Output:
+
+`17 + 25 = 42`
+
+Token IDs:
+
+`16,22,488,220,17,20,284,220,19,17`
+
+The request ended normally with `finish_reason=stop`, TTFT `834.742 ms`, and
+`last_logits_sanity_ok=true`.
+
+### Repeated Native Q8 TTFT
+
+Prompt:
+
+`Explain briefly why local inference is useful.`
+
+| Run | TTFT | User prefill | Token IDs | Sanity |
+| --- | ---: | ---: | --- | --- |
+| 1 | 744.854 ms | 727.346 ms | `7319,44378` | ok |
+| 2 | 704.370 ms | 693.665 ms | `7319,44378` | ok |
+| 3 | 702.554 ms | 692.385 ms | `7319,44378` | ok |
+
+Mean TTFT: `717.259 ms`.
+
+Native Q8 therefore preserves the approximately `0.7-0.84 s` TTFT achieved by
+the converted Q8 path while reducing startup time substantially. The remaining
+deployment task is removing F32-expanded projection weights by adding a native
+Q8 decode GEMV path or separating prefill and decode weight ownership.

@@ -136,6 +136,7 @@ std::string describe_osh26_vk_stats() {
         << "\"mnn_attention_enabled\":" << (stats.mnn_attention_enabled ? "true" : "false") << ","
         << "\"mnn_prefill_attention_enabled\":" << (stats.mnn_prefill_attention_enabled ? "true" : "false") << ","
         << "\"prefill_q8_enabled\":" << (stats.prefill_q8_enabled ? "true" : "false") << ","
+        << "\"decode_q8_enabled\":" << (stats.decode_q8_enabled ? "true" : "false") << ","
         << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
         << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","

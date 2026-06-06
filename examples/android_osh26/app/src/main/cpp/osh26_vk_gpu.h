@@ -16,6 +16,7 @@ struct osh26_vk_stats {
     bool mnn_attention_enabled;
     bool mnn_prefill_attention_enabled;
     bool prefill_q8_enabled;
+    bool decode_q8_enabled;
     bool debug_correctness;
     float last_attention_max_abs_err;
     uint32_t attention_fallback_layers;
