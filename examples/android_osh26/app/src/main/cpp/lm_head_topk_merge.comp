@@ -1,0 +1,65 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint count;
+    uint topk;
+    uint base;
+    uint out_offset;
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer InBuf {
+    uint data[];
+} uIn;
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutBuf {
+    uint data[];
+} uOut;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u || gl_GlobalInvocationID.z != 0u) {
+        return;
+    }
+
+    float best_val[32];
+    uint best_id[32];
+    for (uint i = 0u; i < 32u; ++i) {
+        best_val[i] = -1e30;
+        best_id[i] = 0u;
+    }
+
+    for (uint i = 0u; i < pc.count; ++i) {
+        const uint in_idx = i * 2u;
+        const uint id = uIn.data[in_idx + 0u];
+        const float v = uintBitsToFloat(uIn.data[in_idx + 1u]);
+
+        uint min_idx = 0u;
+        float min_val = best_val[0];
+        for (uint k = 1u; k < 32u; ++k) {
+            if (best_val[k] < min_val) {
+                min_val = best_val[k];
+                min_idx = k;
+            }
+        }
+        if (v > min_val) {
+            best_val[min_idx] = v;
+            best_id[min_idx] = id;
+        }
+    }
+
+    for (uint i = 0u; i < pc.topk && i < 32u; ++i) {
+        uint max_idx = 0u;
+        float max_val = best_val[0];
+        for (uint k = 1u; k < 32u; ++k) {
+            if (best_val[k] > max_val) {
+                max_val = best_val[k];
+                max_idx = k;
+            }
+        }
+        const uint out_idx = (pc.out_offset + i) * 2u;
+        uOut.data[out_idx + 0u] = best_id[max_idx];
+        uOut.data[out_idx + 1u] = floatBitsToUint(max_val);
+        best_val[max_idx] = -1e30;
+    }
+}

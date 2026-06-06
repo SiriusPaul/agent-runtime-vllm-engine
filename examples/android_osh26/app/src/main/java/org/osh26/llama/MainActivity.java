@@ -141,8 +141,8 @@ public class MainActivity extends Activity {
             Log.i(TAG, "generate request: promptChars=" + generationPrompt.length()
                     + ", historyChars=" + conversationContextChars);
             appendSystemLine("generation: tokenizing prompt");
-            appendSystemLine("generation: prefix cache check");
-            appendSystemLine("generation: prefill in progress");
+            appendSystemLine("generation: full prefill");
+            appendSystemLine("generation: first-token logits in progress");
             generationExecutor.execute(() -> {
                 try {
                     final boolean[] firstTokenSeen = new boolean[] { false };

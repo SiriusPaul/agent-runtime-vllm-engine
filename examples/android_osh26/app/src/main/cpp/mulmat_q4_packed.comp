@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint stride;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer W { uint w[]; };
+layout(set=0,binding=1,std430) readonly buffer X { float x[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+
+shared float As[8][32];
+shared float Bs[32][8];
+
+void main() {
+    const uint ti = gl_LocalInvocationID.x;
+    const uint tj = gl_LocalInvocationID.y;
+    const uint m = gl_WorkGroupID.y * 8u + ti;
+    const uint n = gl_WorkGroupID.x * 8u + tj;
+    const bool m_ok = m < pc.M;
+    const bool n_ok = n < pc.N;
+    const uint blocks_per_row = pc.K / 32u;
+    float sum = 0.0;
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 32u) {
+        uint kk = tj;
+        for (uint i = 0u; i < 4u; ++i) {
+            As[ti][kk] = m_ok ? x[m * pc.stride + k0 + kk] : 0.0;
+            kk += 8u;
+        }
+
+        kk = ti;
+        for (uint i = 0u; i < 4u; ++i) {
+            float value = 0.0;
+            if (n_ok) {
+                const uint block_base = (n * blocks_per_row + (k0 >> 5u)) * 9u;
+                const float scale = uintBitsToFloat(w[block_base]);
+                const uint packed = w[block_base + 1u + (kk >> 3u)];
+                const uint nibble = (packed >> ((kk & 7u) * 4u)) & 15u;
+                value = float(int(nibble) - 8) * scale;
+            }
+            Bs[kk][tj] = value;
+            kk += 8u;
+        }
+
+        barrier();
+        memoryBarrierShared();
+        if (m_ok && n_ok) {
+            for (uint i = 0u; i < 32u; ++i) {
+                sum += As[ti][i] * Bs[i][tj];
+            }
+        }
+        barrier();
+    }
+
+    if (m_ok && n_ok) {
+        y[m * pc.N + n] = sum;
+    }
+}

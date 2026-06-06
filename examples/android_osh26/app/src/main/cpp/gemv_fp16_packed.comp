@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint stride;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer W { uint w[]; };
+layout(set=0,binding=1,std430) readonly buffer X { float x[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+
+shared float partial[256];
+
+void main() {
+    const uint n = gl_WorkGroupID.x;
+    const uint lid = gl_LocalInvocationID.x;
+    if (n >= pc.N) {
+        return;
+    }
+
+    float sum = 0.0;
+    const uint row_base = n * pc.K;
+    for (uint k = lid; k < pc.K; k += 256u) {
+        const uint packed = w[(row_base + k) >> 1u];
+        const vec2 pair = unpackHalf2x16(packed);
+        const float weight = ((k & 1u) == 0u) ? pair.x : pair.y;
+        sum += weight * x[k];
+    }
+    partial[lid] = sum;
+
+    barrier();
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        if (lid < offset) {
+            partial[lid] += partial[lid + offset];
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        y[n] = partial[0];
+    }
+}

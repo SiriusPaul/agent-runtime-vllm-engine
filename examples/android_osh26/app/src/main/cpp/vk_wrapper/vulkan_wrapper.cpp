@@ -28,7 +28,7 @@ int InitVulkan(void) {
     /* Buffer */
     LOAD(CreateBuffer); LOAD(DestroyBuffer);
     /* Fence */
-    LOAD(CreateFence); LOAD(DestroyFence); LOAD(WaitForFences);
+    LOAD(CreateFence); LOAD(DestroyFence); LOAD(WaitForFences); LOAD(ResetFences);
     /* Shader & Pipeline */
     LOAD(CreateShaderModule); LOAD(DestroyShaderModule);
     LOAD(CreateComputePipelines); LOAD(DestroyPipeline);
@@ -39,7 +39,7 @@ int InitVulkan(void) {
     LOAD(ResetDescriptorPool);
     LOAD(AllocateDescriptorSets); LOAD(FreeDescriptorSets); LOAD(UpdateDescriptorSets);
     /* Command */
-    LOAD(CreateCommandPool); LOAD(DestroyCommandPool);
+    LOAD(CreateCommandPool); LOAD(DestroyCommandPool); LOAD(ResetCommandPool);
     LOAD(AllocateCommandBuffers); LOAD(FreeCommandBuffers);
     LOAD(BeginCommandBuffer); LOAD(EndCommandBuffer);
     LOAD(CmdBindPipeline); LOAD(CmdBindDescriptorSets);
@@ -81,6 +81,7 @@ PFN_vkDestroyBuffer vkDestroyBuffer;
 PFN_vkCreateFence vkCreateFence;
 PFN_vkDestroyFence vkDestroyFence;
 PFN_vkWaitForFences vkWaitForFences;
+PFN_vkResetFences vkResetFences;
 PFN_vkCreateShaderModule vkCreateShaderModule;
 PFN_vkDestroyShaderModule vkDestroyShaderModule;
 PFN_vkCreateComputePipelines vkCreateComputePipelines;
@@ -97,6 +98,7 @@ PFN_vkFreeDescriptorSets vkFreeDescriptorSets;
 PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
 PFN_vkCreateCommandPool vkCreateCommandPool;
 PFN_vkDestroyCommandPool vkDestroyCommandPool;
+PFN_vkResetCommandPool vkResetCommandPool;
 PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers;
 PFN_vkFreeCommandBuffers vkFreeCommandBuffers;
 PFN_vkBeginCommandBuffer vkBeginCommandBuffer;

@@ -39,6 +39,36 @@ function Write-SpvHeader {
 }
 
 Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/lm_head_topk_local.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/lm_head_topk_local.spv.h" `
+    -SymbolName "_tmp_lm_head_topk_local_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/lm_head_topk_merge.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/lm_head_topk_merge.spv.h" `
+    -SymbolName "_tmp_lm_head_topk_merge_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/gemv_fp16_packed.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/gemv_fp16_packed.spv.h" `
+    -SymbolName "_tmp_gemv_fp16_packed_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/gemv_q4_packed.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/gemv_q4_packed.spv.h" `
+    -SymbolName "_tmp_gemv_q4_packed_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/mulmat_fp16_packed.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/mulmat_fp16_packed.spv.h" `
+    -SymbolName "_tmp_mulmat_fp16_packed_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/mulmat_q4_packed.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/mulmat_q4_packed.spv.h" `
+    -SymbolName "_tmp_mulmat_q4_packed_spv"
+
+Write-SpvHeader `
     -SourcePath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.comp" `
     -HeaderPath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.spv.h" `
     -SymbolName "_tmp_attention_prefill_kblock_qk_spv"

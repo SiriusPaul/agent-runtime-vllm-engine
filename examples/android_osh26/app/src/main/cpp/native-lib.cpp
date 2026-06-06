@@ -1,6 +1,7 @@
 #include <jni.h>
 
 #include "osh26_engine.h"
+#include "osh26_vk_gpu.h"
 
 #include <cstdint>
 #include <string>
@@ -318,4 +319,18 @@ Java_org_osh26_llama_LlamaNative_release(JNIEnv *, jclass) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_osh26_llama_LlamaNative_getEngineStats(JNIEnv * env, jclass) {
     return string_to_jstring(env, osh26::engine().stats_json());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_osh26_llama_LlamaNative_runQuantBenchmark(JNIEnv * env, jclass) {
+    char json[4096];
+    osh26_vk_gpu_quant_benchmark(json, sizeof(json));
+    return string_to_jstring(env, json);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_osh26_llama_LlamaNative_runQuantGemmBenchmark(JNIEnv * env, jclass) {
+    char json[4096];
+    osh26_vk_gpu_quant_gemm_benchmark(json, sizeof(json));
+    return string_to_jstring(env, json);
 }

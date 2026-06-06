@@ -24,4 +24,6 @@ public final class LlamaNative {
     public static native void resetCache();
     public static native void release();
     public static native String getEngineStats();
+    public static native String runQuantBenchmark();
+    public static native String runQuantGemmBenchmark();
 }

@@ -5,11 +5,10 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -74,48 +73,25 @@ public final class LlmHttpServer {
 
     private void handle(Socket socket) {
         try (Socket ignored = socket;
-             BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
+             InputStream input = socket.getInputStream();
+             OutputStream output = socket.getOutputStream()) {
             try {
-                String requestLine = reader.readLine();
-                if (requestLine == null || requestLine.trim().isEmpty()) {
+                HttpRequest request = readRequest(input);
+                if (request.requestLine == null || request.requestLine.trim().isEmpty()) {
                     return;
                 }
 
-                String[] parts = requestLine.split(" ");
+                String[] parts = request.requestLine.split(" ");
                 if (parts.length < 2) {
-                    writeJson(writer, 400, errorJson("bad_request", "invalid request line"));
+                    writeJson(output, 400, errorJson("bad_request", "invalid request line"));
                     return;
                 }
 
-                int contentLength = 0;
-                String line;
-                while ((line = reader.readLine()) != null && !line.isEmpty()) {
-                    int colon = line.indexOf(':');
-                    if (colon > 0 && "content-length".equals(line.substring(0, colon).trim().toLowerCase(Locale.US))) {
-                        contentLength = Integer.parseInt(line.substring(colon + 1).trim());
-                    }
-                }
-
-                String body = "";
-                if (contentLength > 0) {
-                    char[] buffer = new char[contentLength];
-                    int read = 0;
-                    while (read < contentLength) {
-                        int n = reader.read(buffer, read, contentLength - read);
-                        if (n < 0) {
-                            break;
-                        }
-                        read += n;
-                    }
-                    body = new String(buffer, 0, read);
-                }
-
-                route(parts[0], parts[1], body, writer);
+                route(parts[0], parts[1], request.body, output);
             } catch (Throwable t) {
                 Log.e("OSH26HTTP", "request failed: " + t.getMessage(), t);
                 try {
-                    writeJson(writer, 500, errorJson("internal_error", t.toString()));
+                    writeJson(output, 500, errorJson("internal_error", t.toString()));
                 } catch (Exception ignored2) {
                 }
             }
@@ -124,7 +100,55 @@ public final class LlmHttpServer {
         }
     }
 
-    private void route(String method, String path, String body, BufferedWriter writer) throws Exception {
+    private HttpRequest readRequest(InputStream input) throws IOException {
+        ByteArrayOutputStream headerBytes = new ByteArrayOutputStream(512);
+        int matched = 0;
+        int b;
+        while ((b = input.read()) >= 0) {
+            headerBytes.write(b);
+            if ((matched == 0 && b == '\r')
+                    || (matched == 1 && b == '\n')
+                    || (matched == 2 && b == '\r')
+                    || (matched == 3 && b == '\n')) {
+                matched++;
+                if (matched == 4) {
+                    break;
+                }
+            } else {
+                matched = b == '\r' ? 1 : 0;
+            }
+        }
+
+        if (headerBytes.size() == 0) {
+            return new HttpRequest(null, "");
+        }
+
+        String header = headerBytes.toString(StandardCharsets.ISO_8859_1.name());
+        String[] lines = header.split("\r\n");
+        String requestLine = lines.length > 0 ? lines[0] : null;
+        int contentLength = 0;
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            int colon = line.indexOf(':');
+            if (colon > 0 && "content-length".equals(line.substring(0, colon).trim().toLowerCase(Locale.US))) {
+                contentLength = Integer.parseInt(line.substring(colon + 1).trim());
+            }
+        }
+
+        byte[] bodyBytes = new byte[Math.max(0, contentLength)];
+        int offset = 0;
+        while (offset < bodyBytes.length) {
+            int n = input.read(bodyBytes, offset, bodyBytes.length - offset);
+            if (n < 0) {
+                break;
+            }
+            offset += n;
+        }
+        String body = new String(bodyBytes, 0, offset, StandardCharsets.UTF_8);
+        return new HttpRequest(requestLine, body);
+    }
+
+    private void route(String method, String path, String body, OutputStream writer) throws Exception {
         if ("GET".equals(method) && "/health".equals(path)) {
             JSONObject json = new JSONObject();
             json.put("status", "ok");
@@ -181,6 +205,16 @@ public final class LlmHttpServer {
             return;
         }
 
+        if ("POST".equals(method) && "/benchmark/quant_gemv".equals(path)) {
+            writeJson(writer, 200, new JSONObject(LlamaNative.runQuantBenchmark()));
+            return;
+        }
+
+        if ("POST".equals(method) && "/benchmark/quant_gemm".equals(path)) {
+            writeJson(writer, 200, new JSONObject(LlamaNative.runQuantGemmBenchmark()));
+            return;
+        }
+
         if ("POST".equals(method) && "/v1/chat/completions".equals(path)) {
             handleChatCompletion(body, writer);
             return;
@@ -189,7 +223,7 @@ public final class LlmHttpServer {
         writeJson(writer, 404, errorJson("not_found", "unknown route"));
     }
 
-    private void handleChatCompletion(String body, BufferedWriter writer) throws Exception {
+    private void handleChatCompletion(String body, OutputStream writer) throws Exception {
         JSONObject request = new JSONObject(body);
         String prompt = messagesToPrompt(request.optJSONArray("messages"));
         int maxTokens = request.optInt("max_tokens", 128);
@@ -301,28 +335,27 @@ public final class LlmHttpServer {
         return new JSONObject().put("error", error);
     }
 
-    private void writeJson(BufferedWriter writer, int status, JSONObject json) throws IOException {
+    private void writeJson(OutputStream writer, int status, JSONObject json) throws IOException {
         byte[] bytes = json.toString().getBytes(StandardCharsets.UTF_8);
-        writer.write("HTTP/1.1 " + status + " " + reason(status) + "\r\n");
-        writer.write("Content-Type: application/json; charset=utf-8\r\n");
-        writer.write("Content-Length: " + bytes.length + "\r\n");
-        writer.write("Connection: close\r\n\r\n");
-        writer.write(json.toString());
+        String header = "HTTP/1.1 " + status + " " + reason(status) + "\r\n"
+                + "Content-Type: application/json; charset=utf-8\r\n"
+                + "Content-Length: " + bytes.length + "\r\n"
+                + "Connection: close\r\n\r\n";
+        writer.write(header.getBytes(StandardCharsets.US_ASCII));
+        writer.write(bytes);
         writer.flush();
     }
 
-    private void writeSseHeaders(BufferedWriter writer) throws IOException {
-        writer.write("HTTP/1.1 200 OK\r\n");
-        writer.write("Content-Type: text/event-stream; charset=utf-8\r\n");
-        writer.write("Cache-Control: no-cache\r\n");
-        writer.write("Connection: close\r\n\r\n");
+    private void writeSseHeaders(OutputStream writer) throws IOException {
+        writer.write(("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/event-stream; charset=utf-8\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         writer.flush();
     }
 
-    private synchronized void writeSseData(BufferedWriter writer, String data) throws IOException {
-        writer.write("data: ");
-        writer.write(data);
-        writer.write("\n\n");
+    private synchronized void writeSseData(OutputStream writer, String data) throws IOException {
+        writer.write(("data: " + data + "\n\n").getBytes(StandardCharsets.UTF_8));
         writer.flush();
     }
 
@@ -337,5 +370,15 @@ public final class LlmHttpServer {
             return "Not Found";
         }
         return "Internal Server Error";
+    }
+
+    private static final class HttpRequest {
+        final String requestLine;
+        final String body;
+
+        HttpRequest(String requestLine, String body) {
+            this.requestLine = requestLine;
+            this.body = body;
+        }
     }
 }

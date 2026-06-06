@@ -45,6 +45,7 @@ extern PFN_vkDestroyBuffer vkDestroyBuffer;
 extern PFN_vkCreateFence vkCreateFence;
 extern PFN_vkDestroyFence vkDestroyFence;
 extern PFN_vkWaitForFences vkWaitForFences;
+extern PFN_vkResetFences vkResetFences;
 /* Shader & Pipeline */
 extern PFN_vkCreateShaderModule vkCreateShaderModule;
 extern PFN_vkDestroyShaderModule vkDestroyShaderModule;
@@ -64,6 +65,7 @@ extern PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
 /* Command */
 extern PFN_vkCreateCommandPool vkCreateCommandPool;
 extern PFN_vkDestroyCommandPool vkDestroyCommandPool;
+extern PFN_vkResetCommandPool vkResetCommandPool;
 extern PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers;
 extern PFN_vkFreeCommandBuffers vkFreeCommandBuffers;
 extern PFN_vkBeginCommandBuffer vkBeginCommandBuffer;

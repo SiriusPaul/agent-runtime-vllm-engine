@@ -161,7 +161,16 @@ function Assert-VulkanHealthGate {
         "last_prefill_qkv_ms",
         "last_prefill_cpu_post_ms",
         "last_prefill_attention_ms",
-        "last_prefill_ffn_ms"
+        "last_prefill_ffn_gate_up_silu_ms",
+        "last_lm_head_gemv_ms",
+        "last_lm_head_local_topk_ms",
+        "last_lm_head_merge_ms",
+        "last_lm_head_wait_ms",
+        "last_lm_head_validation_ran",
+        "last_lm_head_validation_ok",
+        "last_lm_head_matched_logit_max_abs_err",
+        "last_lm_head_top20_overlap",
+        "last_lm_head_validation_ms"
     )) {
         if (-not ($vk.PSObject.Properties.Name -contains $field)) {
             throw "missing engine.vulkan field: $field"
@@ -185,16 +194,29 @@ function Assert-VulkanHealthGate {
         throw "last_logits_top5 missing or incomplete"
     }
     if ($DebugCorrectness -and $vk.gpu_lm_head_enabled) {
-        if ([double] $vk.last_lm_head_max_abs_err -gt 1e-3) {
-            throw "last_lm_head_max_abs_err expected <= 1e-3, got $($vk.last_lm_head_max_abs_err)"
+        if (-not [bool] $vk.last_lm_head_validation_ran) {
+            throw "LM head validation did not run"
         }
-        if ($vk.last_lm_head_ref_top5 -and $vk.last_lm_head_ref_top5.Count -gt 0) {
-            $gpuTop1 = [int] $vk.last_logits_top5[0].id
-            $refTop1 = [int] $vk.last_lm_head_ref_top5[0]
-            if ($gpuTop1 -ne $refTop1) {
-                throw "LM head top1 mismatch: gpu=$gpuTop1 ref=$refTop1"
-            }
+        if (-not [bool] $vk.last_lm_head_validation_ok) {
+            throw "LM head validation failed at stage $($vk.last_lm_head_validation_stage)"
         }
+        if ([int] $vk.last_lm_head_top5_overlap -lt 4) {
+            throw "LM head top5 overlap expected >= 4, got $($vk.last_lm_head_top5_overlap)"
+        }
+        if ([int] $vk.last_lm_head_top20_overlap -lt 18) {
+            throw "LM head top20 overlap expected >= 18, got $($vk.last_lm_head_top20_overlap)"
+        }
+        if ([double] $vk.last_lm_head_cpu_top1_margin -ge 1e-3 -and -not [bool] $vk.last_lm_head_top1_match) {
+            throw "LM head top1 mismatch with CPU margin $($vk.last_lm_head_cpu_top1_margin)"
+        }
+        if (-not [bool] $Health.engine.last_e2e_compare_ran) {
+            throw "E2E CPU/GPU first-token comparison did not run"
+        }
+        if ([double] $Health.engine.last_e2e_cpu_top1_margin -ge 1e-3 -and -not [bool] $Health.engine.last_e2e_top1_match) {
+            throw "E2E top1 mismatch with CPU margin $($Health.engine.last_e2e_cpu_top1_margin)"
+        }
+    } elseif ([bool] $vk.last_lm_head_validation_ran -or [bool] $Health.engine.last_e2e_compare_ran) {
+        throw "correctness comparison ran while debug_correctness=false"
     }
 }
 
@@ -215,14 +237,16 @@ function Get-Health {
     $stats | ConvertTo-Json -Depth 8 | Write-Host
     if ($stats.engine -and $stats.engine.vulkan) {
         $vk = $stats.engine.vulkan
-        Write-Host ("{0} timings: load={1}ms prefixWarm={2}ms qkv={3}ms cpuPost={4}ms attn={5}ms ffn={6}ms prefill={7}ms decode={8}ms ttft={9}ms tps={10}" -f `
+        Write-Host ("{0} timings: load={1}ms prefixWarm={2}ms qkv={3}ms cpuPost={4}ms attn={5}ms ffn={6}ms lmHead={7}ms lmWait={8}ms prefill={9}ms decode={10}ms ttft={11}ms tps={12}" -f `
             $Label,
             $stats.engine.last_load_model_ms,
             $stats.engine.last_prefix_warm_ms,
             $vk.last_prefill_qkv_ms,
             $vk.last_prefill_cpu_post_ms,
             $vk.last_prefill_attention_ms,
-            $vk.last_prefill_ffn_ms,
+            $vk.last_prefill_ffn_gate_up_silu_ms,
+            $vk.last_lm_head_ms,
+            $vk.last_lm_head_wait_ms,
             $vk.last_prefill_ms,
             $vk.last_decode_ms,
             $stats.engine.last_ttft_ms,

@@ -28,8 +28,9 @@ constexpr int kShortPrefillTokenLimit = 64;
 constexpr int kMediumPrefillTokenLimit = 256;
 constexpr int kShortPrefillChunkSize = 64;
 constexpr int kLongPrefillChunkSize = 128;
-constexpr int kGpuTopkCandidateCount = 256;
-constexpr int kGpuLowIdStreakFallback = 3;
+constexpr int kGpuTopkCandidateCount = 32;
+constexpr int kGpuGuardTokenCount = 3;
+constexpr bool kEnablePrefixCache = false;
 
 std::once_flag g_backend_once;
 
@@ -139,20 +140,42 @@ std::string describe_osh26_vk_stats() {
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
         << "\"last_forward_submit_count\":" << stats.last_forward_submit_count << ","
+        << "\"last_prefill_submit_count\":" << stats.last_prefill_submit_count << ","
         << "\"last_forward_layers_ms\":" << stats.last_forward_layers_ms << ","
         << "\"last_forward_attention_ms\":" << stats.last_forward_attention_ms << ","
         << "\"last_forward_kv_update_ms\":" << stats.last_forward_kv_update_ms << ","
         << "\"last_forward_lm_head_ms\":" << stats.last_forward_lm_head_ms << ","
         << "\"last_prefill_qkv_ms\":" << stats.last_prefill_qkv_ms << ","
+        << "\"last_prefill_qk_norm_rope_ms\":" << stats.last_prefill_qk_norm_rope_ms << ","
+        << "\"last_prefill_o_proj_ms\":" << stats.last_prefill_o_proj_ms << ","
+        << "\"last_prefill_down_ms\":" << stats.last_prefill_down_ms << ","
         << "\"last_prefill_cpu_post_ms\":" << stats.last_prefill_cpu_post_ms << ","
         << "\"last_prefill_attention_ms\":" << stats.last_prefill_attention_ms << ","
-        << "\"last_prefill_ffn_ms\":" << stats.last_prefill_ffn_ms << ","
+        << "\"last_prefill_ffn_gate_up_silu_ms\":" << stats.last_prefill_ffn_gate_up_silu_ms << ","
+        << "\"last_submit_wait_ms\":" << stats.last_submit_wait_ms << ","
+        << "\"last_layer_submit_count\":" << stats.last_layer_submit_count << ","
+        << "\"last_lm_head_submit_count\":" << stats.last_lm_head_submit_count << ","
+        << "\"last_ttft_submit_count\":" << stats.last_ttft_submit_count << ","
         << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
         << "\"last_decode_ms\":" << stats.last_decode_ms << ","
         << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
+        << "\"last_lm_head_gemv_ms\":" << stats.last_lm_head_gemv_ms << ","
+        << "\"last_lm_head_local_topk_ms\":" << stats.last_lm_head_local_topk_ms << ","
+        << "\"last_lm_head_merge_ms\":" << stats.last_lm_head_merge_ms << ","
+        << "\"last_lm_head_wait_ms\":" << stats.last_lm_head_wait_ms << ","
         << "\"last_token_tps\":" << stats.last_token_tps << ","
         << "\"gpu_lm_head_enabled\":" << (stats.gpu_lm_head_enabled ? "true" : "false") << ","
-        << "\"last_lm_head_max_abs_err\":" << stats.last_lm_head_max_abs_err << ","
+        << "\"last_lm_head_validation_ran\":" << (stats.last_lm_head_validation_ran ? "true" : "false") << ","
+        << "\"last_lm_head_validation_ok\":" << (stats.last_lm_head_validation_ok ? "true" : "false") << ","
+        << "\"last_lm_head_validation_stage\":\""
+        << (stats.last_lm_head_validation_stage == 1 ? "prefill" :
+            stats.last_lm_head_validation_stage == 2 ? "first_decode" : "none") << "\","
+        << "\"last_lm_head_matched_logit_max_abs_err\":" << stats.last_lm_head_matched_logit_max_abs_err << ","
+        << "\"last_lm_head_top1_match\":" << (stats.last_lm_head_top1_match ? "true" : "false") << ","
+        << "\"last_lm_head_top5_overlap\":" << stats.last_lm_head_top5_overlap << ","
+        << "\"last_lm_head_top20_overlap\":" << stats.last_lm_head_top20_overlap << ","
+        << "\"last_lm_head_cpu_top1_margin\":" << stats.last_lm_head_cpu_top1_margin << ","
+        << "\"last_lm_head_validation_ms\":" << stats.last_lm_head_validation_ms << ","
         << "\"last_lm_head_ref_top5\":[" << stats.last_lm_head_ref_top5[0] << ","
         << stats.last_lm_head_ref_top5[1] << ","
         << stats.last_lm_head_ref_top5[2] << ","
@@ -205,6 +228,18 @@ std::string token_to_text(const llama_vocab * vocab, llama_token token) {
     return out;
 }
 
+bool is_ascii_whitespace_only(const std::string & text) {
+    if (text.empty()) {
+        return true;
+    }
+    for (char c : text) {
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+            return false;
+        }
+    }
+    return true;
+}
+
 int choose_prefill_chunk_size(int remaining_tokens) {
     if (remaining_tokens <= kShortPrefillTokenLimit) {
         return remaining_tokens;
@@ -215,10 +250,44 @@ int choose_prefill_chunk_size(int remaining_tokens) {
     return kLongPrefillChunkSize;
 }
 
+void select_top5(const float * logits, int vocab_size, int ids[5], float values[5]) {
+    for (int k = 0; k < 5; ++k) {
+        ids[k] = -1;
+        values[k] = -INFINITY;
+        for (int token = 0; token < vocab_size; ++token) {
+            bool used = false;
+            for (int prev = 0; prev < k; ++prev) {
+                if (ids[prev] == token) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used && std::isfinite(logits[token]) && logits[token] > values[k]) {
+                ids[k] = token;
+                values[k] = logits[token];
+            }
+        }
+    }
+}
+
+int top5_overlap(const int lhs[5], const int rhs[5]) {
+    int overlap = 0;
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 5; ++j) {
+            if (lhs[i] >= 0 && lhs[i] == rhs[j]) {
+                ++overlap;
+                break;
+            }
+        }
+    }
+    return overlap;
+}
+
 bool gpu_logits_look_bad(
         const osh26_vk_candidate * candidates,
         int candidate_count,
-        int * low_id_streak,
+        int vocab_size,
+        int * whitespace_streak,
         std::string * reason) {
     if (candidates == nullptr || candidate_count <= 0) {
         if (reason != nullptr) {
@@ -226,27 +295,63 @@ bool gpu_logits_look_bad(
         }
         return true;
     }
-    const int top_count = std::min(candidate_count, 5);
-    for (int i = 0; i < top_count; ++i) {
-        if (!std::isfinite(candidates[i].logit)) {
+    if (candidate_count != kGpuTopkCandidateCount) {
+        if (reason != nullptr) {
+            *reason = "gpu topK candidate count was not 32";
+        }
+        return true;
+    }
+    for (int i = 0; i < candidate_count; ++i) {
+        if (candidates[i].token < 0 || candidates[i].token >= vocab_size || !std::isfinite(candidates[i].logit)) {
             if (reason != nullptr) {
-                *reason = "gpu logits contained non-finite values";
+                *reason = "gpu topK contained an invalid token or logit";
             }
             return true;
+        }
+        if (i > 0 && candidates[i].logit > candidates[i - 1].logit) {
+            if (reason != nullptr) {
+                *reason = "gpu topK was not sorted descending";
+            }
+            return true;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (candidates[i].token == candidates[j].token) {
+                if (reason != nullptr) {
+                    *reason = "gpu topK contained duplicate tokens";
+                }
+                return true;
+            }
         }
     }
-    if (low_id_streak != nullptr) {
-        if (candidates[0].token >= 0 && candidates[0].token <= 20) {
-            *low_id_streak += 1;
+    const int top_token = candidates[0].token;
+    if (whitespace_streak != nullptr) {
+        if (top_token == 198 || top_token == 271) {
+            *whitespace_streak += 1;
         } else {
-            *low_id_streak = 0;
+            *whitespace_streak = 0;
         }
-        if (*low_id_streak >= kGpuLowIdStreakFallback) {
-            if (reason != nullptr) {
-                *reason = "gpu top token stayed in low-id range";
-            }
-            return true;
+    }
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    return false;
+}
+
+bool sampled_token_looks_bad(
+        llama_token token,
+        llama_token * previous_token,
+        int * same_token_streak,
+        std::string * reason) {
+    if (previous_token != nullptr && same_token_streak != nullptr) {
+        if (*previous_token == token) {
+            *same_token_streak += 1;
+        } else {
+            *previous_token = token;
+            *same_token_streak = 1;
         }
+    }
+    if (reason != nullptr) {
+        reason->clear();
     }
     return false;
 }
@@ -274,13 +379,9 @@ std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool e
     if (model_ != nullptr) {
         const char * tmpl = llama_model_chat_template(model_, nullptr);
         if (tmpl != nullptr && tmpl[0] != '\0') {
-            std::string system_msg = "You are a helpful local assistant.";
+            std::string system_msg = "You are a helpful local assistant. Answer in the same language as the user and keep the response concise.";
             std::string user_msg = user_prompt;
-            if (enable_thinking) {
-                user_msg += "\n/think";
-            } else {
-                user_msg += "\n/no_think";
-            }
+            user_msg += enable_thinking ? "\n/think" : "\n/no_think";
             std::array<llama_chat_message, 2> messages = {
                 llama_chat_message{"system", system_msg.c_str()},
                 llama_chat_message{"user", user_msg.c_str()},
@@ -302,16 +403,11 @@ std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool e
             }
         }
     }
-
     std::string prompt = "<|im_start|>system\n"
-                         "You are a helpful local assistant. Think before answering when useful.\n"
+                         "You are a helpful local assistant. Answer in the same language as the user and keep the response concise.\n"
                          "<|im_end|>\n"
                          "<|im_start|>user\n" + user_prompt;
-    if (enable_thinking) {
-        prompt += "\n/think";
-    } else {
-        prompt += "\n/no_think";
-    }
+    prompt += enable_thinking ? "\n/think" : "\n/no_think";
     prompt += "\n<|im_end|>\n<|im_start|>assistant\n";
     return prompt;
 }
@@ -353,6 +449,9 @@ std::string ComputeBackend::build_prompt_prefix() const {
 }
 
 bool ComputeBackend::prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const {
+    if (!kEnablePrefixCache) {
+        return false;
+    }
     if (!prefix_cache_valid_ || prefix_tokens_.empty() || prompt_tokens.size() < prefix_tokens_.size()) {
         return false;
     }
@@ -360,6 +459,14 @@ bool ComputeBackend::prompt_has_cached_prefix(const std::vector<llama_token> & p
 }
 
 void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
+    const auto gpu_reset_start = std::chrono::steady_clock::now();
+    if (osh26_vk_gpu_ready()) {
+        osh26_vk_gpu_reset_cache();
+        last_gpu_kv_reset_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - gpu_reset_start).count();
+    } else {
+        last_gpu_kv_reset_ms_ = 0.0;
+    }
     if (ctx_ != nullptr) {
         llama_memory_clear(llama_get_memory(ctx_), false);
     }
@@ -386,6 +493,9 @@ void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
 }
 
 bool ComputeBackend::warm_prefix_cache_locked() {
+    if (!kEnablePrefixCache) {
+        return false;
+    }
     if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
         return false;
     }
@@ -421,6 +531,9 @@ bool ComputeBackend::warm_prefix_cache_locked() {
 }
 
 void ComputeBackend::start_prefix_warmup_async_locked() {
+    if (!kEnablePrefixCache) {
+        return;
+    }
     if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
         return;
     }
@@ -527,6 +640,9 @@ void ComputeBackend::complete_request(const std::shared_ptr<GenerationRequest> &
 }
 
 void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens) {
+    if (!kEnablePrefixCache) {
+        return;
+    }
     const size_t prefix_len = std::min(prompt_tokens.size(), max_prefix_cache_tokens_);
     if (prefix_len == 0) {
         return;
@@ -646,6 +762,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     std::lock_guard<std::mutex> lock(mutex_);
     available_devices_ = describe_backend_devices();
     cancel_requested_.store(true);
+    reset_cache_locked(true);
     if (ctx_ != nullptr) {
         llama_free(ctx_);
         ctx_ = nullptr;
@@ -656,7 +773,6 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     }
     osh26_vk_gpu_free();
     active_backend_ = "llama.cpp CPU";
-    reset_cache_locked(true);
 
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
@@ -714,7 +830,8 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     last_prefill_chunk_count_ = 0;
     last_prefill_logits_chunks_ = 0;
     last_logits_sanity_ok_ = true;
-    last_logits_low_id_streak_ = 0;
+    last_logits_whitespace_streak_ = 0;
+    last_logits_same_token_streak_ = 0;
     last_logits_sanity_reason_.clear();
     cancel_requested_.store(false);
     start_prefix_warmup_async_locked();
@@ -761,12 +878,24 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         last_prefill_qkv_ms_ = 0.0;
         last_prefill_cpu_post_ms_ = 0.0;
         last_prefill_attention_ms_ = 0.0;
-        last_prefill_ffn_ms_ = 0.0;
+        last_prefill_ffn_gate_up_silu_ms_ = 0.0;
         last_user_prefill_ms_ = 0.0;
         last_first_decode_ms_ = 0.0;
         last_logits_sanity_ok_ = true;
-        last_logits_low_id_streak_ = 0;
+        last_logits_whitespace_streak_ = 0;
+        last_logits_same_token_streak_ = 0;
         last_logits_sanity_reason_.clear();
+        last_e2e_compare_ran_ = false;
+        last_e2e_top1_match_ = false;
+        last_e2e_top5_overlap_ = 0;
+        std::fill(std::begin(last_e2e_cpu_top5_), std::end(last_e2e_cpu_top5_), -1);
+        std::fill(std::begin(last_e2e_gpu_top5_), std::end(last_e2e_gpu_top5_), -1);
+        last_e2e_cpu_top1_margin_ = 0.0f;
+        last_e2e_compare_ms_ = 0.0;
+        last_layer_submit_count_ = 0;
+        last_lm_head_submit_count_ = 0;
+        last_ttft_submit_count_ = 0;
+        last_submit_wait_ms_ = 0.0;
 
         const auto prompt_build_start = std::chrono::steady_clock::now();
         prompt = build_prompt(user_prompt, options.enable_thinking);
@@ -794,7 +923,9 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         request->prompt = std::move(prompt);
         request->prompt_tokens = prompt_tokens;
         request->prompt_tokens_total = request->prompt_tokens.size();
-        request->reusable_prefix_tokens = common_prefix_length(request->prompt_tokens, prefix_tokens_);
+        request->reusable_prefix_tokens = kEnablePrefixCache
+            ? common_prefix_length(request->prompt_tokens, prefix_tokens_)
+            : 0;
         request->queue_position = next_queue_position_++;
 
     }
@@ -844,36 +975,76 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
     const auto start = request->submitted_at;
     const llama_vocab * vocab = llama_model_get_vocab(model_);
 
-    llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
-    sampler_params.no_perf = false;
-    llama_sampler * sampler = llama_sampler_chain_init(sampler_params);
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(20));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(options.top_p, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(options.temperature));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(options.seed));
+    llama_sampler * sampler = nullptr;
+    if (options.temperature <= 0.0f) {
+        sampler = llama_sampler_init_greedy();
+    } else {
+        llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
+        sampler_params.no_perf = false;
+        sampler = llama_sampler_chain_init(sampler_params);
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(options.top_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(options.temperature));
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(options.seed));
+    }
 
     const int max_tokens = std::max(1, std::min(options.max_tokens, kDefaultContextSize - n_prompt));
     bool hit_eog = false;
     bool hit_limit = true;
+    bool suppress_leading_whitespace = !options.enable_thinking;
 
     const bool want_gpu = requested_backend_ == "vulkan";
     bool use_gpu = want_gpu && osh26_vk_gpu_ready();
+    if (want_gpu && !use_gpu) {
+        result.error = "Vulkan GPU backend is not ready";
+        hit_limit = false;
+    }
     if(use_gpu)__android_log_print(ANDROID_LOG_INFO,"OSH26GPU","VOCAB check: hardcoded=151936 llama_vocab=%d",(int)llama_vocab_n_tokens(vocab));
     int n_pos = 0;
     bool first_token = true;
+    std::vector<std::string> gpu_guard_pieces;
+    std::vector<llama_token> gpu_guard_tokens;
+    gpu_guard_pieces.reserve(kGpuGuardTokenCount);
+    gpu_guard_tokens.reserve(kGpuGuardTokenCount);
+    llama_token previous_gpu_token = -1;
+    auto flush_gpu_guard = [&] {
+        for (size_t i = 0; i < gpu_guard_tokens.size(); ++i) {
+            if (!result.token_ids.empty()) {
+                result.token_ids += ",";
+            }
+            result.token_ids += std::to_string(gpu_guard_tokens[i]);
+            const bool suppress_piece = suppress_leading_whitespace && is_ascii_whitespace_only(gpu_guard_pieces[i]);
+            if (!suppress_piece) {
+                suppress_leading_whitespace = false;
+            }
+            if (!gpu_guard_pieces[i].empty() && !suppress_piece) {
+                result.text += gpu_guard_pieces[i];
+                if (on_token) {
+                    on_token(gpu_guard_pieces[i]);
+                }
+            }
+        }
+        gpu_guard_tokens.clear();
+        gpu_guard_pieces.clear();
+    };
 
     if (use_gpu) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            start_prefix_warmup_async_locked();
-            if (prompt_has_cached_prefix(prompt_tokens)) {
-                last_prefix_cache_hit_ = true;
-                last_prefix_tokens_ = prefix_cached_pos_;
-                n_pos = prefix_cached_pos_;
-            } else {
-                prefix_cache_valid_ = false;
-                prefix_cached_pos_ = 0;
-                prefix_tokens_.clear();
+            last_prefix_cache_hit_ = false;
+            last_prefix_tokens_ = 0;
+            last_reusable_prefix_tokens_ = 0;
+            last_cached_prefix_entries_ = 0;
+            prefix_cache_valid_ = false;
+            prefix_cached_pos_ = 0;
+            prefix_tokens_.clear();
+            if (kEnablePrefixCache) {
+                start_prefix_warmup_async_locked();
+                if (prompt_has_cached_prefix(prompt_tokens)) {
+                    last_prefix_cache_hit_ = true;
+                    last_prefix_tokens_ = prefix_cached_pos_;
+                    n_pos = prefix_cached_pos_;
+                }
             }
         }
 
@@ -884,7 +1055,8 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         last_prefill_chunk_count_ = 0;
         last_prefill_logits_chunks_ = 0;
         last_logits_sanity_ok_ = true;
-        last_logits_low_id_streak_ = 0;
+        last_logits_whitespace_streak_ = 0;
+        last_logits_same_token_streak_ = 0;
         last_logits_sanity_reason_.clear();
         if (user_prefill_tokens > 0) {
             const auto prefill_time_start = std::chrono::steady_clock::now();
@@ -895,7 +1067,10 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                 if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
                 const int chunk_tokens = std::min(chunk_size, user_prefill_tokens - offset);
                 const bool needs_logits = (offset + chunk_tokens == user_prefill_tokens);
-                const uint32_t forward_flags = needs_logits ? OSH26_FORWARD_NEED_LOGITS : OSH26_FORWARD_PREFILL_ONLY;
+                uint32_t forward_flags = needs_logits ? OSH26_FORWARD_NEED_LOGITS : OSH26_FORWARD_PREFILL_ONLY;
+                if (needs_logits && debug_correctness_) {
+                    forward_flags |= OSH26_FORWARD_VALIDATE_PREFILL;
+                }
                 ++last_prefill_forward_count_;
                 ++last_prefill_chunk_count_;
                 if (needs_logits) {
@@ -904,11 +1079,6 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                     ++last_prefill_skipped_lm_head_count_;
                 }
                 if (osh26_vk_gpu_forward_ex((int *) (prefill_tokens + offset), chunk_tokens, n_pos, forward_flags) != 0) {
-                    if (result.decoded_tokens == 0) {
-                        use_gpu = false;
-                        result.error.clear();
-                        goto cpu_path;
-                    }
                     result.error = needs_logits ? "GPU prefill failed" : "GPU prefill chunk failed";
                     hit_limit = false;
                     break;
@@ -919,28 +1089,57 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                 std::chrono::steady_clock::now() - prefill_time_start).count();
         } else {
             last_user_prefill_ms_ = 0.0;
-            const bool can_refresh_tail = n_prompt > 0
-                && last_prefix_cache_hit_
-                && prefix_cached_pos_ == n_prompt
-                && n_pos > 0
-                && !prefix_tokens_.empty()
-                && prompt_tokens.back() == prefix_tokens_.back();
-            if (can_refresh_tail) {
-                const auto prefill_time_start = std::chrono::steady_clock::now();
-                int refresh_token = (int) prompt_tokens[n_prompt - 1];
-                ++last_prefill_forward_count_;
-                if (osh26_vk_gpu_forward_ex(&refresh_token, 1, std::max(0, n_pos - 1), OSH26_FORWARD_NEED_LOGITS) != 0) {
-                    if (result.decoded_tokens == 0) {
-                        use_gpu = false;
-                        result.error.clear();
-                        goto cpu_path;
-                    }
-                    result.error = "GPU cache refresh failed";
-                    hit_limit = false;
-                }
-                last_user_prefill_ms_ = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - prefill_time_start).count();
+        }
+
+        if (debug_correctness_ && result.error.empty() && !result.cancelled && n_prompt > 0) {
+            const auto compare_start = std::chrono::steady_clock::now();
+            last_e2e_compare_ran_ = true;
+            osh26_vk_candidate gpu_prefill_candidates[kGpuTopkCandidateCount];
+            const int gpu_count = osh26_vk_gpu_collect_topk(gpu_prefill_candidates, kGpuTopkCandidateCount);
+            for (int i = 0; i < 5 && i < gpu_count; ++i) {
+                last_e2e_gpu_top5_[i] = gpu_prefill_candidates[i].token;
             }
+
+            llama_memory_clear(llama_get_memory(ctx_), false);
+            bool cpu_compare_ok = gpu_count == kGpuTopkCandidateCount;
+            for (int offset = 0; cpu_compare_ok && offset < n_prompt; offset += kDefaultBatchSize) {
+                const int chunk_tokens = std::min(kDefaultBatchSize, n_prompt - offset);
+                llama_batch cpu_batch = llama_batch_get_one(prompt_tokens.data() + offset, chunk_tokens);
+                const int decode_status = llama_decode(ctx_, cpu_batch);
+                if (decode_status != 0) {
+                    cpu_compare_ok = false;
+                    __android_log_print(ANDROID_LOG_WARN, "OSH26GPU",
+                        "E2E CPU compare decode failed at offset=%d status=%d", offset, decode_status);
+                }
+            }
+            if (cpu_compare_ok) {
+                const float * cpu_logits = llama_get_logits_ith(ctx_, -1);
+                if (cpu_logits != nullptr) {
+                    float cpu_top5_values[5];
+                    select_top5(cpu_logits, (int) llama_vocab_n_tokens(vocab), last_e2e_cpu_top5_, cpu_top5_values);
+                    last_e2e_cpu_top1_margin_ = cpu_top5_values[0] - cpu_top5_values[1];
+                    last_e2e_top1_match_ = last_e2e_cpu_top5_[0] == last_e2e_gpu_top5_[0];
+                    last_e2e_top5_overlap_ = top5_overlap(last_e2e_cpu_top5_, last_e2e_gpu_top5_);
+                } else {
+                    cpu_compare_ok = false;
+                }
+            }
+            llama_memory_clear(llama_get_memory(ctx_), false);
+            last_e2e_compare_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - compare_start).count();
+            __android_log_print(
+                cpu_compare_ok ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+                "OSH26GPU",
+                "E2E first-token compare: ok=%s top1_match=%s top5_overlap=%d/5 cpu_margin=%.4f cpu_top5=%d,%d,%d,%d,%d gpu_top5=%d,%d,%d,%d,%d ms=%.2f",
+                cpu_compare_ok ? "true" : "false",
+                last_e2e_top1_match_ ? "true" : "false",
+                last_e2e_top5_overlap_,
+                (double) last_e2e_cpu_top1_margin_,
+                last_e2e_cpu_top5_[0], last_e2e_cpu_top5_[1], last_e2e_cpu_top5_[2],
+                last_e2e_cpu_top5_[3], last_e2e_cpu_top5_[4],
+                last_e2e_gpu_top5_[0], last_e2e_gpu_top5_[1], last_e2e_gpu_top5_[2],
+                last_e2e_gpu_top5_[3], last_e2e_gpu_top5_[4],
+                last_e2e_compare_ms_);
         }
 
         for (; result.error.empty() && !result.cancelled && result.decoded_tokens < max_tokens;) {
@@ -951,22 +1150,21 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             osh26_vk_candidate gpu_candidates[kGpuTopkCandidateCount];
             const int candidate_count = osh26_vk_gpu_collect_topk(gpu_candidates, kGpuTopkCandidateCount);
             if (candidate_count <= 0) {
-                if (result.decoded_tokens == 0) {
-                    use_gpu = false;
-                    goto cpu_path;
-                }
                 result.error = "GPU logits candidate collection failed";
                 hit_limit = false;
                 break;
             }
 
-            if (gpu_logits_look_bad(gpu_candidates, candidate_count, &last_logits_low_id_streak_, &last_logits_sanity_reason_)) {
+            if (gpu_logits_look_bad(
+                    gpu_candidates,
+                    candidate_count,
+                    (int) llama_vocab_n_tokens(vocab),
+                    &last_logits_whitespace_streak_,
+                    &last_logits_sanity_reason_)) {
                 last_logits_sanity_ok_ = false;
-                __android_log_print(ANDROID_LOG_WARN, "OSH26GPU", "GPU logits sanity fallback: %s", last_logits_sanity_reason_.c_str());
-                if (result.decoded_tokens == 0) {
-                    use_gpu = false;
-                    result.error.clear();
-                    goto cpu_path;
+                __android_log_print(ANDROID_LOG_WARN, "OSH26GPU", "GPU logits sanity failed: %s", last_logits_sanity_reason_.c_str());
+                if (result.decoded_tokens < kGpuGuardTokenCount) {
+                    ++last_logits_sanity_fail_count_;
                 }
                 result.error = "GPU logits sanity check failed: " + last_logits_sanity_reason_;
                 hit_limit = false;
@@ -993,6 +1191,20 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             llama_token token = cur_p.data[cur_p.selected].id;
 
             if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+            if (result.decoded_tokens == 0) {
+                previous_gpu_token = -1;
+                last_logits_same_token_streak_ = 0;
+            }
+            if (sampled_token_looks_bad(token, &previous_gpu_token, &last_logits_same_token_streak_, &last_logits_sanity_reason_)) {
+                last_logits_sanity_ok_ = false;
+                __android_log_print(ANDROID_LOG_WARN, "OSH26GPU", "GPU sampled-token sanity failed: %s", last_logits_sanity_reason_.c_str());
+                if (result.decoded_tokens < kGpuGuardTokenCount) {
+                    ++last_logits_sanity_fail_count_;
+                }
+                result.error = "GPU sampled-token sanity check failed: " + last_logits_sanity_reason_;
+                hit_limit = false;
+                break;
+            }
             llama_sampler_accept(sampler, token);
 
             if (first_token) {
@@ -1004,16 +1216,32 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             }
 
             std::string piece = token_to_text(vocab, token);
-            if (!result.token_ids.empty()) result.token_ids += ",";
-            result.token_ids += std::to_string(token);
-            if (!piece.empty()) { result.text += piece; if (on_token) on_token(piece); }
             result.decoded_tokens += 1;
+            if (result.decoded_tokens <= kGpuGuardTokenCount) {
+                gpu_guard_tokens.push_back(token);
+                gpu_guard_pieces.push_back(piece);
+                if (result.decoded_tokens >= kGpuGuardTokenCount || result.decoded_tokens >= max_tokens) {
+                    flush_gpu_guard();
+                }
+            } else {
+                if (!result.token_ids.empty()) result.token_ids += ",";
+                result.token_ids += std::to_string(token);
+                const bool suppress_piece = suppress_leading_whitespace && is_ascii_whitespace_only(piece);
+                if (!suppress_piece) {
+                    suppress_leading_whitespace = false;
+                }
+                if (!piece.empty() && !suppress_piece) { result.text += piece; if (on_token) on_token(piece); }
+            }
             if (result.decoded_tokens >= max_tokens) {
                 break;
             }
 
             const auto decode_start = std::chrono::steady_clock::now();
-            if (osh26_vk_gpu_forward_ex((int *) &token, 1, n_pos, OSH26_FORWARD_NEED_LOGITS) != 0) {
+            uint32_t decode_flags = OSH26_FORWARD_NEED_LOGITS;
+            if (debug_correctness_ && result.decoded_tokens == 1) {
+                decode_flags |= OSH26_FORWARD_VALIDATE_FIRST_DECODE;
+            }
+            if (osh26_vk_gpu_forward_ex((int *) &token, 1, n_pos, decode_flags) != 0) {
                 result.error = "GPU decode failed";
                 hit_limit = false;
                 break;
@@ -1024,9 +1252,10 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                     std::chrono::steady_clock::now() - decode_start).count();
             }
         }
+        flush_gpu_guard();
     }
 cpu_path:
-    if (!use_gpu) {
+    if (!use_gpu && !want_gpu) {
         llama_memory_clear(llama_get_memory(ctx_), false);
         n_pos = 0;
         llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
@@ -1037,8 +1266,9 @@ cpu_path:
         last_prefill_chunk_count_ = n_prompt > 0 ? 1 : 0;
         last_prefill_logits_chunks_ = n_prompt > 0 ? 1 : 0;
         last_logits_sanity_ok_ = true;
-        last_logits_low_id_streak_ = 0;
         last_logits_sanity_reason_.clear();
+        last_logits_whitespace_streak_ = 0;
+        last_logits_same_token_streak_ = 0;
         for (; n_pos + batch.n_tokens < n_prompt + max_tokens;) {
             if (cancel_requested_.load()) { result.cancelled = true; hit_limit = false; break; }
 
@@ -1070,7 +1300,11 @@ cpu_path:
             std::string piece = token_to_text(vocab, token);
             if (!result.token_ids.empty()) result.token_ids += ",";
             result.token_ids += std::to_string(token);
-            if (!piece.empty()) { result.text += piece; if (on_token) on_token(piece); }
+            const bool suppress_piece = suppress_leading_whitespace && is_ascii_whitespace_only(piece);
+            if (!suppress_piece) {
+                suppress_leading_whitespace = false;
+            }
+            if (!piece.empty() && !suppress_piece) { result.text += piece; if (on_token) on_token(piece); }
             batch = llama_batch_get_one(&token, 1);
             result.decoded_tokens += 1;
         }
@@ -1093,6 +1327,8 @@ cpu_path:
     llama_sampler_free(sampler);
     llama_memory_clear(llama_get_memory(ctx_), false);
 
+    osh26_vk_stats vk_stats {};
+    const bool have_vk_stats = use_gpu && osh26_vk_get_stats(&vk_stats) == 0;
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
         active_request_.reset();
@@ -1112,22 +1348,23 @@ cpu_path:
         last_finish_reason_ = result.finish_reason;
         last_error_ = result.error;
         last_token_ids_ = result.token_ids;
-        if (result.ok && !result.cancelled && result.error.empty() && use_gpu) {
-            insert_prefix_cache_locked(prompt_tokens);
-            last_prefix_tokens_ = prefix_cached_pos_;
-            last_prefix_cache_hit_ = last_prefix_tokens_ > 0 && request->reusable_prefix_tokens > 0;
-            if (request->reusable_prefix_tokens > 0) {
-                prefix_cache_hits_ += 1;
-                prefix_cache_reuse_tokens_ += request->reusable_prefix_tokens;
-                prefix_cache_block_reuse_ += (request->reusable_prefix_tokens + prefix_cache_block_size_ - 1) / std::max<size_t>(1, prefix_cache_block_size_);
-            } else {
-                prefix_cache_misses_ += 1;
-            }
-        } else {
-            prefix_cache_valid_ = false;
-            prefix_cached_pos_ = 0;
-            prefix_tokens_.clear();
+        if (have_vk_stats) {
+            last_prefill_qkv_ms_ = vk_stats.last_prefill_qkv_ms;
+            last_prefill_cpu_post_ms_ = vk_stats.last_prefill_cpu_post_ms;
+            last_prefill_attention_ms_ = vk_stats.last_prefill_attention_ms;
+            last_prefill_ffn_gate_up_silu_ms_ = vk_stats.last_prefill_ffn_gate_up_silu_ms;
+            last_layer_submit_count_ = vk_stats.last_layer_submit_count;
+            last_lm_head_submit_count_ = vk_stats.last_lm_head_submit_count;
+            last_ttft_submit_count_ = vk_stats.last_ttft_submit_count;
+            last_submit_wait_ms_ = vk_stats.last_submit_wait_ms;
         }
+        last_prefix_cache_hit_ = false;
+        last_prefix_tokens_ = 0;
+        last_reusable_prefix_tokens_ = 0;
+        last_cached_prefix_entries_ = 0;
+        prefix_cache_valid_ = false;
+        prefix_cached_pos_ = 0;
+        prefix_tokens_.clear();
     }
     return result;
 }
@@ -1198,17 +1435,18 @@ void ComputeBackend::release() {
             llama_model_free(model_);
             model_ = nullptr;
         }
+        reset_cache_locked(true);
         osh26_vk_gpu_free();
         model_path_.clear();
         active_backend_ = "llama.cpp CPU";
-        reset_cache_locked(true);
         last_prefill_forward_count_ = 0;
         last_prefill_skipped_lm_head_count_ = 0;
         last_prefill_chunk_size_ = 0;
         last_prefill_chunk_count_ = 0;
         last_prefill_logits_chunks_ = 0;
         last_logits_sanity_ok_ = true;
-        last_logits_low_id_streak_ = 0;
+        last_logits_whitespace_streak_ = 0;
+        last_logits_same_token_streak_ = 0;
         last_logits_sanity_reason_.clear();
         running_ = false;
     }
@@ -1246,12 +1484,6 @@ std::string ComputeBackend::stats_json() const {
         last_queue_wait_ms = last_queue_wait_ms_;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    const double prefix_hit_ratio = (prefix_cache_hits_ + prefix_cache_misses_) > 0
-        ? (double) prefix_cache_hits_ / (double) (prefix_cache_hits_ + prefix_cache_misses_)
-        : 0.0;
-    const double block_reuse_ratio = prefix_cache_entry_count_ > 0
-        ? (double) prefix_cache_reuse_tokens_ / (double) std::max<size_t>(1, prefix_cache_token_count_)
-        : 0.0;
     std::ostringstream out;
     out << "{\n"
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
@@ -1265,7 +1497,7 @@ std::string ComputeBackend::stats_json() const {
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
-        << "  \"scheduler\": \"queued-prefix-lite\",\n"
+        << "  \"scheduler\": \"queued-no-prefix-lite\",\n"
         << "  \"max_concurrent_requests\": 1,\n"
         << "  \"max_pending_requests\": " << max_pending_requests_ << ",\n"
         << "  \"model_loaded\": " << (model_ ? "true" : "false") << ",\n"
@@ -1286,16 +1518,17 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
         << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
         << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
-        << "  \"last_prefix_cache_hit\": " << (last_prefix_cache_hit_ ? "true" : "false") << ",\n"
-        << "  \"prefix_cache_valid\": " << (prefix_cache_valid_ ? "true" : "false") << ",\n"
-        << "  \"prefix_cached_pos\": " << prefix_cached_pos_ << ",\n"
-        << "  \"last_prefix_tokens\": " << last_prefix_tokens_ << ",\n"
-        << "  \"prefix_cache_entries\": " << prefix_cache_entry_count_ << ",\n"
-        << "  \"prefix_cache_tokens\": " << prefix_cache_token_count_ << ",\n"
-        << "  \"prefix_cache_evictions\": " << prefix_cache_evictions_ << ",\n"
-        << "  \"prefix_cache_hit_ratio\": " << prefix_hit_ratio << ",\n"
-        << "  \"prefix_cache_block_reuse_ratio\": " << block_reuse_ratio << ",\n"
-        << "  \"prefix_cache_fragmentation\": " << prefix_cache_fragmentation_locked() << ",\n"
+        << "  \"prefix_cache_enabled\": false,\n"
+        << "  \"last_prefix_cache_hit\": false,\n"
+        << "  \"prefix_cache_valid\": false,\n"
+        << "  \"prefix_cached_pos\": 0,\n"
+        << "  \"last_prefix_tokens\": 0,\n"
+        << "  \"prefix_cache_entries\": 0,\n"
+        << "  \"prefix_cache_tokens\": 0,\n"
+        << "  \"prefix_cache_evictions\": 0,\n"
+        << "  \"prefix_cache_hit_ratio\": 0,\n"
+        << "  \"prefix_cache_block_reuse_ratio\": 0,\n"
+        << "  \"prefix_cache_fragmentation\": 0,\n"
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
         << "  \"last_prefill_forward_count\": " << last_prefill_forward_count_ << ",\n"
         << "  \"last_prefill_skipped_lm_head_count\": " << last_prefill_skipped_lm_head_count_ << ",\n"
@@ -1305,11 +1538,27 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_prefill_qkv_ms\": " << last_prefill_qkv_ms_ << ",\n"
         << "  \"last_prefill_cpu_post_ms\": " << last_prefill_cpu_post_ms_ << ",\n"
         << "  \"last_prefill_attention_ms\": " << last_prefill_attention_ms_ << ",\n"
-        << "  \"last_prefill_ffn_ms\": " << last_prefill_ffn_ms_ << ",\n"
+        << "  \"last_prefill_ffn_gate_up_silu_ms\": " << last_prefill_ffn_gate_up_silu_ms_ << ",\n"
+        << "  \"last_submit_wait_ms\": " << last_submit_wait_ms_ << ",\n"
+        << "  \"last_layer_submit_count\": " << last_layer_submit_count_ << ",\n"
+        << "  \"last_lm_head_submit_count\": " << last_lm_head_submit_count_ << ",\n"
+        << "  \"last_ttft_submit_count\": " << last_ttft_submit_count_ << ",\n"
         << "  \"last_user_prefill_ms\": " << last_user_prefill_ms_ << ",\n"
         << "  \"last_first_decode_ms\": " << last_first_decode_ms_ << ",\n"
+        << "  \"last_gpu_kv_reset_ms\": " << last_gpu_kv_reset_ms_ << ",\n"
+        << "  \"last_e2e_compare_ran\": " << (last_e2e_compare_ran_ ? "true" : "false") << ",\n"
+        << "  \"last_e2e_top1_match\": " << (last_e2e_top1_match_ ? "true" : "false") << ",\n"
+        << "  \"last_e2e_top5_overlap\": " << last_e2e_top5_overlap_ << ",\n"
+        << "  \"last_e2e_cpu_top5\": [" << last_e2e_cpu_top5_[0] << "," << last_e2e_cpu_top5_[1] << ","
+        << last_e2e_cpu_top5_[2] << "," << last_e2e_cpu_top5_[3] << "," << last_e2e_cpu_top5_[4] << "],\n"
+        << "  \"last_e2e_gpu_top5\": [" << last_e2e_gpu_top5_[0] << "," << last_e2e_gpu_top5_[1] << ","
+        << last_e2e_gpu_top5_[2] << "," << last_e2e_gpu_top5_[3] << "," << last_e2e_gpu_top5_[4] << "],\n"
+        << "  \"last_e2e_cpu_top1_margin\": " << last_e2e_cpu_top1_margin_ << ",\n"
+        << "  \"last_e2e_compare_ms\": " << last_e2e_compare_ms_ << ",\n"
         << "  \"last_logits_sanity_ok\": " << (last_logits_sanity_ok_ ? "true" : "false") << ",\n"
-        << "  \"last_logits_low_id_streak\": " << last_logits_low_id_streak_ << ",\n"
+        << "  \"last_logits_whitespace_streak\": " << last_logits_whitespace_streak_ << ",\n"
+        << "  \"last_logits_same_token_streak\": " << last_logits_same_token_streak_ << ",\n"
+        << "  \"last_logits_sanity_fail_count\": " << last_logits_sanity_fail_count_ << ",\n"
         << "  \"last_logits_sanity_reason\": \"" << json_escape(last_logits_sanity_reason_) << "\",\n"
         << "  \"last_ttft_ms\": " << last_ttft_ms_ << ",\n"
         << "  \"last_tokens_per_second\": " << last_tokens_per_second_ << ",\n"
