@@ -50,7 +50,10 @@
 #define QDIM  (N_HD*HD)
 #define KVD   (N_KVH*HD)
 #define VOCAB 151936
-#define MAX_S 1024
+#define MAX_S 8192
+#define MAX_FORWARD_TOKENS 128
+#define HOST_KV_MAX_S 1024
+#define PREFILL_ATTN_BLOCK_TOKENS 128
 #define HEAD_SHARD 16384
 #define HEAD_SHARDS ((VOCAB + HEAD_SHARD - 1) / HEAD_SHARD)
 #define LM_HEAD_LOCAL_TOPK 32
@@ -612,7 +615,7 @@ static void BIND_PREFILL_FINALIZE(VkCommandBuffer cb,VkBuf*out,VkBuf*out_acc,VkB
 
 static void pack_mnn_kv_cache(int l,int pos,int nt,const float*kb,const float*vb){
     const int d4s=HD/4;
-    float *kc=B_KCache[l].P,*vc=B_VCache[l].P;
+    ggml_fp16_t *kc=(ggml_fp16_t*)B_KCache[l].P,*vc=(ggml_fp16_t*)B_VCache[l].P;
     for(int t=0;t<nt;t++){
         int token=pos+t;
         if(token<0||token>=MAX_S)continue;
@@ -620,8 +623,12 @@ static void pack_mnn_kv_cache(int l,int pos,int nt,const float*kb,const float*vb
             const float *krow=kb+(t*N_KVH+kvh)*HD;
             const float *vrow=vb+(t*N_KVH+kvh)*HD;
             for(int d4=0;d4<d4s;d4++){
-                memcpy(kc+(((kvh*d4s+d4)*MAX_S+token)*4),krow+d4*4,4*sizeof(float));
-                memcpy(vc+(((kvh*MAX_S+token)*d4s+d4)*4),vrow+d4*4,4*sizeof(float));
+                ggml_fp16_t *kd=kc+(((kvh*d4s+d4)*MAX_S+token)*4);
+                ggml_fp16_t *vd=vc+(((kvh*MAX_S+token)*d4s+d4)*4);
+                for(int lane=0;lane<4;lane++){
+                    kd[lane]=ggml_fp32_to_fp16(krow[d4*4+lane]);
+                    vd[lane]=ggml_fp32_to_fp16(vrow[d4*4+lane]);
+                }
             }
         }
     }
@@ -650,28 +657,28 @@ static void copy_packed_kv_page(VkBuf *dst_k,VkBuf *dst_v,int dst_token,int dst_
     const int d4s=HD/4;
     for(int kvh=0;kvh<N_KVH;kvh++){
         for(int d4=0;d4<d4s;d4++){
-            float *dk=dst_k->P+kcache_vec_offset(kvh,d4,dst_token,dst_stride);
-            const float *sk=src_k->P+kcache_vec_offset(kvh,d4,src_token,src_stride);
-            memcpy(dk,sk,(size_t)PREFIX_PAGE_TOKENS*4*sizeof(float));
+            ggml_fp16_t *dk=(ggml_fp16_t*)dst_k->P+kcache_vec_offset(kvh,d4,dst_token,dst_stride);
+            const ggml_fp16_t *sk=(const ggml_fp16_t*)src_k->P+kcache_vec_offset(kvh,d4,src_token,src_stride);
+            memcpy(dk,sk,(size_t)PREFIX_PAGE_TOKENS*4*sizeof(ggml_fp16_t));
         }
         for(int t=0;t<PREFIX_PAGE_TOKENS;t++){
-            float *dv=dst_v->P+vcache_vec_offset(kvh,dst_token+t,0,dst_stride);
-            const float *sv=src_v->P+vcache_vec_offset(kvh,src_token+t,0,src_stride);
-            memcpy(dv,sv,(size_t)d4s*4*sizeof(float));
+            ggml_fp16_t *dv=(ggml_fp16_t*)dst_v->P+vcache_vec_offset(kvh,dst_token+t,0,dst_stride);
+            const ggml_fp16_t *sv=(const ggml_fp16_t*)src_v->P+vcache_vec_offset(kvh,src_token+t,0,src_stride);
+            memcpy(dv,sv,(size_t)d4s*4*sizeof(ggml_fp16_t));
         }
     }
 }
 
 static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv,float*sc,float*out){
-    int kvo=l*2*MAX_S*KVD;
+    int kvo=l*2*HOST_KV_MAX_S*KVD;
     int slen=pos+nt;
-    memset(sc,0,nt*N_HD*MAX_S*sizeof(float));
+    memset(sc,0,nt*N_HD*HOST_KV_MAX_S*sizeof(float));
     float isd=1.0f/sqrtf((float)HD);
     for(int h=0;h<N_HD;h++){
         int kvh=h*N_KVH/N_HD;
         for(int t=0;t<nt;t++){
             const float*qt=qb+t*QDIM+h*HD;
-            float*sr=sc+(t*N_HD+h)*MAX_S;
+            float*sr=sc+(t*N_HD+h)*HOST_KV_MAX_S;
             int lim=(nt==1)?slen:(pos+t+1);
             for(int s=0;s<lim;s++){
                 const float*ks=kv+kvo+s*KVD+kvh*HD;
@@ -682,7 +689,7 @@ static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv
         }
     }
     for(int r=0;r<nt*N_HD;r++){
-        float*row=sc+r*MAX_S;
+        float*row=sc+r*HOST_KV_MAX_S;
         int nc=(nt==1)?slen:(pos+(r/N_HD)+1);
         float mx=row[0];
         for(int c=1;c<nc;c++)if(row[c]>mx)mx=row[c];
@@ -695,9 +702,9 @@ static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv
         int kvh=h*N_KVH/N_HD;
         for(int t=0;t<nt;t++){
             float*oh=out+t*QDIM+h*HD;
-            const float*sr=sc+(t*N_HD+h)*MAX_S;
+            const float*sr=sc+(t*N_HD+h)*HOST_KV_MAX_S;
             for(int s=0;s<slen;s++){
-                const float*vs=kv+kvo+MAX_S*KVD+s*KVD+kvh*HD;
+                const float*vs=kv+kvo+HOST_KV_MAX_S*KVD+s*KVD+kvh*HD;
                 float wgt=sr[s];
                 for(int d=0;d<HD;d++)oh[d]+=wgt*vs[d];
             }
@@ -718,7 +725,7 @@ static bool prefill_attention_gpu_record(VkCommandBuffer cb, int l, int nt, int 
         return false;
     }
     const int total_len = pos + nt;
-    const int block_len = 128;
+    const int block_len = PREFILL_ATTN_BLOCK_TOKENS;
     const int block_len4 = ((block_len + 3) / 4) * 4;
     const int block_len4_4 = block_len4 / 4;
     const int q4_count = (nt + 3) / 4;
@@ -1041,28 +1048,30 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
 #define ALLOC_BUF(buf, bytes, label) do { \
         if(!buf_alloc(&(buf),(bytes))){LOGE("alloc %s",label);osh26_vk_gpu_free();return -1;} \
     } while(0)
-    ALLOC_ZERO_BUF(B_KV,((VkDeviceSize)N_LAY*2*MAX_S*KVD)*4,"B_KV");
+    if(g_debug_correctness){
+        ALLOC_ZERO_BUF(B_KV,((VkDeviceSize)N_LAY*2*HOST_KV_MAX_S*KVD)*4,"B_KV");
+    }
     for(int l=0;l<N_LAY;l++){
-        ALLOC_ZERO_BUF(B_KCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_KCache");
-        ALLOC_ZERO_BUF(B_VCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_VCache");
-        ALLOC_ZERO_BUF(B_KPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*4,"B_KPrefixPool");
-        ALLOC_ZERO_BUF(B_VPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*4,"B_VPrefixPool");
+        ALLOC_ZERO_BUF(B_KCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*2,"B_KCache");
+        ALLOC_ZERO_BUF(B_VCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*2,"B_VCache");
+        ALLOC_ZERO_BUF(B_KPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*2,"B_KPrefixPool");
+        ALLOC_ZERO_BUF(B_VPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*2,"B_VPrefixPool");
         ALLOC_ZERO_BUF(B_KVUpdateConst[l],sizeof(AttnConst),"B_KVUpdateConst");
         ALLOC_ZERO_BUF(B_AttnRunConst[l],sizeof(AttnConst),"B_AttnRunConst");
     }
-    ALLOC_BUF(B_Hid,((VkDeviceSize)MAX_S*HDIM)*4,"B_Hid");
-    ALLOC_BUF(B_Hid2,((VkDeviceSize)MAX_S*HDIM)*4,"B_Hid2");
-    ALLOC_BUF(B_Qb,((VkDeviceSize)MAX_S*QDIM)*4,"B_Qb");
-    ALLOC_BUF(B_Kb,((VkDeviceSize)MAX_S*KVD)*4,"B_Kb");
-    ALLOC_BUF(B_Vb,((VkDeviceSize)MAX_S*KVD)*4,"B_Vb");
-    ALLOC_BUF(B_Sc,((VkDeviceSize)N_HD*MAX_S*MAX_S)*4,"B_Sc");
-    ALLOC_BUF(B_Att,((VkDeviceSize)MAX_S*QDIM)*4,"B_Att");
-    ALLOC_BUF(B_PrefillOAcc,((VkDeviceSize)MAX_S*QDIM)*4,"B_PrefillOAcc");
-    ALLOC_BUF(B_Gat,((VkDeviceSize)MAX_S*IDIM)*4,"B_Gat");
-    ALLOC_BUF(B_Up,((VkDeviceSize)MAX_S*IDIM)*4,"B_Up");
-    ALLOC_BUF(B_Dwn,((VkDeviceSize)MAX_S*IDIM)*4,"B_Dwn");
-    ALLOC_BUF(B_Tmp,((VkDeviceSize)MAX_S*HDIM)*4,"B_Tmp");
-    ALLOC_BUF(B_Q8In,((VkDeviceSize)MAX_S*((IDIM+31)/32)*9)*sizeof(uint32_t),"B_Q8In");
+    ALLOC_BUF(B_Hid,((VkDeviceSize)MAX_FORWARD_TOKENS*HDIM)*4,"B_Hid");
+    ALLOC_BUF(B_Hid2,((VkDeviceSize)MAX_FORWARD_TOKENS*HDIM)*4,"B_Hid2");
+    ALLOC_BUF(B_Qb,((VkDeviceSize)MAX_FORWARD_TOKENS*QDIM)*4,"B_Qb");
+    ALLOC_BUF(B_Kb,((VkDeviceSize)MAX_FORWARD_TOKENS*KVD)*4,"B_Kb");
+    ALLOC_BUF(B_Vb,((VkDeviceSize)MAX_FORWARD_TOKENS*KVD)*4,"B_Vb");
+    ALLOC_BUF(B_Sc,((VkDeviceSize)N_HD*MAX_FORWARD_TOKENS*(g_debug_correctness?HOST_KV_MAX_S:PREFILL_ATTN_BLOCK_TOKENS))*4,"B_Sc");
+    ALLOC_BUF(B_Att,((VkDeviceSize)MAX_FORWARD_TOKENS*QDIM)*4,"B_Att");
+    ALLOC_BUF(B_PrefillOAcc,((VkDeviceSize)MAX_FORWARD_TOKENS*QDIM)*4,"B_PrefillOAcc");
+    ALLOC_BUF(B_Gat,((VkDeviceSize)MAX_FORWARD_TOKENS*IDIM)*4,"B_Gat");
+    ALLOC_BUF(B_Up,((VkDeviceSize)MAX_FORWARD_TOKENS*IDIM)*4,"B_Up");
+    ALLOC_BUF(B_Dwn,((VkDeviceSize)MAX_FORWARD_TOKENS*IDIM)*4,"B_Dwn");
+    ALLOC_BUF(B_Tmp,((VkDeviceSize)MAX_FORWARD_TOKENS*HDIM)*4,"B_Tmp");
+    ALLOC_BUF(B_Q8In,((VkDeviceSize)MAX_FORWARD_TOKENS*((IDIM+31)/32)*9)*sizeof(uint32_t),"B_Q8In");
     ALLOC_BUF(B_Last,((VkDeviceSize)HDIM)*4,"B_Last");
     ALLOC_BUF(B_LogPart,((VkDeviceSize)HEAD_SHARD)*4,"B_LogPart");
     ALLOC_BUF(B_LmShardTopk,((VkDeviceSize)HEAD_SHARDS*LM_HEAD_LOCAL_TOPK*2)*4,"B_LmShardTopk");
@@ -1077,7 +1086,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
 #undef TRY_LOAD_Q8
 
 /* ---- Forward pass ---- */
-int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const int validation_stage=(flags&OSH26_FORWARD_VALIDATE_PREFILL)?1:((flags&OSH26_FORWARD_VALIDATE_FIRST_DECODE)?2:0);const bool correctness_check=g_debug_correctness&&validation_stage!=0;const bool debug_check=((flags&OSH26_FORWARD_DEBUG_CHECK)!=0);static int fc=0;if((correctness_check||debug_check)&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
+int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;if(!tokens||nt<=0||nt>MAX_FORWARD_TOKENS||pos<0||pos>MAX_S-nt){LOGE("forward range invalid nt=%d pos=%d max_context=%d",nt,pos,MAX_S);return -1;}const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const int validation_stage=(flags&OSH26_FORWARD_VALIDATE_PREFILL)?1:((flags&OSH26_FORWARD_VALIDATE_FIRST_DECODE)?2:0);const bool correctness_check=g_debug_correctness&&validation_stage!=0;const bool debug_check=((flags&OSH26_FORWARD_DEBUG_CHECK)!=0);const bool needs_cpu_attention=correctness_check||debug_check||!g_mnn_attention_enabled||g_attention_fallback_layers!=0;if(needs_cpu_attention&&B_KV.P==NULL){LOGE("CPU attention fallback is unavailable in the 8K fast configuration");return -1;}if(needs_cpu_attention&&pos>HOST_KV_MAX_S-nt){LOGE("CPU attention fallback supports at most %d tokens",HOST_KV_MAX_S);return -1;}static int fc=0;if((correctness_check||debug_check)&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
     if(pos==0){g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;g_last_lm_head_matched_logit_max_abs_err=0.0f;g_last_lm_head_top1_match=false;g_last_lm_head_top5_overlap=0;g_last_lm_head_top20_overlap=0;g_last_lm_head_cpu_top1_margin=0.0f;g_last_lm_head_validation_ms=0.0;g_last_ttft_submit_count=0;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));}
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
     if (nt > 1) {
@@ -1186,7 +1195,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
         }
 
         /* --- KV cache + attention --- */
-        { int kvo=l*2*MAX_S*KVD;bool att_on_host=false;bool att_done=false;const double kv_update_start_ms=now_ms();
+        { int kvo=l*2*HOST_KV_MAX_S*KVD;bool att_on_host=false;bool att_done=false;const double kv_update_start_ms=now_ms();
           if(nt>1 && !debug_check){
               AttnConst kc={{nt,nt,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+nt},{nt,pos+nt,2,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
               memcpy(B_KVUpdateConst[l].P,&kc,sizeof(kc));buf_flush(&B_KVUpdateConst[l]);
@@ -1209,7 +1218,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
                 if(!decode_grouped_layer)SubmitNoWait(cbk);
               }
           }else{
-              memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));memcpy(kv+kvo+MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));
+              memcpy(kv+kvo+pos*KVD,kb,nt*KVD*sizeof(float));memcpy(kv+kvo+HOST_KV_MAX_S*KVD+pos*KVD,vb,nt*KVD*sizeof(float));
               pack_mnn_kv_cache(l,pos,nt,kb,vb);
           }
           g_last_forward_kv_update_ms += now_ms()-kv_update_start_ms;
@@ -1265,7 +1274,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
          float mx=score_cpu[0];for(int s=1;s<slen;s++)if(score_cpu[s]>mx)mx=score_cpu[s];
          float sum_w=0;for(int s=0;s<slen;s++){float w=expf(score_cpu[s]-mx);sum_w+=w;score_cpu[s]=w;}
          for(int s=0;s<slen;s++)score_cpu[s]/=sum_w;
-         for(int s=0;s<slen;s++){float w=score_cpu[s];for(int d=0;d<HD;d++)att_cpu[d]+=w*kv[kvo+MAX_S*KVD+s*KVD+d];}
+         for(int s=0;s<slen;s++){float w=score_cpu[s];for(int d=0;d<HD;d++)att_cpu[d]+=w*kv[kvo+HOST_KV_MAX_S*KVD+s*KVD+d];}
          LOGI("D08 ATTN: gpu[0]=%.6f cpu[0]=%.6f err=%.2e",(double)att[0],(double)att_cpu[0],(double)fabsf(att[0]-att_cpu[0]));
          free(score_cpu);free(att_cpu);}
 

@@ -11,7 +11,7 @@ layout(set=0, binding=1) readonly buffer s1 {
 } uW;
 
 layout(set=0, binding=2) readonly buffer s2 {
-    FLOAT4 data[];
+    uint data[];
 } uCacheValue;
 
 layout(set=0, binding=3) readonly buffer s3 {
@@ -33,6 +33,11 @@ layout(push_constant) uniform PushConsts {
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 const int MAX_D4 = 64; // headDim <= 256
+
+vec4 loadCacheValue(int index) {
+    return vec4(unpackHalf2x16(uCacheValue.data[index * 2 + 0]),
+                unpackHalf2x16(uCacheValue.data[index * 2 + 1]));
+}
 
 void main() {
     const int d4 = int(gl_GlobalInvocationID.x);
@@ -104,25 +109,25 @@ void main() {
 
         if ((gk0 + 0) < totalLen) {
             const int vOff4 = ((kvh * maxLen + (gk0 + 0)) * d4Size) + d4;
-            vec4 v = vec4(uCacheValue.data[vOff4]);
+            vec4 v = loadCacheValue(vOff4);
             outVec0 += w0.x * v;
             if (q1Valid) outVec1 += w1.x * v;
         }
         if ((gk0 + 1) < totalLen) {
             const int vOff4 = ((kvh * maxLen + (gk0 + 1)) * d4Size) + d4;
-            vec4 v = vec4(uCacheValue.data[vOff4]);
+            vec4 v = loadCacheValue(vOff4);
             outVec0 += w0.y * v;
             if (q1Valid) outVec1 += w1.y * v;
         }
         if ((gk0 + 2) < totalLen) {
             const int vOff4 = ((kvh * maxLen + (gk0 + 2)) * d4Size) + d4;
-            vec4 v = vec4(uCacheValue.data[vOff4]);
+            vec4 v = loadCacheValue(vOff4);
             outVec0 += w0.z * v;
             if (q1Valid) outVec1 += w1.z * v;
         }
         if ((gk0 + 3) < totalLen) {
             const int vOff4 = ((kvh * maxLen + (gk0 + 3)) * d4Size) + d4;
-            vec4 v = vec4(uCacheValue.data[vOff4]);
+            vec4 v = loadCacheValue(vOff4);
             outVec0 += w0.w * v;
             if (q1Valid) outVec1 += w1.w * v;
         }

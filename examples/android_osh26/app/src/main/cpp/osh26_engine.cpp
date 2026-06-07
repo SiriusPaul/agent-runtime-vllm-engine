@@ -22,9 +22,9 @@
 namespace osh26 {
 namespace {
 
-constexpr int kDefaultContextSize = 1024;
+constexpr int kDefaultContextSize = 8192;
 constexpr int kDefaultBatchSize = 512;
-constexpr int kDefaultMaxSeq = 4;
+constexpr int kDefaultMaxSeq = 1;
 constexpr int kShortPrefillTokenLimit = 64;
 constexpr int kMediumPrefillTokenLimit = 256;
 constexpr int kShortPrefillChunkSize = 64;
@@ -170,7 +170,7 @@ std::string describe_osh26_vk_stats() {
         << "\"prefill_q8_enabled\":" << (stats.prefill_q8_enabled ? "true" : "false") << ","
         << "\"decode_q8_enabled\":" << (stats.decode_q8_enabled ? "true" : "false") << ","
         << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
-        << "\"mnn_kv_layout\":\"cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
+        << "\"mnn_kv_layout\":\"FP16 cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
         << "\"last_forward_submit_count\":" << stats.last_forward_submit_count << ","

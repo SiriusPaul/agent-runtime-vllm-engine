@@ -801,3 +801,68 @@ was `30.5 C` before and after the test.
 This is a short single-device validation rather than a statistically rigorous
 benchmark. It demonstrates a meaningful TTFT/TPS gain while preserving strict
 prefix correctness across exact-match and partially matching token sequences.
+
+## 2026-06-07 8K Context Device Validation
+
+The runtime context was increased from 1024 to 8192 tokens. The handwritten
+Vulkan path keeps native Q8_0 model weights and Q8 prefill/decode kernels.
+Only the generated K/V activation cache changed from F32 to packed FP16.
+Attention still unpacks K/V to F32 and accumulates in F32.
+
+Memory-related changes:
+
+- llama context: 8192 tokens, one active sequence
+- Vulkan packed K/V cache: 8192 tokens, FP16 storage
+- prefill execution: unchanged 128-token chunks
+- activation and temporary attention buffers: fixed to chunk capacity
+- CPU correctness fallback cache: allocated only in correctness mode
+
+The native Q8_0 model loaded successfully on the Redmi K40:
+
+- model: `/data/local/tmp/qwen3-0.6b-base-q8_0.gguf`
+- backend: `OSH26 GPU Runtime`
+- context: 8192
+- model load: `40244.7 ms`
+- `prefill_q8_enabled=true`
+- `decode_q8_enabled=true`
+- `prefix_cache_supported=true`
+
+### Short Output and Prefix Validation
+
+| Request | TTFT | TPS | Prefix hit | Reused tokens | Sanity |
+| --- | ---: | ---: | --- | ---: | --- |
+| Cold A | 1348.14 ms | 4.351 | no | 0 | ok |
+| Exact repeat A | 460.893 ms | 5.232 | yes | 64 | ok |
+| Late-suffix B | 765.017 ms | 4.584 | yes | 48 | ok |
+
+The cold and exact-repeat requests produced the same 24 output token IDs.
+The late-suffix request produced a distinct valid response. No logits sanity
+failure, attention fallback, malformed output, or Vulkan device loss occurred.
+
+### Beyond-1024 Context Validation
+
+A long request successfully prefetched 5488 user tokens in 43 chunks of 128
+tokens, then generated 8 tokens:
+
+- TTFT: `128142 ms`
+- end-to-end request time: `132695 ms`
+- finish reason: `length`
+- `last_logits_sanity_ok=true`
+- `last_error=""`
+
+This verifies that the runtime is genuinely operating beyond the previous
+1024-token boundary rather than only reporting a larger capacity. The base
+model did not follow the exact response instruction, but its output remained
+finite and syntactically valid.
+
+After the long-context run:
+
+- Total PSS: `6176756 KiB`
+- Total RSS: `6246704 KiB`
+- Graphics PSS: `3763928 KiB`
+- battery temperature: `34.5 C`
+
+The 8K capacity is functional, but long-context prefill is currently slow and
+memory use is close to the practical limit of this device. A 16K context would
+require another KV-memory reduction, paging inactive KV to host memory, or
+removing duplicate expanded model weights.

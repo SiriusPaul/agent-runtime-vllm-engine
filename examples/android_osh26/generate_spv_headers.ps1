@@ -79,6 +79,16 @@ Write-SpvHeader `
     -SymbolName "_tmp_mulmat_q8_w8a8_spv"
 
 Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/attention_decode_q1_subgroup.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/attn_decode_q1.spv.h" `
+    -SymbolName "_tmp_attn_decode_q1_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/attention_kvcache_update.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/attn_kvcache.spv.h" `
+    -SymbolName "_tmp_attn_kvcache_spv"
+
+Write-SpvHeader `
     -SourcePath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.comp" `
     -HeaderPath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_qk.spv.h" `
     -SymbolName "_tmp_attention_prefill_kblock_qk_spv"

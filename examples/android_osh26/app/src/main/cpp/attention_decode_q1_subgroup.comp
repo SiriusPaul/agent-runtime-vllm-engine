@@ -21,11 +21,11 @@ layout(set=0, binding=3) readonly buffer s3 {
 } uValue;
 
 layout(set=0, binding=4) readonly buffer s4 {
-    FLOAT4 data[];
+    uint data[];
 } uCacheKey;
 
 layout(set=0, binding=5) readonly buffer s5 {
-    FLOAT4 data[];
+    uint data[];
 } uCacheValue;
 
 layout(set=0, binding=6) readonly buffer s6 {
@@ -44,6 +44,16 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 const int MAX_D4 = 64; // headDim <= 256
 const float NEG_INF = -3.402823466e38;
 shared vec4 sQuery[MAX_D4];
+
+vec4 loadCacheKey(int index) {
+    return vec4(unpackHalf2x16(uCacheKey.data[index * 2 + 0]),
+                unpackHalf2x16(uCacheKey.data[index * 2 + 1]));
+}
+
+vec4 loadCacheValue(int index) {
+    return vec4(unpackHalf2x16(uCacheValue.data[index * 2 + 0]),
+                unpackHalf2x16(uCacheValue.data[index * 2 + 1]));
+}
 
 void main() {
     const int h = int(gl_WorkGroupID.x);
@@ -108,7 +118,7 @@ void main() {
         float dotSum = 0.0;
         for (int i = 0; i < d4Size; ++i) {
             const int kOff = (kvh * d4Size + i) * maxLen + k;
-            vec4 kv = vec4(uCacheKey.data[kOff]);
+            vec4 kv = loadCacheKey(kOff);
             dotSum += dot(sQuery[i], kv);
         }
         float score = dotSum * scale;
@@ -137,7 +147,7 @@ void main() {
 
         const int vBase = (kvh * maxLen + k) * d4Size;
         for (int i = 0; i < d4Size; ++i) {
-            vec4 vv = vec4(uCacheValue.data[vBase + i]);
+            vec4 vv = loadCacheValue(vBase + i);
             outVec[i] += w * vv;
         }
     }
