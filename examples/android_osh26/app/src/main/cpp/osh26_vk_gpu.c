@@ -58,6 +58,8 @@
 #define LM_HEAD_TOP1_MARGIN_REQUIRED 1.0e-3f
 #define SUBMIT_POOL_CAP 512
 #define F32(n) ((VkDeviceSize)(n)*4)
+#define PREFIX_PAGE_TOKENS OSH26_VK_PREFIX_CACHE_PAGE_TOKENS
+#define PREFIX_POOL_PAGES OSH26_VK_PREFIX_CACHE_POOL_PAGES
 
 /* Individual buffer (MNN-style: each tensor gets own VkBuffer, offset always 0) */
 typedef struct { VkBuffer B; VkDeviceMemory M; float *P; VkDeviceSize size; } VkBuf;
@@ -92,6 +94,7 @@ static VkBuf W_Fnorm,W_HeadShard[HEAD_SHARDS]; static float *Emb;
 /* Activation buffers */
 static VkBuf B_KV,B_Hid,B_Hid2,B_Qb,B_Kb,B_Vb,B_Sc,B_Att,B_PrefillOAcc,B_Gat,B_Up,B_Dwn,B_Tmp,B_Q8In,B_Last,B_LogPart,B_LmShardTopk,B_LmTopk;
 static VkBuf B_KCache[N_LAY],B_VCache[N_LAY],B_AttnConst,B_KVConst;
+static VkBuf B_KPrefixPool[N_LAY],B_VPrefixPool[N_LAY];
 static VkBuf B_KVUpdateConst[N_LAY],B_AttnRunConst[N_LAY];
 
 static VkInstance V;static VkQueue Q;static VkCommandPool CP;static VkDescriptorPool DP,DP_Lm;
@@ -625,6 +628,40 @@ static void pack_mnn_kv_cache(int l,int pos,int nt,const float*kb,const float*vb
     buf_flush(&B_KCache[l]);buf_flush(&B_VCache[l]);
 }
 
+static bool prefix_page_args_valid(int page_slot,int token){
+    return mdl_ok
+        && page_slot >= 0
+        && page_slot < PREFIX_POOL_PAGES
+        && token >= 0
+        && token + PREFIX_PAGE_TOKENS <= MAX_S
+        && B_KPrefixPool[0].P != NULL
+        && B_VPrefixPool[0].P != NULL;
+}
+
+static size_t kcache_vec_offset(int kvh,int d4,int token,int stride){
+    return (size_t)(((kvh*(HD/4)+d4)*stride+token)*4);
+}
+
+static size_t vcache_vec_offset(int kvh,int token,int d4,int stride){
+    return (size_t)(((kvh*stride+token)*(HD/4)+d4)*4);
+}
+
+static void copy_packed_kv_page(VkBuf *dst_k,VkBuf *dst_v,int dst_token,int dst_stride,const VkBuf *src_k,const VkBuf *src_v,int src_token,int src_stride){
+    const int d4s=HD/4;
+    for(int kvh=0;kvh<N_KVH;kvh++){
+        for(int d4=0;d4<d4s;d4++){
+            float *dk=dst_k->P+kcache_vec_offset(kvh,d4,dst_token,dst_stride);
+            const float *sk=src_k->P+kcache_vec_offset(kvh,d4,src_token,src_stride);
+            memcpy(dk,sk,(size_t)PREFIX_PAGE_TOKENS*4*sizeof(float));
+        }
+        for(int t=0;t<PREFIX_PAGE_TOKENS;t++){
+            float *dv=dst_v->P+vcache_vec_offset(kvh,dst_token+t,0,dst_stride);
+            const float *sv=src_v->P+vcache_vec_offset(kvh,src_token+t,0,src_stride);
+            memcpy(dv,sv,(size_t)d4s*4*sizeof(float));
+        }
+    }
+}
+
 static void cpu_attention_ref(int nt,int pos,int l,const float*qb,const float*kv,float*sc,float*out){
     int kvo=l*2*MAX_S*KVD;
     int slen=pos+nt;
@@ -1008,6 +1045,8 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     for(int l=0;l<N_LAY;l++){
         ALLOC_ZERO_BUF(B_KCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_KCache");
         ALLOC_ZERO_BUF(B_VCache[l],((VkDeviceSize)N_KVH*HD*MAX_S)*4,"B_VCache");
+        ALLOC_ZERO_BUF(B_KPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*4,"B_KPrefixPool");
+        ALLOC_ZERO_BUF(B_VPrefixPool[l],((VkDeviceSize)N_KVH*HD*PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS)*4,"B_VPrefixPool");
         ALLOC_ZERO_BUF(B_KVUpdateConst[l],sizeof(AttnConst),"B_KVUpdateConst");
         ALLOC_ZERO_BUF(B_AttnRunConst[l],sizeof(AttnConst),"B_AttnRunConst");
     }
@@ -2085,6 +2124,14 @@ int osh26_vk_gpu_collect_topk(struct osh26_vk_candidate *out, int max_out){
     return n;
 }
 bool osh26_vk_gpu_ready(void){return vk_ok&&mdl_ok;}
+
+bool osh26_vk_gpu_prefix_cache_supported(void){
+    if(!vk_ok||!mdl_ok)return false;
+    if(!g_mnn_attention_enabled||!g_mnn_prefill_attention_enabled)return false;
+    if(g_debug_correctness||g_attention_fallback_layers!=0)return false;
+    return B_KPrefixPool[0].P!=NULL&&B_VPrefixPool[0].P!=NULL;
+}
+
 int osh26_vk_gpu_reset_cache(void){
     if (!vk_ok) {
         return 0;
@@ -2101,13 +2148,67 @@ int osh26_vk_gpu_reset_cache(void){
     }
     return 0;
 }
+
+int osh26_vk_gpu_prefix_cache_store_page(int page_slot,int src_token){
+    pthread_mutex_lock(&Mtx);
+    if(!osh26_vk_gpu_prefix_cache_supported()||!prefix_page_args_valid(page_slot,src_token)){
+        pthread_mutex_unlock(&Mtx);
+        return -1;
+    }
+    const int pool_stride=PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS;
+    const int pool_token=page_slot*PREFIX_PAGE_TOKENS;
+    for(int l=0;l<N_LAY;l++){
+        copy_packed_kv_page(&B_KPrefixPool[l],&B_VPrefixPool[l],pool_token,pool_stride,&B_KCache[l],&B_VCache[l],src_token,MAX_S);
+        buf_flush(&B_KPrefixPool[l]);
+        buf_flush(&B_VPrefixPool[l]);
+    }
+    pthread_mutex_unlock(&Mtx);
+    return 0;
+}
+
+int osh26_vk_gpu_prefix_cache_restore_page(int page_slot,int dst_token){
+    pthread_mutex_lock(&Mtx);
+    if(!osh26_vk_gpu_prefix_cache_supported()||!prefix_page_args_valid(page_slot,dst_token)){
+        pthread_mutex_unlock(&Mtx);
+        return -1;
+    }
+    const int pool_stride=PREFIX_POOL_PAGES*PREFIX_PAGE_TOKENS;
+    const int pool_token=page_slot*PREFIX_PAGE_TOKENS;
+    for(int l=0;l<N_LAY;l++){
+        copy_packed_kv_page(&B_KCache[l],&B_VCache[l],dst_token,MAX_S,&B_KPrefixPool[l],&B_VPrefixPool[l],pool_token,pool_stride);
+        buf_flush(&B_KCache[l]);
+        buf_flush(&B_VCache[l]);
+    }
+    pthread_mutex_unlock(&Mtx);
+    return 0;
+}
+
+int osh26_vk_gpu_prefix_cache_clear(void){
+    if(!vk_ok){
+        return 0;
+    }
+    pthread_mutex_lock(&Mtx);
+    for(int l=0;l<N_LAY;l++){
+        if(B_KPrefixPool[l].P!=NULL){
+            memset(B_KPrefixPool[l].P,0,(size_t)B_KPrefixPool[l].size);
+            buf_flush(&B_KPrefixPool[l]);
+        }
+        if(B_VPrefixPool[l].P!=NULL){
+            memset(B_VPrefixPool[l].P,0,(size_t)B_VPrefixPool[l].size);
+            buf_flush(&B_VPrefixPool[l]);
+        }
+    }
+    pthread_mutex_unlock(&Mtx);
+    return 0;
+}
+
 void osh26_vk_gpu_free(void){
     if(DP_Lm)vkResetDescriptorPool(D,DP_Lm,0);DS_LmLocal=VK_NULL_HANDLE;DS_LmMerge=VK_NULL_HANDLE;
     buf_free(&B_LmTopk);buf_free(&B_LmShardTopk);buf_free(&B_LogPart);buf_free(&B_Last);buf_free(&B_Q8In);buf_free(&B_Tmp);buf_free(&B_Dwn);buf_free(&B_Up);buf_free(&B_Gat);
     buf_free(&B_PrefillOAcc);buf_free(&B_Att);buf_free(&B_Sc);buf_free(&B_Vb);buf_free(&B_Kb);buf_free(&B_Qb);
     buf_free(&B_Hid2);buf_free(&B_Hid);buf_free(&B_KV);
     buf_free(&B_KVConst);buf_free(&B_AttnConst);
-    for(int l=0;l<N_LAY;l++){buf_free(&B_AttnRunConst[l]);buf_free(&B_KVUpdateConst[l]);buf_free(&B_VCache[l]);buf_free(&B_KCache[l]);}
+    for(int l=0;l<N_LAY;l++){buf_free(&B_AttnRunConst[l]);buf_free(&B_KVUpdateConst[l]);buf_free(&B_VPrefixPool[l]);buf_free(&B_KPrefixPool[l]);buf_free(&B_VCache[l]);buf_free(&B_KCache[l]);}
     for(int s=0;s<HEAD_SHARDS;s++)buf_free(&W_HeadShard[s]);
     buf_free(&W_Fnorm);
     for(int l=0;l<N_LAY;l++){buf_free(&WQ_Down[l]);buf_free(&WQ_Up[l]);buf_free(&WQ_Gate[l]);buf_free(&WQ_O[l]);buf_free(&WQ_V[l]);buf_free(&WQ_K[l]);buf_free(&WQ_Q[l]);buf_free(&W_Down[l]);buf_free(&W_Up[l]);buf_free(&W_Gate[l]);buf_free(&W_rf[l]);buf_free(&W_Kn[l]);buf_free(&W_Qn[l]);buf_free(&W_O[l]);buf_free(&W_V[l]);buf_free(&W_K[l]);buf_free(&W_Q[l]);buf_free(&W_ra[l]);}

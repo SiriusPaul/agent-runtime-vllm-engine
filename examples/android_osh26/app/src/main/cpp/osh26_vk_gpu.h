@@ -70,6 +70,9 @@ struct osh26_vk_candidate {
     float logit;
 };
 
+#define OSH26_VK_PREFIX_CACHE_PAGE_TOKENS 16
+#define OSH26_VK_PREFIX_CACHE_POOL_PAGES 16
+
 typedef enum osh26_vk_forward_flags {
     OSH26_FORWARD_NEED_LOGITS = 1u << 0,
     OSH26_FORWARD_PREFILL_ONLY = 1u << 1,
@@ -90,6 +93,10 @@ int osh26_vk_gpu_quant_gemm_benchmark(char * out_json, size_t out_size);
 int osh26_vk_gpu_q8_gemm_benchmark(char * out_json, size_t out_size);
 bool osh26_vk_gpu_ready(void);
 int osh26_vk_gpu_reset_cache(void);
+bool osh26_vk_gpu_prefix_cache_supported(void);
+int osh26_vk_gpu_prefix_cache_store_page(int page_slot, int src_token);
+int osh26_vk_gpu_prefix_cache_restore_page(int page_slot, int dst_token);
+int osh26_vk_gpu_prefix_cache_clear(void);
 void osh26_vk_gpu_free(void);
 int osh26_vk_get_stats(struct osh26_vk_stats * out);
 void osh26_vk_gpu_set_debug_correctness(bool enabled);

@@ -736,3 +736,68 @@ Native Q8 therefore preserves the approximately `0.7-0.84 s` TTFT achieved by
 the converted Q8 path while reducing startup time substantially. The remaining
 deployment task is removing F32-expanded projection weights by adding a native
 Q8 decode GEMV path or separating prefill and decode weight ownership.
+
+## 2026-06-07 Paged Prefix KV Cache Device Validation
+
+Test environment:
+
+- device: Redmi K40 (`alioth`), Snapdragon 870 / Adreno 650, Android 13
+- model: `/data/local/tmp/qwen3-0.6b.gguf`, F16 Qwen3 0.6B
+- backend: OSH26 Vulkan GPU runtime
+- generation: greedy (`temperature=0`), maximum 16 output tokens
+- prefix cache: strict token-by-token matching, 16-token pages, 16-page pool
+- packed MNN attention enabled with zero fallback layers
+
+The first request used a fixed cache description followed by Question A. The
+second request repeated it exactly. The third retained the opening context but
+changed the late prompt suffix to Question B.
+
+| Request | Wall time | TTFT | TPS | Cache hit | Reused tokens | User prefill | Restore | Store |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| Cold Question A | 5222.0 ms | 1902.63 ms | 3.383 | no | 0 | 97 | 0 ms | 337.109 ms |
+| Exact repeat A | 3845.6 ms | 613.658 ms | 4.734 | yes | 96 | 1 | 353.935 ms | unchanged |
+| Shared-prefix B | 4585.9 ms | 1288.87 ms | 3.891 | yes | 64 | 34 | 238.003 ms | 339.168 ms |
+
+Compared with the cold request, the exact repeat reduced TTFT by `67.7%`
+(`3.10x`) and increased TPS by `39.9%` (`1.40x`). The late-suffix variant
+reduced TTFT by `32.3%` (`1.48x`) and increased TPS by `15.0%`.
+
+### Prefix Correctness Checks
+
+The cold and exact-repeat Question A requests produced identical text and the
+same 16 output token IDs:
+
+`151667,271,151668,271,785,1887,57323,5912,374,429,279,1590,9934,3950,374,37201`
+
+The late-suffix Question B request reused only 64 matching input tokens and
+produced a distinct, relevant answer:
+
+`Strict prefix equality is important because it ensures that the model's`
+
+Its output token IDs were:
+
+`151667,271,151668,271,41857,9252,21777,374,2989,1576,432,25351,429,279,1614,594`
+
+All three requests reported `last_logits_sanity_ok=true`, with no device loss,
+attention fallback, malformed output, or repeated-token degeneration. This
+confirms that the differing suffix was evaluated rather than incorrectly
+restored from the cached prefix.
+
+### Cache, Memory, and Thermal State
+
+Final cache statistics:
+
+- hits: 2; misses: 1; hit ratio: `0.666667`
+- reused tokens: 160 across 10 pages
+- entries: 2; used pages: 12; free pages: 4
+- evictions: 0
+- prefill Q8 and decode Q8 both enabled
+
+Process memory increased from `5763820 KiB` to `5794442 KiB` Total PSS and
+from `5829252 KiB` to `5861828 KiB` Total RSS across the three requests. This
+is approximately `29.9 MiB` PSS and `31.8 MiB` RSS growth. Battery temperature
+was `30.5 C` before and after the test.
+
+This is a short single-device validation rather than a statistically rigorous
+benchmark. It demonstrates a meaningful TTFT/TPS gain while preserving strict
+prefix correctness across exact-match and partially matching token sequences.

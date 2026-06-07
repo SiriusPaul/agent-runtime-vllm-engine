@@ -228,7 +228,7 @@ void call_complete_callback(jobject callback, const std::string & text, const st
 
 osh26::GenerateOptions options_from_args(jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
     osh26::GenerateOptions options;
-    options.max_tokens = max_tokens > 0 ? max_tokens : 128;
+    options.max_tokens = max_tokens > 0 ? max_tokens : 2048;
     options.temperature = temperature > 0.0f ? temperature : 0.6f;
     options.top_p = top_p > 0.0f ? top_p : 0.95f;
     options.seed = seed > 0 ? (uint32_t) seed : 0xCAFE;

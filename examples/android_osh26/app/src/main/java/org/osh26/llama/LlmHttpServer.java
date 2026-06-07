@@ -231,7 +231,7 @@ public final class LlmHttpServer {
     private void handleChatCompletion(String body, OutputStream writer) throws Exception {
         JSONObject request = new JSONObject(body);
         String prompt = messagesToPrompt(request.optJSONArray("messages"));
-        int maxTokens = request.optInt("max_tokens", 128);
+        int maxTokens = request.optInt("max_tokens", 2048);
         float temperature = (float) request.optDouble("temperature", 0.6);
         float topP = (float) request.optDouble("top_p", 0.95);
         int seed = request.optInt("seed", 0xCAFE);

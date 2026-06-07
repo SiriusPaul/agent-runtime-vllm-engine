@@ -179,7 +179,7 @@ public class MainActivity extends Activity {
                                 refreshStatsAsync();
                             });
                         }
-                    }, 128, 0.6f, 0.95f, 0xCAFE, false);
+                    }, 2048, 0.6f, 0.95f, 0xCAFE, false);
                     runOnUiThread(() -> appendSystemLine(status));
                 } catch (Throwable t) {
                     Log.e(TAG, "generateStream failed", t);

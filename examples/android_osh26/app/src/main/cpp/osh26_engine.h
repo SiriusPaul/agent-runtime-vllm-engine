@@ -20,7 +20,7 @@ namespace osh26 {
 using TokenCallback = std::function<void(const std::string &)>;
 
 struct GenerateOptions {
-    int max_tokens = 128;
+    int max_tokens = 2048;
     float temperature = 0.6f;
     float top_p = 0.95f;
     uint32_t seed = 0xCAFE;
@@ -69,6 +69,15 @@ private:
         llama_token token = 0;
         bool terminal = false;
         size_t token_count = 0;
+        std::vector<int> page_slots;
+        size_t hit_count = 0;
+        size_t request_count = 0;
+        uint64_t last_used_tick = 0;
+    };
+
+    struct PrefixCacheEntry {
+        std::vector<llama_token> tokens;
+        std::vector<int> page_slots;
         size_t hit_count = 0;
         size_t request_count = 0;
         uint64_t last_used_tick = 0;
@@ -105,7 +114,11 @@ private:
     std::string build_prompt_prefix() const;
     bool warm_prefix_cache_locked();
     void start_prefix_warmup_async_locked();
-    bool prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const;
+    PrefixCacheEntry * find_best_prefix_cache_match_locked(
+        const std::vector<llama_token> & prompt_tokens,
+        size_t * reusable_tokens);
+    size_t best_cached_prefix_tokens_locked(const std::vector<llama_token> & prompt_tokens) const;
+    bool restore_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens, int * restored_tokens);
     size_t common_prefix_length(const std::vector<llama_token> & lhs, const std::vector<llama_token> & rhs) const;
     std::shared_ptr<GenerationRequest> enqueue_request(
         const std::string & prompt,
@@ -126,7 +139,10 @@ private:
     PrefixCacheNode * ensure_prefix_node_locked(const std::vector<llama_token> & tokens);
     PrefixCacheNode * find_prefix_node_locked(const std::vector<llama_token> & tokens) const;
     void touch_prefix_node_locked(PrefixCacheNode * node);
+    bool evict_one_prefix_cache_entry_locked();
     void evict_prefix_cache_locked();
+    void clear_prefix_cache_node_locked(PrefixCacheNode * node);
+    void init_prefix_cache_page_slots_locked();
     size_t prefix_cache_entry_count_locked() const;
     size_t prefix_cache_token_count_locked() const;
     double prefix_cache_fragmentation_locked() const;
@@ -150,6 +166,9 @@ private:
     std::vector<llama_token> boot_prefix_tokens_;
     PrefixCacheNode prefix_cache_root_;
     std::list<PrefixCacheNode *> prefix_cache_lru_;
+    std::list<PrefixCacheEntry> prefix_cache_entries_;
+    std::vector<int> prefix_cache_free_page_slots_;
+    uint64_t prefix_cache_tick_ = 0;
     size_t prefix_cache_entry_count_ = 0;
     size_t prefix_cache_token_count_ = 0;
     size_t prefix_cache_evictions_ = 0;
@@ -158,8 +177,10 @@ private:
     size_t prefix_cache_reuse_tokens_ = 0;
     size_t prefix_cache_block_reuse_ = 0;
     size_t prefix_cache_block_size_ = 16;
-    size_t max_prefix_cache_entries_ = 32;
-    size_t max_prefix_cache_tokens_ = 256;
+    size_t max_prefix_cache_entries_ = 16;
+    size_t max_prefix_cache_tokens_ = 128;
+    size_t prefix_cache_pool_pages_ = 16;
+    size_t prefix_cache_used_pages_ = 0;
     size_t max_pending_requests_ = 8;
     size_t queue_depth_peak_ = 0;
     size_t total_submitted_requests_ = 0;
@@ -206,6 +227,8 @@ private:
     double last_first_decode_ms_ = 0.0;
     size_t last_reusable_prefix_tokens_ = 0;
     size_t last_cached_prefix_entries_ = 0;
+    double last_prefix_restore_ms_ = 0.0;
+    double last_prefix_store_ms_ = 0.0;
     bool last_logits_sanity_ok_ = true;
     int last_logits_whitespace_streak_ = 0;
     int last_logits_same_token_streak_ = 0;

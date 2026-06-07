@@ -1,4 +1,5 @@
 #include "osh26_engine.h"
+#include "osh26_prefix_cache_policy.h"
 #include "osh26_vk_gpu.h"
 
 #include <android/log.h>
@@ -30,7 +31,38 @@ constexpr int kShortPrefillChunkSize = 64;
 constexpr int kLongPrefillChunkSize = 128;
 constexpr int kGpuTopkCandidateCount = 32;
 constexpr int kGpuGuardTokenCount = 3;
-constexpr bool kEnablePrefixCache = false;
+constexpr bool kEnablePrefixCache = true;
+constexpr int kPrefixCachePageTokens = OSH26_VK_PREFIX_CACHE_PAGE_TOKENS;
+constexpr int kPrefixCachePoolPages = OSH26_VK_PREFIX_CACHE_POOL_PAGES;
+
+template <size_t N>
+constexpr std::array<int, N> prefix_policy_seq(int base = 1000) {
+    std::array<int, N> out {};
+    for (size_t i = 0; i < N; ++i) {
+        out[i] = base + (int) i;
+    }
+    return out;
+}
+
+template <size_t N>
+constexpr std::array<int, N> prefix_policy_seq_with_delta(size_t index, int delta) {
+    auto out = prefix_policy_seq<N>();
+    if (index < N) {
+        out[index] += delta;
+    }
+    return out;
+}
+
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<33>(), std::array<int, 0>{}, 0, kPrefixCachePageTokens) == 0);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<33>(), prefix_policy_seq<33>(), 2, kPrefixCachePageTokens) == 32);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<32>(), prefix_policy_seq<32>(), 2, kPrefixCachePageTokens) == 16);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq_with_delta<40>(20, 10000), prefix_policy_seq<40>(), 2, kPrefixCachePageTokens) == 16);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq_with_delta<40>(8, 10000), prefix_policy_seq<40>(), 2, kPrefixCachePageTokens) == 0);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq_with_delta<48>(40, 10000), prefix_policy_seq<48>(), 3, kPrefixCachePageTokens) == 32);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<16>(), prefix_policy_seq<16>(), 1, kPrefixCachePageTokens) == 0);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<41>(), prefix_policy_seq<80>(), 5, kPrefixCachePageTokens) == 32);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<80>(), prefix_policy_seq<80>(), 3, kPrefixCachePageTokens) == 48);
+static_assert(reusable_paged_prefix_tokens(prefix_policy_seq<40>(2000), prefix_policy_seq<40>(3000), 2, kPrefixCachePageTokens) == 0);
 
 std::once_flag g_backend_once;
 
@@ -455,14 +487,100 @@ std::string ComputeBackend::build_prompt_prefix() const {
            "<|im_start|>user\n";
 }
 
-bool ComputeBackend::prompt_has_cached_prefix(const std::vector<llama_token> & prompt_tokens) const {
-    if (!kEnablePrefixCache) {
+ComputeBackend::PrefixCacheEntry * ComputeBackend::find_best_prefix_cache_match_locked(
+        const std::vector<llama_token> & prompt_tokens,
+        size_t * reusable_tokens) {
+    if (reusable_tokens != nullptr) {
+        *reusable_tokens = 0;
+    }
+    if (!kEnablePrefixCache || prompt_tokens.size() <= 1 || prefix_cache_entries_.empty()) {
+        return nullptr;
+    }
+
+    PrefixCacheEntry * best = nullptr;
+    size_t best_tokens = 0;
+    for (auto & entry : prefix_cache_entries_) {
+        if (entry.page_slots.empty() || entry.tokens.empty()) {
+            continue;
+        }
+        const size_t reusable = reusable_paged_prefix_tokens(
+            prompt_tokens, entry.tokens, entry.page_slots.size(), prefix_cache_block_size_);
+        if (reusable > best_tokens) {
+            best = &entry;
+            best_tokens = reusable;
+        }
+    }
+    if (reusable_tokens != nullptr) {
+        *reusable_tokens = best_tokens;
+    }
+    return best_tokens > 0 ? best : nullptr;
+}
+
+size_t ComputeBackend::best_cached_prefix_tokens_locked(const std::vector<llama_token> & prompt_tokens) const {
+    if (!kEnablePrefixCache || prompt_tokens.size() <= 1 || prefix_cache_entries_.empty()) {
+        return 0;
+    }
+
+    size_t best_tokens = 0;
+    for (const auto & entry : prefix_cache_entries_) {
+        if (entry.page_slots.empty() || entry.tokens.empty()) {
+            continue;
+        }
+        const size_t reusable = reusable_paged_prefix_tokens(
+            prompt_tokens, entry.tokens, entry.page_slots.size(), prefix_cache_block_size_);
+        best_tokens = std::max(best_tokens, reusable);
+    }
+    return best_tokens;
+}
+
+bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens, int * restored_tokens) {
+    if (restored_tokens != nullptr) {
+        *restored_tokens = 0;
+    }
+    if (!kEnablePrefixCache || debug_correctness_ || requested_backend_ != "vulkan" || !osh26_vk_gpu_prefix_cache_supported()) {
         return false;
     }
-    if (!prefix_cache_valid_ || prefix_tokens_.empty() || prompt_tokens.size() < prefix_tokens_.size()) {
+
+    size_t reusable_tokens = 0;
+    PrefixCacheEntry * entry = find_best_prefix_cache_match_locked(prompt_tokens, &reusable_tokens);
+    if (entry == nullptr || reusable_tokens == 0) {
+        prefix_cache_misses_ += 1;
         return false;
     }
-    return std::equal(prefix_tokens_.begin(), prefix_tokens_.end(), prompt_tokens.begin());
+
+    const auto restore_start = std::chrono::steady_clock::now();
+    const size_t restore_pages = reusable_tokens / prefix_cache_block_size_;
+    for (size_t page = 0; page < restore_pages; ++page) {
+        const int dst_token = static_cast<int>(page * prefix_cache_block_size_);
+        if (osh26_vk_gpu_prefix_cache_restore_page(entry->page_slots[page], dst_token) != 0) {
+            last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - restore_start).count();
+            prefix_cache_misses_ += 1;
+            return false;
+        }
+    }
+
+    last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - restore_start).count();
+    entry->hit_count += 1;
+    entry->last_used_tick = ++prefix_cache_tick_;
+    for (auto it = prefix_cache_entries_.begin(); it != prefix_cache_entries_.end(); ++it) {
+        if (&(*it) == entry) {
+            prefix_cache_entries_.splice(prefix_cache_entries_.begin(), prefix_cache_entries_, it);
+            entry = &prefix_cache_entries_.front();
+            break;
+        }
+    }
+    prefix_cache_hits_ += 1;
+    prefix_cache_reuse_tokens_ += reusable_tokens;
+    prefix_cache_block_reuse_ += restore_pages;
+    last_prefix_cache_hit_ = true;
+    last_prefix_tokens_ = static_cast<int>(reusable_tokens);
+    last_reusable_prefix_tokens_ = reusable_tokens;
+    if (restored_tokens != nullptr) {
+        *restored_tokens = static_cast<int>(reusable_tokens);
+    }
+    return true;
 }
 
 void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
@@ -492,95 +610,31 @@ void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
         prefix_cache_block_reuse_ = 0;
         prefix_cache_root_ = PrefixCacheNode{};
         prefix_cache_lru_.clear();
+        prefix_cache_entries_.clear();
+        prefix_cache_free_page_slots_.clear();
+        prefix_cache_used_pages_ = 0;
+        prefix_cache_tick_ = 0;
+        osh26_vk_gpu_prefix_cache_clear();
         last_prefix_cache_hit_ = false;
         last_prefix_tokens_ = 0;
         last_reusable_prefix_tokens_ = 0;
         last_cached_prefix_entries_ = 0;
+        last_prefix_restore_ms_ = 0.0;
+        last_prefix_store_ms_ = 0.0;
     }
 }
 
 bool ComputeBackend::warm_prefix_cache_locked() {
-    if (!kEnablePrefixCache) {
-        return false;
-    }
-    if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
-        return false;
-    }
-    if (prefix_cache_valid_) {
-        return true;
-    }
-
-    const std::string prefix = build_prompt_prefix();
-    const llama_vocab * vocab = llama_model_get_vocab(model_);
-    const int n_prefix = -llama_tokenize(vocab, prefix.c_str(), (int32_t) prefix.size(), nullptr, 0, true, true);
-    if (n_prefix <= 0 || n_prefix >= kDefaultContextSize) {
-        return false;
-    }
-
-    std::vector<llama_token> tokens((size_t) n_prefix);
-    if (llama_tokenize(vocab, prefix.c_str(), (int32_t) prefix.size(), tokens.data(), n_prefix, true, true) < 0) {
-        return false;
-    }
-
-    if (osh26_vk_gpu_forward_ex((int *) tokens.data(), n_prefix, 0, OSH26_FORWARD_PREFILL_ONLY) != 0) {
-        __android_log_write(ANDROID_LOG_WARN, "OSH26GPU", "prefix cache warmup failed");
-        return false;
-    }
-
-    prefix_tokens_ = std::move(tokens);
-    prefix_cached_pos_ = n_prefix;
-    prefix_cache_valid_ = true;
-    prefix_cache_entry_count_ = std::max<size_t>(prefix_cache_entry_count_, 1);
-    prefix_cache_token_count_ = std::max<size_t>(prefix_cache_token_count_, (size_t) n_prefix);
-    last_cached_prefix_entries_ = prefix_cache_entry_count_;
-    __android_log_print(ANDROID_LOG_INFO, "OSH26GPU", "prefix cache warmed tokens=%d", n_prefix);
-    return true;
+    return false;
 }
 
 void ComputeBackend::start_prefix_warmup_async_locked() {
-    if (!kEnablePrefixCache) {
-        return;
-    }
-    if (model_ == nullptr || ctx_ == nullptr || requested_backend_ != "vulkan" || debug_correctness_ || !osh26_vk_gpu_ready()) {
-        return;
-    }
-    if (prefix_cache_valid_ || prefix_warm_thread_running_) {
-        return;
-    }
-
-    // Keep Vulkan load stable for now; the async warmup path is exercised after the
-    // prefill fast path is validated on-device.
-    return;
-
-    prefix_warm_thread_running_ = true;
     last_prefix_warm_ms_ = 0.0;
-    prefix_warm_thread_ = std::thread([this] {
-        const auto warm_start = std::chrono::steady_clock::now();
-        bool warmed = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (model_ != nullptr && ctx_ != nullptr && requested_backend_ == "vulkan" && !debug_correctness_ && osh26_vk_gpu_ready()) {
-                warmed = warm_prefix_cache_locked();
-                if (warmed) {
-                    last_prefix_warm_ms_ = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - warm_start).count();
-                } else {
-                    last_prefix_warm_ms_ = 0.0;
-                }
-            }
-            prefix_warm_thread_running_ = false;
-        }
-    });
-    prefix_warm_thread_.detach();
+    prefix_warm_thread_running_ = false;
 }
 
 size_t ComputeBackend::common_prefix_length(const std::vector<llama_token> & lhs, const std::vector<llama_token> & rhs) const {
-    const size_t limit = std::min(lhs.size(), rhs.size());
-    size_t n = 0;
-    while (n < limit && lhs[n] == rhs[n]) {
-        ++n;
-    }
-    return n;
+    return strict_common_prefix_tokens(lhs, rhs);
 }
 
 std::shared_ptr<ComputeBackend::GenerationRequest> ComputeBackend::enqueue_request(
@@ -650,30 +704,72 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
     if (!kEnablePrefixCache) {
         return;
     }
-    const size_t prefix_len = std::min(prompt_tokens.size(), max_prefix_cache_tokens_);
+    if (debug_correctness_ || requested_backend_ != "vulkan" || !osh26_vk_gpu_prefix_cache_supported()) {
+        return;
+    }
+    if (prompt_tokens.size() <= 1) {
+        return;
+    }
+    init_prefix_cache_page_slots_locked();
+
+    const size_t prefix_cap = std::min(max_prefix_cache_tokens_, prompt_tokens.size() - 1);
+    const size_t prefix_len = (prefix_cap / prefix_cache_block_size_) * prefix_cache_block_size_;
     if (prefix_len == 0) {
         return;
     }
-    PrefixCacheNode * node = ensure_prefix_node_locked(std::vector<llama_token>(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len));
-    if (node == nullptr) {
+    const size_t page_count = prefix_len / prefix_cache_block_size_;
+    if (page_count == 0 || page_count > prefix_cache_pool_pages_) {
         return;
     }
-    if (node->terminal) {
-        node->request_count += 1;
-        node->hit_count += 1;
-        touch_prefix_node_locked(node);
-    } else {
-        node->terminal = true;
-        node->token_count = prefix_len;
-        node->request_count = 1;
-        node->hit_count = 0;
-        prefix_cache_lru_.push_front(node);
-        prefix_cache_entry_count_ += 1;
-        prefix_cache_token_count_ += prefix_len;
+    while (prefix_cache_free_page_slots_.size() < page_count) {
+        if (!evict_one_prefix_cache_entry_locked()) {
+            break;
+        }
     }
-    prefix_cache_valid_ = true;
-    prefix_cached_pos_ = static_cast<int>(prefix_len);
-    prefix_tokens_.assign(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len);
+    if (prefix_cache_free_page_slots_.size() < page_count) {
+        return;
+    }
+
+    const std::vector<llama_token> cached_tokens(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len);
+    for (auto it = prefix_cache_entries_.begin(); it != prefix_cache_entries_.end(); ++it) {
+        if (it->tokens == cached_tokens) {
+            it->request_count += 1;
+            it->last_used_tick = ++prefix_cache_tick_;
+            prefix_cache_entries_.splice(prefix_cache_entries_.begin(), prefix_cache_entries_, it);
+            last_cached_prefix_entries_ = prefix_cache_entries_.size();
+            return;
+        }
+    }
+
+    PrefixCacheEntry entry;
+    entry.tokens = cached_tokens;
+    entry.request_count = 1;
+    entry.last_used_tick = ++prefix_cache_tick_;
+    entry.page_slots.reserve(page_count);
+
+    const auto store_start = std::chrono::steady_clock::now();
+    for (size_t page = 0; page < page_count; ++page) {
+        const int page_slot = prefix_cache_free_page_slots_.back();
+        prefix_cache_free_page_slots_.pop_back();
+        const int src_token = static_cast<int>(page * prefix_cache_block_size_);
+        if (osh26_vk_gpu_prefix_cache_store_page(page_slot, src_token) != 0) {
+            prefix_cache_free_page_slots_.push_back(page_slot);
+            for (const int slot : entry.page_slots) {
+                prefix_cache_free_page_slots_.push_back(slot);
+            }
+            last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - store_start).count();
+            return;
+        }
+        entry.page_slots.push_back(page_slot);
+    }
+
+    last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - store_start).count();
+    prefix_cache_token_count_ += prefix_len;
+    prefix_cache_used_pages_ += page_count;
+    prefix_cache_entries_.push_front(std::move(entry));
+    prefix_cache_entry_count_ = prefix_cache_entries_.size();
     last_cached_prefix_entries_ = prefix_cache_entry_count_;
     evict_prefix_cache_locked();
 }
@@ -713,23 +809,56 @@ void ComputeBackend::touch_prefix_node_locked(PrefixCacheNode * node) {
     node->last_used_tick += 1;
 }
 
+bool ComputeBackend::evict_one_prefix_cache_entry_locked() {
+    if (prefix_cache_entries_.empty()) {
+        return false;
+    }
+    PrefixCacheEntry & victim = prefix_cache_entries_.back();
+    for (const int slot : victim.page_slots) {
+        prefix_cache_free_page_slots_.push_back(slot);
+    }
+    if (prefix_cache_token_count_ >= victim.tokens.size()) {
+        prefix_cache_token_count_ -= victim.tokens.size();
+    } else {
+        prefix_cache_token_count_ = 0;
+    }
+    if (prefix_cache_used_pages_ >= victim.page_slots.size()) {
+        prefix_cache_used_pages_ -= victim.page_slots.size();
+    } else {
+        prefix_cache_used_pages_ = 0;
+    }
+    prefix_cache_entries_.pop_back();
+    prefix_cache_evictions_ += 1;
+    prefix_cache_entry_count_ = prefix_cache_entries_.size();
+    last_cached_prefix_entries_ = prefix_cache_entry_count_;
+    return true;
+}
+
 void ComputeBackend::evict_prefix_cache_locked() {
-    while (prefix_cache_entry_count_ > max_prefix_cache_entries_ && !prefix_cache_lru_.empty()) {
-        PrefixCacheNode * victim = prefix_cache_lru_.back();
-        prefix_cache_lru_.pop_back();
-        if (victim != nullptr && victim->terminal) {
-            victim->terminal = false;
-            if (prefix_cache_token_count_ >= victim->token_count) {
-                prefix_cache_token_count_ -= victim->token_count;
-            } else {
-                prefix_cache_token_count_ = 0;
-            }
-            victim->token_count = 0;
-            if (prefix_cache_entry_count_ > 0) {
-                prefix_cache_entry_count_ -= 1;
-            }
-            prefix_cache_evictions_ += 1;
-        }
+    while ((prefix_cache_entries_.size() > max_prefix_cache_entries_ ||
+            prefix_cache_used_pages_ > prefix_cache_pool_pages_) &&
+           evict_one_prefix_cache_entry_locked()) {
+    }
+}
+
+void ComputeBackend::clear_prefix_cache_node_locked(PrefixCacheNode * node) {
+    if (node == nullptr) {
+        return;
+    }
+    node->terminal = false;
+    node->token_count = 0;
+    node->page_slots.clear();
+}
+
+void ComputeBackend::init_prefix_cache_page_slots_locked() {
+    if (!prefix_cache_free_page_slots_.empty() || prefix_cache_used_pages_ > 0 || !prefix_cache_entries_.empty()) {
+        return;
+    }
+    prefix_cache_pool_pages_ = kPrefixCachePoolPages;
+    prefix_cache_block_size_ = kPrefixCachePageTokens;
+    prefix_cache_free_page_slots_.reserve(prefix_cache_pool_pages_);
+    for (size_t i = 0; i < prefix_cache_pool_pages_; ++i) {
+        prefix_cache_free_page_slots_.push_back(static_cast<int>(prefix_cache_pool_pages_ - 1 - i));
     }
 }
 
@@ -742,12 +871,10 @@ size_t ComputeBackend::prefix_cache_token_count_locked() const {
 }
 
 double ComputeBackend::prefix_cache_fragmentation_locked() const {
-    if (prefix_cache_token_count_ == 0) {
+    if (prefix_cache_pool_pages_ == 0) {
         return 0.0;
     }
-    const size_t used_tokens = std::min(prefix_tokens_.size(), prefix_cache_token_count_);
-    const double total_tokens = (double) std::max<size_t>(1, prefix_cache_token_count_);
-    return 1.0 - ((double) used_tokens / total_tokens);
+    return 1.0 - ((double) prefix_cache_used_pages_ / (double) prefix_cache_pool_pages_);
 }
 
 std::string ComputeBackend::load_model(const std::string & model_path) {
@@ -766,7 +893,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
 
     release();
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     available_devices_ = describe_backend_devices();
     cancel_requested_.store(true);
     reset_cache_locked(true);
@@ -844,12 +971,14 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     start_prefix_warmup_async_locked();
     last_load_model_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - load_model_start).count();
+    const std::string loaded_message = "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
+    lock.unlock();
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
         shutdown_requested_ = false;
         queue_cv_.notify_all();
     }
-    return "model loaded: " + model_path + " [" + active_backend_ + "] (" + file_info + ")";
+    return loaded_message;
 }
 
 GenerateResult ComputeBackend::generate(const std::string & user_prompt, const GenerateOptions & options, const TokenCallback & on_token) {
@@ -931,7 +1060,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         request->prompt_tokens = prompt_tokens;
         request->prompt_tokens_total = request->prompt_tokens.size();
         request->reusable_prefix_tokens = kEnablePrefixCache
-            ? common_prefix_length(request->prompt_tokens, prefix_tokens_)
+            ? best_cached_prefix_tokens_locked(request->prompt_tokens)
             : 0;
         request->queue_position = next_queue_position_++;
 
@@ -1042,16 +1171,9 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             last_prefix_tokens_ = 0;
             last_reusable_prefix_tokens_ = 0;
             last_cached_prefix_entries_ = 0;
-            prefix_cache_valid_ = false;
-            prefix_cached_pos_ = 0;
-            prefix_tokens_.clear();
+            last_prefix_restore_ms_ = 0.0;
             if (kEnablePrefixCache) {
-                start_prefix_warmup_async_locked();
-                if (prompt_has_cached_prefix(prompt_tokens)) {
-                    last_prefix_cache_hit_ = true;
-                    last_prefix_tokens_ = prefix_cached_pos_;
-                    n_pos = prefix_cached_pos_;
-                }
+                restore_prefix_cache_locked(prompt_tokens, &n_pos);
             }
         }
 
@@ -1096,6 +1218,36 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                 std::chrono::steady_clock::now() - prefill_time_start).count();
         } else {
             last_user_prefill_ms_ = 0.0;
+        }
+
+        if (result.error.empty() && !result.cancelled && kEnablePrefixCache && !debug_correctness_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            insert_prefix_cache_locked(prompt_tokens);
+            last_cached_prefix_entries_ = prefix_cache_entries_.size();
+        }
+        if (result.error.empty() && !result.cancelled && kEnablePrefixCache && !debug_correctness_) {
+            std::vector<std::shared_ptr<GenerationRequest>> queued_snapshot;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                queued_snapshot.assign(request_queue_.begin(), request_queue_.end());
+            }
+            std::vector<size_t> scores;
+            scores.reserve(queued_snapshot.size());
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto & queued : queued_snapshot) {
+                    scores.push_back(queued != nullptr ? best_cached_prefix_tokens_locked(queued->prompt_tokens) : 0);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                for (size_t i = 0; i < queued_snapshot.size(); ++i) {
+                    if (queued_snapshot[i] != nullptr) {
+                        queued_snapshot[i]->reusable_prefix_tokens = scores[i];
+                    }
+                }
+                queue_cv_.notify_all();
+            }
         }
 
         if (debug_correctness_ && result.error.empty() && !result.cancelled && n_prompt > 0) {
@@ -1365,13 +1517,7 @@ cpu_path:
             last_ttft_submit_count_ = vk_stats.last_ttft_submit_count;
             last_submit_wait_ms_ = vk_stats.last_submit_wait_ms;
         }
-        last_prefix_cache_hit_ = false;
-        last_prefix_tokens_ = 0;
-        last_reusable_prefix_tokens_ = 0;
-        last_cached_prefix_entries_ = 0;
-        prefix_cache_valid_ = false;
-        prefix_cached_pos_ = 0;
-        prefix_tokens_.clear();
+        last_cached_prefix_entries_ = prefix_cache_entries_.size();
     }
     return result;
 }
@@ -1491,6 +1637,18 @@ std::string ComputeBackend::stats_json() const {
         last_queue_wait_ms = last_queue_wait_ms_;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool prefix_cache_enabled = kEnablePrefixCache && requested_backend_ == "vulkan" && !debug_correctness_;
+    const bool prefix_cache_supported = prefix_cache_enabled && osh26_vk_gpu_prefix_cache_supported();
+    const bool prefix_cache_valid = !prefix_cache_entries_.empty();
+    const size_t prefix_cache_lookups = prefix_cache_hits_ + prefix_cache_misses_;
+    const double prefix_cache_hit_ratio = prefix_cache_lookups > 0
+        ? (double) prefix_cache_hits_ / (double) prefix_cache_lookups
+        : 0.0;
+    const size_t max_reusable_blocks = prefix_cache_lookups * std::max<size_t>(1, max_prefix_cache_tokens_ / std::max<size_t>(1, prefix_cache_block_size_));
+    const double prefix_cache_block_reuse_ratio = max_reusable_blocks > 0
+        ? (double) prefix_cache_block_reuse_ / (double) max_reusable_blocks
+        : 0.0;
+    const size_t prefix_cache_free_pages = prefix_cache_free_page_slots_.size();
     std::ostringstream out;
     out << "{\n"
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
@@ -1498,13 +1656,13 @@ std::string ComputeBackend::stats_json() const {
         << "  \"requested_gpu_layers\": " << requested_gpu_layers_ << ",\n"
         << "  \"debug_correctness\": " << (debug_correctness_ ? "true" : "false") << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
-        << "  \"kv_cache_device\": \"CPU\",\n"
+        << "  \"kv_cache_device\": \"" << (requested_backend_ == "vulkan" ? "CPU llama.cpp ctx + OSH26 Vulkan packed KV" : "CPU") << "\",\n"
         << "  \"max_context_tokens\": " << kDefaultContextSize << ",\n"
         << "  \"short_prefill_token_limit\": " << kShortPrefillTokenLimit << ",\n"
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
-        << "  \"scheduler\": \"queued-no-prefix-lite\",\n"
+        << "  \"scheduler\": \"queued-prefix-paged-lite\",\n"
         << "  \"max_concurrent_requests\": 1,\n"
         << "  \"max_pending_requests\": " << max_pending_requests_ << ",\n"
         << "  \"model_loaded\": " << (model_ ? "true" : "false") << ",\n"
@@ -1525,17 +1683,31 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
         << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
         << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
-        << "  \"prefix_cache_enabled\": false,\n"
-        << "  \"last_prefix_cache_hit\": false,\n"
-        << "  \"prefix_cache_valid\": false,\n"
-        << "  \"prefix_cached_pos\": 0,\n"
-        << "  \"last_prefix_tokens\": 0,\n"
-        << "  \"prefix_cache_entries\": 0,\n"
-        << "  \"prefix_cache_tokens\": 0,\n"
-        << "  \"prefix_cache_evictions\": 0,\n"
-        << "  \"prefix_cache_hit_ratio\": 0,\n"
-        << "  \"prefix_cache_block_reuse_ratio\": 0,\n"
-        << "  \"prefix_cache_fragmentation\": 0,\n"
+        << "  \"prefix_cache_enabled\": " << (prefix_cache_enabled ? "true" : "false") << ",\n"
+        << "  \"prefix_cache_supported\": " << (prefix_cache_supported ? "true" : "false") << ",\n"
+        << "  \"last_prefix_cache_hit\": " << (last_prefix_cache_hit_ ? "true" : "false") << ",\n"
+        << "  \"prefix_cache_valid\": " << (prefix_cache_valid ? "true" : "false") << ",\n"
+        << "  \"prefix_cached_pos\": " << last_prefix_tokens_ << ",\n"
+        << "  \"last_prefix_tokens\": " << last_prefix_tokens_ << ",\n"
+        << "  \"last_reusable_prefix_tokens\": " << last_reusable_prefix_tokens_ << ",\n"
+        << "  \"prefix_cache_entries\": " << prefix_cache_entry_count_locked() << ",\n"
+        << "  \"prefix_cache_tokens\": " << prefix_cache_token_count_locked() << ",\n"
+        << "  \"prefix_cache_page_tokens\": " << prefix_cache_block_size_ << ",\n"
+        << "  \"prefix_cache_pool_pages\": " << prefix_cache_pool_pages_ << ",\n"
+        << "  \"prefix_cache_used_pages\": " << prefix_cache_used_pages_ << ",\n"
+        << "  \"prefix_cache_free_pages\": " << prefix_cache_free_pages << ",\n"
+        << "  \"prefix_cache_max_entries\": " << max_prefix_cache_entries_ << ",\n"
+        << "  \"prefix_cache_max_tokens\": " << max_prefix_cache_tokens_ << ",\n"
+        << "  \"prefix_cache_hits\": " << prefix_cache_hits_ << ",\n"
+        << "  \"prefix_cache_misses\": " << prefix_cache_misses_ << ",\n"
+        << "  \"prefix_cache_evictions\": " << prefix_cache_evictions_ << ",\n"
+        << "  \"prefix_cache_reuse_tokens\": " << prefix_cache_reuse_tokens_ << ",\n"
+        << "  \"prefix_cache_reuse_blocks\": " << prefix_cache_block_reuse_ << ",\n"
+        << "  \"prefix_cache_hit_ratio\": " << prefix_cache_hit_ratio << ",\n"
+        << "  \"prefix_cache_block_reuse_ratio\": " << prefix_cache_block_reuse_ratio << ",\n"
+        << "  \"prefix_cache_fragmentation\": " << prefix_cache_fragmentation_locked() << ",\n"
+        << "  \"last_prefix_restore_ms\": " << last_prefix_restore_ms_ << ",\n"
+        << "  \"last_prefix_store_ms\": " << last_prefix_store_ms_ << ",\n"
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"
         << "  \"last_prefill_forward_count\": " << last_prefill_forward_count_ << ",\n"
         << "  \"last_prefill_skipped_lm_head_count\": " << last_prefill_skipped_lm_head_count_ << ",\n"

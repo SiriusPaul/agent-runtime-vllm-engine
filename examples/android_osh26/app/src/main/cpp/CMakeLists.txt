@@ -47,6 +47,13 @@ add_library(llama_osh26 SHARED
 
 target_compile_features(llama_osh26 PRIVATE cxx_std_17)
 
+option(OSH26_BUILD_PREFIX_CACHE_POLICY_TEST "Build the standalone prefix cache policy self-test" OFF)
+if (OSH26_BUILD_PREFIX_CACHE_POLICY_TEST)
+    add_executable(osh26_prefix_cache_policy_test
+        osh26_prefix_cache_policy_test.cpp)
+    target_compile_features(osh26_prefix_cache_policy_test PRIVATE cxx_std_17)
+endif()
+
 target_link_libraries(llama_osh26
     llama
     android
