@@ -914,7 +914,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;
-    model_params.use_mmap = false;
+    model_params.use_mmap = true;
     model_params.use_mlock = false;
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (model_ == nullptr) {
@@ -935,28 +935,34 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "Skipping GPU model load (CPU backend requested)");
     }
 
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = kDefaultContextSize;
-    ctx_params.n_batch = kDefaultBatchSize;
-    ctx_params.n_ubatch = kDefaultBatchSize;
-    ctx_params.n_seq_max = kDefaultMaxSeq;
-    ctx_params.n_threads = default_thread_count();
-    ctx_params.n_threads_batch = ctx_params.n_threads;
-    // The custom Vulkan backend does not implement the KV update/attention ops yet.
-    // Keep KV cache in CPU memory while allowing layer weights and supported matmuls on GPU.
-    ctx_params.offload_kqv = false;
-    ctx_params.op_offload = false;
-    ctx_params.no_perf = false;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    ctx_ = llama_init_from_model(model_, ctx_params);
-    if (ctx_ == nullptr) {
-        osh26_vk_gpu_free();
-        llama_model_free(model_);
-        model_ = nullptr;
-        model_path_.clear();
-        active_backend_ = "llama.cpp CPU";
-        last_error_ = "failed to create llama_context";
-        return last_error_;
+    // For Vulkan production mode (no debug correctness), skip CPU context entirely.
+    // Only the model (for tokenizer/vocab) is kept; GPU context handles everything else.
+    const bool needs_cpu_context = (requested_backend_ != "vulkan") || debug_correctness_;
+    if (needs_cpu_context) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = kDefaultContextSize;
+        ctx_params.n_batch = kDefaultBatchSize;
+        ctx_params.n_ubatch = kDefaultBatchSize;
+        ctx_params.n_seq_max = kDefaultMaxSeq;
+        ctx_params.n_threads = default_thread_count();
+        ctx_params.n_threads_batch = ctx_params.n_threads;
+        ctx_params.offload_kqv = false;
+        ctx_params.op_offload = false;
+        ctx_params.no_perf = false;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        ctx_ = llama_init_from_model(model_, ctx_params);
+        if (ctx_ == nullptr) {
+            osh26_vk_gpu_free();
+            llama_model_free(model_);
+            model_ = nullptr;
+            model_path_.clear();
+            active_backend_ = "llama.cpp CPU";
+            last_error_ = "failed to create llama_context";
+            return last_error_;
+        }
+    } else {
+        ctx_ = nullptr;
+        __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "CPU context skipped (Vulkan production mode)");
     }
 
     model_path_ = model_path;
@@ -997,8 +1003,13 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (model_ == nullptr || ctx_ == nullptr) {
+        if (model_ == nullptr) {
             result.error = "model is not loaded";
+            last_error_ = result.error;
+            return result;
+        }
+        if (requested_backend_ != "vulkan" && ctx_ == nullptr) {
+            result.error = "model is not loaded (CPU backend requires context)";
             last_error_ = result.error;
             return result;
         }
@@ -1486,8 +1497,10 @@ cpu_path:
         result.finish_reason = "stop";
     }
 
+    if (ctx_ != nullptr) {
+        llama_memory_clear(llama_get_memory(ctx_), false);
+    }
     llama_sampler_free(sampler);
-    llama_memory_clear(llama_get_memory(ctx_), false);
 
     osh26_vk_stats vk_stats {};
     const bool have_vk_stats = use_gpu && osh26_vk_get_stats(&vk_stats) == 0;
@@ -1660,6 +1673,7 @@ std::string ComputeBackend::stats_json() const {
         << "  \"debug_correctness\": " << (debug_correctness_ ? "true" : "false") << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
         << "  \"kv_cache_device\": \"" << (requested_backend_ == "vulkan" ? "CPU llama.cpp ctx + OSH26 Vulkan packed KV" : "CPU") << "\",\n"
+        << "  \"cpu_context_active\": " << (ctx_ != nullptr ? "true" : "false") << ",\n"
         << "  \"max_context_tokens\": " << kDefaultContextSize << ",\n"
         << "  \"short_prefill_token_limit\": " << kShortPrefillTokenLimit << ",\n"
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
