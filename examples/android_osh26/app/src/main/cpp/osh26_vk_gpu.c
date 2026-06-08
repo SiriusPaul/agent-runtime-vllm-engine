@@ -41,8 +41,8 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,TAG,__VA_ARGS__)
 
-#define HDIM 1024
-#define IDIM 3072
+#define HDIM (g_hdim)
+#define IDIM (g_idim)
 #define N_LAY 28
 #define N_HD  16
 #define N_KVH 8
@@ -50,6 +50,9 @@
 #define QDIM  (N_HD*HD)
 #define KVD   (N_KVH*HD)
 #define VOCAB 151936
+/* HDIM and IDIM are runtime variables, set by load_qwen3_model_spec() */
+static int g_hdim = 0;   /* hidden_dim: 1024 for 0.6B, 2048 for 1.7B */
+static int g_idim = 0;   /* intermediate_dim: 3072 for 0.6B, 6144 for 1.7B */
 #define MAX_S 8192
 #define MAX_FORWARD_TOKENS 128
 #define HOST_KV_MAX_S 1024
@@ -302,7 +305,7 @@ static bool gguf_check_tensor_elements(struct gguf_context *g, const char *name,
     return true;
 }
 
-static bool validate_qwen3_06b_gguf(struct gguf_context *g) {
+static bool load_qwen3_model_spec(struct gguf_context *g, int *hdim_out, int *idim_out) {
     int64_t arch_id = gguf_find_key(g, "general.architecture");
     if (arch_id < 0 || gguf_get_kv_type(g, arch_id) != GGUF_TYPE_STRING) {
         LOGE("GGUF key missing or not string: general.architecture");
@@ -313,14 +316,65 @@ static bool validate_qwen3_06b_gguf(struct gguf_context *g) {
         LOGE("GGUF architecture mismatch: expected=qwen3 actual=%s", arch ? arch : "(null)");
         return false;
     }
-    return gguf_check_u32(g, "qwen3.embedding_length", HDIM) &&
-           gguf_check_u32(g, "qwen3.block_count", N_LAY) &&
-           gguf_check_u32(g, "qwen3.attention.head_count", N_HD) &&
-           gguf_check_u32(g, "qwen3.attention.head_count_kv", N_KVH) &&
-           gguf_check_u32(g, "qwen3.attention.key_length", HD) &&
-           gguf_check_u32(g, "qwen3.attention.value_length", HD) &&
-           gguf_check_u32(g, "qwen3.feed_forward_length", IDIM) &&
-           gguf_check_tensor_elements(g, "token_embd.weight", (int64_t)VOCAB * HDIM);
+
+    uint32_t block_count = 0, head_count = 0, head_count_kv = 0;
+    uint32_t key_length = 0, value_length = 0;
+    uint32_t embedding_length = 0, feed_forward_length = 0;
+    if (!gguf_get_u32_checked(g, "qwen3.block_count", &block_count) ||
+        block_count != N_LAY) {
+        LOGE("GGUF block_count must be %d, got %u", N_LAY, block_count);
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.attention.head_count", &head_count) ||
+        head_count != N_HD) {
+        LOGE("GGUF head_count must be %d, got %u", N_HD, head_count);
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.attention.head_count_kv", &head_count_kv) ||
+        head_count_kv != N_KVH) {
+        LOGE("GGUF head_count_kv must be %d, got %u", N_KVH, head_count_kv);
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.attention.key_length", &key_length) ||
+        key_length != HD) {
+        LOGE("GGUF key_length must be %d, got %u", HD, key_length);
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.attention.value_length", &value_length) ||
+        value_length != HD) {
+        LOGE("GGUF value_length must be %d, got %u", HD, value_length);
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.embedding_length", &embedding_length)) {
+        return false;
+    }
+    if (!gguf_get_u32_checked(g, "qwen3.feed_forward_length", &feed_forward_length)) {
+        return false;
+    }
+
+    /* Validate supported profiles */
+    bool profile_ok = false;
+    if (embedding_length == 1024 && feed_forward_length == 3072) {
+        profile_ok = true;  /* 0.6B */
+    } else if (embedding_length == 2048 && feed_forward_length == 6144) {
+        profile_ok = true;  /* 1.7B */
+    }
+    if (!profile_ok) {
+        LOGE("Unsupported Qwen3 profile: hidden=%u FFN=%u. Supported: 0.6B (1024/3072), 1.7B (2048/6144)",
+             embedding_length, feed_forward_length);
+        return false;
+    }
+
+    if (!gguf_check_tensor_elements(g, "token_embd.weight", (int64_t)VOCAB * embedding_length)) {
+        return false;
+    }
+
+    *hdim_out = (int)embedding_length;
+    *idim_out = (int)feed_forward_length;
+    LOGI("Model spec: hidden_dim=%d intermediate_dim=%d (profile=%s)",
+         *hdim_out, *idim_out,
+         embedding_length == 1024 ? "0.6B" : "1.7B");
+    return true;
 }
 
 static void compute_lm_head_cpu_topk(const VkBuf *head_src, int *ids, float *values, int *count, int limit) {
@@ -1010,7 +1064,8 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     if(!B_KVConst.B && !buf_alloc(&B_KVConst,sizeof(AttnConst))){LOGE("alloc kv const");return -1;}
     FILE*f=fopen(path,"rb");if(!f){LOGE("open %s",path);return -1;}
     struct gguf_init_params gp={true,NULL};struct gguf_context*gctx=gguf_init_from_file(path,gp);if(!gctx){fclose(f);return -1;}
-    if(!validate_qwen3_06b_gguf(gctx)){gguf_free(gctx);fclose(f);return -1;}
+    if(!load_qwen3_model_spec(gctx, &g_hdim, &g_idim)){gguf_free(gctx);fclose(f);return -1;}
+    LOGI("Runtime dims: HDIM=%d IDIM=%d", HDIM, IDIM);
     Emb=(float*)malloc(((VkDeviceSize)VOCAB*HDIM)*4);if(!read_gguf(gctx,f,"token_embd.weight",Emb)){free(Emb);gguf_free(gctx);fclose(f);return -1;}
     char n[128];
     bool q8_load_ok=true;
