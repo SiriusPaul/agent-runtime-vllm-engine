@@ -150,6 +150,9 @@ static double g_last_prefill_attention_ms;
 static double g_last_prefill_ffn_gate_up_silu_ms;
 static bool g_prefill_q8_enabled;
 static bool g_decode_q8_enabled;
+static bool g_q8_only_mode;
+static bool g_embedding_head_shared;
+static uint64_t g_resident_f32_matrix_bytes;
 static bool g_gpu_lm_head_enabled=true;
 static bool g_last_q8_benchmark_ran;
 static bool g_last_q8_gate_pass;
@@ -999,6 +1002,7 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_last_prefill_qkv_ms=0.0;g_last_prefill_qk_norm_rope_ms=0.0;g_last_prefill_o_proj_ms=0.0;g_last_prefill_down_ms=0.0;
     g_last_prefill_cpu_post_ms=0.0;g_last_prefill_attention_ms=0.0;g_last_prefill_ffn_gate_up_silu_ms=0.0;
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;g_last_logits_topk_count=0;
+    g_q8_only_mode=false; g_embedding_head_shared=false; g_resident_f32_matrix_bytes=0;
     g_submit_cursor=0; g_current_submit_phase = SUBMIT_PHASE_NONE;
     g_current_forward_is_prefill=false;
     if(!B_Dummy.B && !buf_alloc(&B_Dummy,256)){LOGE("alloc dummy");return -1;}
@@ -1010,18 +1014,72 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     Emb=(float*)malloc(((VkDeviceSize)VOCAB*HDIM)*4);if(!read_gguf(gctx,f,"token_embd.weight",Emb)){free(Emb);gguf_free(gctx);fclose(f);return -1;}
     char n[128];
     bool q8_load_ok=true;
+    /* Pre-scan: detect if all 7 projection tensors per layer are native GGML_TYPE_Q8_0 */
+    bool all_proj_q8 = true;
+    static const char *proj_names[] = {
+        "blk.%d.attn_q.weight", "blk.%d.attn_k.weight", "blk.%d.attn_v.weight",
+        "blk.%d.attn_output.weight", "blk.%d.ffn_gate.weight",
+        "blk.%d.ffn_up.weight", "blk.%d.ffn_down.weight"
+    };
+    for (int l = 0; l < N_LAY && all_proj_q8; l++) {
+        for (int ti = 0; ti < 7; ti++) {
+            snprintf(n, sizeof(n), proj_names[ti], l);
+            int idx = gguf_find_tensor(gctx, n);
+            if (idx < 0 || gguf_get_tensor_type(gctx, idx) != GGML_TYPE_Q8_0) {
+                all_proj_q8 = false;
+                break;
+            }
+        }
+    }
+    g_q8_only_mode = all_proj_q8;
+    g_resident_f32_matrix_bytes = 0;
+    LOGI("Model mode: %s (all projection tensors are Q8_0)", g_q8_only_mode ? "Q8_ONLY" : "HYBRID_F32_Q8");
     for(int l=0;l<N_LAY;l++){
         snprintf(n,sizeof(n),"blk.%d.attn_norm.weight",l);LOAD_BUF(n,W_ra[l],HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_q.weight",l);LOAD_BUF(n,W_Q[l],QDIM*HDIM);TRY_LOAD_Q8(n,WQ_Q[l],W_Q[l],QDIM,HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_k.weight",l);LOAD_BUF(n,W_K[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_K[l],W_K[l],KVD,HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_v.weight",l);LOAD_BUF(n,W_V[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_V[l],W_V[l],KVD,HDIM);
-        snprintf(n,sizeof(n),"blk.%d.attn_output.weight",l);LOAD_BUF(n,W_O[l],HDIM*QDIM);TRY_LOAD_Q8(n,WQ_O[l],W_O[l],HDIM,QDIM);
+        if (g_q8_only_mode) {
+            /* Q8_ONLY: skip F32 projection tensors, load Q8 packed directly */
+            snprintf(n,sizeof(n),"blk.%d.attn_q.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_Q[l],QDIM,HDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+            snprintf(n,sizeof(n),"blk.%d.attn_k.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_K[l],KVD,HDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+            snprintf(n,sizeof(n),"blk.%d.attn_v.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_V[l],KVD,HDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+            snprintf(n,sizeof(n),"blk.%d.attn_output.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_O[l],HDIM,QDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+        } else {
+            snprintf(n,sizeof(n),"blk.%d.attn_q.weight",l);LOAD_BUF(n,W_Q[l],QDIM*HDIM);TRY_LOAD_Q8(n,WQ_Q[l],W_Q[l],QDIM,HDIM);
+            snprintf(n,sizeof(n),"blk.%d.attn_k.weight",l);LOAD_BUF(n,W_K[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_K[l],W_K[l],KVD,HDIM);
+            snprintf(n,sizeof(n),"blk.%d.attn_v.weight",l);LOAD_BUF(n,W_V[l],KVD*HDIM);TRY_LOAD_Q8(n,WQ_V[l],W_V[l],KVD,HDIM);
+            snprintf(n,sizeof(n),"blk.%d.attn_output.weight",l);LOAD_BUF(n,W_O[l],HDIM*QDIM);TRY_LOAD_Q8(n,WQ_O[l],W_O[l],HDIM,QDIM);
+        }
         snprintf(n,sizeof(n),"blk.%d.attn_q_norm.weight",l);LOAD_BUF(n,W_Qn[l],HD);
         snprintf(n,sizeof(n),"blk.%d.attn_k_norm.weight",l);LOAD_BUF(n,W_Kn[l],HD);
         snprintf(n,sizeof(n),"blk.%d.ffn_norm.weight",l);LOAD_BUF(n,W_rf[l],HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_gate.weight",l);LOAD_BUF(n,W_Gate[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Gate[l],W_Gate[l],IDIM,HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_up.weight",l);LOAD_BUF(n,W_Up[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Up[l],W_Up[l],IDIM,HDIM);
-        snprintf(n,sizeof(n),"blk.%d.ffn_down.weight",l);LOAD_BUF(n,W_Down[l],HDIM*IDIM);TRY_LOAD_Q8(n,WQ_Down[l],W_Down[l],HDIM,IDIM);
+        if (g_q8_only_mode) {
+            snprintf(n,sizeof(n),"blk.%d.ffn_gate.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_Gate[l],IDIM,HDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+            snprintf(n,sizeof(n),"blk.%d.ffn_up.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_Up[l],IDIM,HDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+            snprintf(n,sizeof(n),"blk.%d.ffn_down.weight",l);
+            if(!read_gguf_q8_packed(gctx,f,n,&WQ_Down[l],HDIM,IDIM)){LOGE("Q8 load %s",n);gguf_free(gctx);fclose(f);return -1;}
+        } else {
+            snprintf(n,sizeof(n),"blk.%d.ffn_gate.weight",l);LOAD_BUF(n,W_Gate[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Gate[l],W_Gate[l],IDIM,HDIM);
+            snprintf(n,sizeof(n),"blk.%d.ffn_up.weight",l);LOAD_BUF(n,W_Up[l],IDIM*HDIM);TRY_LOAD_Q8(n,WQ_Up[l],W_Up[l],IDIM,HDIM);
+            snprintf(n,sizeof(n),"blk.%d.ffn_down.weight",l);LOAD_BUF(n,W_Down[l],HDIM*IDIM);TRY_LOAD_Q8(n,WQ_Down[l],W_Down[l],HDIM,IDIM);
+        }
+    }
+    if (!g_q8_only_mode) {
+        /* Calculate resident F32 matrix bytes (projection weights only) */
+        g_resident_f32_matrix_bytes = 0;
+        for (int l = 0; l < N_LAY; l++) {
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(QDIM*HDIM) * 4;  /* Q */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(KVD*HDIM) * 4;  /* K */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(KVD*HDIM) * 4;  /* V */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(HDIM*QDIM) * 4;  /* O */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(IDIM*HDIM) * 4;  /* Gate */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(IDIM*HDIM) * 4;  /* Up */
+            g_resident_f32_matrix_bytes += (VkDeviceSize)(HDIM*IDIM) * 4;  /* Down */
+        }
     }
     LOAD_BUF("output_norm.weight",W_Fnorm,HDIM);
     float *head_tmp=(float*)malloc(F32((VkDeviceSize)VOCAB*HDIM));
@@ -1082,11 +1140,18 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_prefill_q8_enabled=q8_load_ok;
     g_decode_q8_enabled=q8_load_ok;
     LOGI("Q8 prefill/decode enabled: %s",g_prefill_q8_enabled?"true":"false");
+    LOGI("Model mode: %s (resident_f32_matrix_bytes=%llu)",
+         g_q8_only_mode?"Q8_ONLY":"HYBRID",
+         (unsigned long long)g_resident_f32_matrix_bytes);
     mdl_ok=true;LOGI("Model loaded");return 0;}
 #undef TRY_LOAD_Q8
 
 /* ---- Forward pass ---- */
-int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;if(!tokens||nt<=0||nt>MAX_FORWARD_TOKENS||pos<0||pos>MAX_S-nt){LOGE("forward range invalid nt=%d pos=%d max_context=%d",nt,pos,MAX_S);return -1;}const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const int validation_stage=(flags&OSH26_FORWARD_VALIDATE_PREFILL)?1:((flags&OSH26_FORWARD_VALIDATE_FIRST_DECODE)?2:0);const bool correctness_check=g_debug_correctness&&validation_stage!=0;const bool debug_check=((flags&OSH26_FORWARD_DEBUG_CHECK)!=0);const bool needs_cpu_attention=correctness_check||debug_check||!g_mnn_attention_enabled||g_attention_fallback_layers!=0;if(needs_cpu_attention&&B_KV.P==NULL){LOGE("CPU attention fallback is unavailable in the 8K fast configuration");return -1;}if(needs_cpu_attention&&pos>HOST_KV_MAX_S-nt){LOGE("CPU attention fallback supports at most %d tokens",HOST_KV_MAX_S);return -1;}static int fc=0;if((correctness_check||debug_check)&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
+int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!mdl_ok)return -1;if(!tokens||nt<=0||nt>MAX_FORWARD_TOKENS||pos<0||pos>MAX_S-nt){LOGE("forward range invalid nt=%d pos=%d max_context=%d",nt,pos,MAX_S);return -1;}const bool need_logits=(flags&OSH26_FORWARD_NEED_LOGITS)!=0;const bool prefill_only=(flags&OSH26_FORWARD_PREFILL_ONLY)!=0;const int validation_stage=(flags&OSH26_FORWARD_VALIDATE_PREFILL)?1:((flags&OSH26_FORWARD_VALIDATE_FIRST_DECODE)?2:0);const bool correctness_check=g_debug_correctness&&validation_stage!=0;const bool debug_check=((flags&OSH26_FORWARD_DEBUG_CHECK)!=0);const bool needs_cpu_attention=correctness_check||debug_check||!g_mnn_attention_enabled||g_attention_fallback_layers!=0;if(needs_cpu_attention&&B_KV.P==NULL){LOGE("CPU attention fallback is unavailable in the 8K fast configuration");return -1;}if(needs_cpu_attention&&pos>HOST_KV_MAX_S-nt){LOGE("CPU attention fallback supports at most %d tokens",HOST_KV_MAX_S);return -1;}
+    if(g_q8_only_mode && (debug_check || (correctness_check && nt > 1))){
+        LOGE("Q8_ONLY mode: debug/correctness check incompatible (no F32 projection weights allocated). Use F16 model for debug mode.");
+        pthread_mutex_unlock(&Mtx);return -1;
+    }static int fc=0;if((correctness_check||debug_check)&&++fc<=3)LOGI("forward#%d nt=%d pos=%d flags=0x%x",fc,nt,pos,flags);pthread_mutex_lock(&Mtx);
     if(pos==0){g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;g_last_lm_head_matched_logit_max_abs_err=0.0f;g_last_lm_head_top1_match=false;g_last_lm_head_top5_overlap=0;g_last_lm_head_top20_overlap=0;g_last_lm_head_cpu_top1_margin=0.0f;g_last_lm_head_validation_ms=0.0;g_last_ttft_submit_count=0;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));}
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
     if (nt > 1) {
@@ -2224,5 +2289,5 @@ void osh26_vk_gpu_free(void){
     if(Emb){free(Emb);Emb=NULL;}
     mdl_ok=false;g_prefill_q8_enabled=false;g_decode_q8_enabled=false;
 }
-int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->prefill_q8_enabled=g_prefill_q8_enabled;o->decode_q8_enabled=g_decode_q8_enabled;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_q8_benchmark_ran=g_last_q8_benchmark_ran;o->last_q8_gate_pass=g_last_q8_gate_pass;o->last_q8_weighted_f32_ms=g_last_q8_weighted_f32_ms;o->last_q8_weighted_total_ms=g_last_q8_weighted_total_ms;o->last_q8_weighted_speedup=g_last_q8_weighted_speedup;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
+int osh26_vk_get_stats(struct osh26_vk_stats*o){if(!o)return -1;memset(o,0,sizeof(*o));o->ready=vk_ok;o->registered=mdl_ok;o->mnn_attention_enabled=g_mnn_attention_enabled;o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;o->prefill_q8_enabled=g_prefill_q8_enabled;o->decode_q8_enabled=g_decode_q8_enabled;o->q8_only_mode=g_q8_only_mode;o->embedding_head_shared=g_embedding_head_shared;o->resident_f32_matrix_bytes=g_resident_f32_matrix_bytes;o->debug_correctness=g_debug_correctness;o->last_attention_max_abs_err=g_last_attention_max_abs_err;o->attention_fallback_layers=g_attention_fallback_layers;o->last_forward_submit_count=g_last_forward_submit_count;o->last_prefill_submit_count=g_last_prefill_submit_count;o->last_layer_submit_count=g_last_layer_submit_count;o->last_lm_head_submit_count=g_last_lm_head_submit_count;o->last_ttft_submit_count=g_last_ttft_submit_count;o->last_forward_layers_ms=g_last_forward_layers_ms;o->last_forward_attention_ms=g_last_forward_attention_ms;o->last_forward_kv_update_ms=g_last_forward_kv_update_ms;o->last_forward_lm_head_ms=g_last_forward_lm_head_ms;o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;o->last_prefill_down_ms=g_last_prefill_down_ms;o->last_prefill_cpu_post_ms=g_last_prefill_cpu_post_ms;o->last_prefill_attention_ms=g_last_prefill_attention_ms;o->last_prefill_ffn_gate_up_silu_ms=g_last_prefill_ffn_gate_up_silu_ms;o->last_submit_wait_ms=g_last_submit_wait_ms;o->last_prefill_ms=g_last_prefill_ms;o->last_decode_ms=g_last_decode_ms;o->last_lm_head_ms=g_last_lm_head_ms;o->last_lm_head_gemv_ms=g_last_lm_head_gemv_ms;o->last_lm_head_local_topk_ms=g_last_lm_head_local_topk_ms;o->last_lm_head_merge_ms=g_last_lm_head_merge_ms;o->last_lm_head_wait_ms=g_last_lm_head_wait_ms;o->last_token_tps=g_last_token_tps;o->gpu_lm_head_enabled=g_gpu_lm_head_enabled;o->last_q8_benchmark_ran=g_last_q8_benchmark_ran;o->last_q8_gate_pass=g_last_q8_gate_pass;o->last_q8_weighted_f32_ms=g_last_q8_weighted_f32_ms;o->last_q8_weighted_total_ms=g_last_q8_weighted_total_ms;o->last_q8_weighted_speedup=g_last_q8_weighted_speedup;o->last_lm_head_validation_ran=g_last_lm_head_validation_ran;o->last_lm_head_validation_ok=g_last_lm_head_validation_ok;o->last_lm_head_validation_stage=g_last_lm_head_validation_stage;o->last_lm_head_matched_logit_max_abs_err=g_last_lm_head_matched_logit_max_abs_err;o->last_lm_head_top1_match=g_last_lm_head_top1_match;o->last_lm_head_top5_overlap=g_last_lm_head_top5_overlap;o->last_lm_head_top20_overlap=g_last_lm_head_top20_overlap;o->last_lm_head_cpu_top1_margin=g_last_lm_head_cpu_top1_margin;o->last_lm_head_validation_ms=g_last_lm_head_validation_ms;memcpy(o->last_lm_head_ref_top5,g_last_lm_head_ref_top5,sizeof(g_last_lm_head_ref_top5));memcpy(o->last_logits_top5,g_last_logits_top5,sizeof(g_last_logits_top5));memcpy(o->last_logits_top5_values,g_last_logits_top5_values,sizeof(g_last_logits_top5_values));return 0;}
 void osh26_vk_gpu_set_debug_correctness(bool enabled){g_debug_correctness=enabled;if(!enabled){g_last_attention_max_abs_err=0.0f;g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;}}
