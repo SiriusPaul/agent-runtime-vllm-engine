@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -25,15 +26,19 @@ namespace {
 constexpr int kDefaultContextSize = 8192;
 constexpr int kDefaultBatchSize = 512;
 constexpr int kDefaultMaxSeq = 1;
-constexpr int kShortPrefillTokenLimit = 64;
+constexpr int kShortPrefillTokenLimit = 32;
 constexpr int kMediumPrefillTokenLimit = 256;
-constexpr int kShortPrefillChunkSize = 64;
+constexpr int kShortPrefillChunkSize = 32;
 constexpr int kLongPrefillChunkSize = 128;
 constexpr int kGpuTopkCandidateCount = 32;
 constexpr int kGpuGuardTokenCount = 3;
 constexpr bool kEnablePrefixCache = true;
 constexpr int kPrefixCachePageTokens = OSH26_VK_PREFIX_CACHE_PAGE_TOKENS;
 constexpr int kPrefixCachePoolPages = OSH26_VK_PREFIX_CACHE_POOL_PAGES;
+
+bool prefix_cache_gpu_batch_copy_enabled() {
+    return std::getenv("OSH26_PREFIX_CACHE_GPU_COPY") != nullptr;
+}
 
 template <size_t N>
 constexpr std::array<int, N> prefix_policy_seq(int base = 1000) {
@@ -172,7 +177,18 @@ std::string describe_osh26_vk_stats() {
         << "\"q8_only_mode\":" << (stats.q8_only_mode ? "true" : "false") << ","
         << "\"embedding_head_shared\":" << (stats.embedding_head_shared ? "true" : "false") << ","
         << "\"resident_f32_matrix_bytes\":" << stats.resident_f32_matrix_bytes << ","
+        << "\"single_submit_enabled\":" << (stats.single_submit_enabled ? "true" : "false") << ","
+        << "\"last_single_submit_used\":" << (stats.last_single_submit_used ? "true" : "false") << ","
+        << "\"lm_head_q8_enabled\":" << (stats.lm_head_q8_enabled ? "true" : "false") << ","
+        << "\"lm_head_path\":\"" << json_escape(stats.lm_head_path) << "\","
+        << "\"lm_head_memory_path\":\"" << json_escape(stats.lm_head_memory_path) << "\","
+        << "\"lm_head_device_local_bytes\":" << stats.lm_head_device_local_bytes << ","
         << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
+        << "\"gpu_subgroup_size\":" << stats.gpu_subgroup_size << ","
+        << "\"gpu_integer_dot_product_supported\":" << (stats.gpu_integer_dot_product_supported ? "true" : "false") << ","
+        << "\"gpu_shader_int8_supported\":" << (stats.gpu_shader_int8_supported ? "true" : "false") << ","
+        << "\"gpu_timestamp_period_ns\":" << stats.gpu_timestamp_period_ns << ","
+        << "\"gpu_timestamp_valid_bits\":" << stats.gpu_timestamp_valid_bits << ","
         << "\"mnn_kv_layout\":\"FP16 cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
@@ -182,6 +198,10 @@ std::string describe_osh26_vk_stats() {
         << "\"last_forward_attention_ms\":" << stats.last_forward_attention_ms << ","
         << "\"last_forward_kv_update_ms\":" << stats.last_forward_kv_update_ms << ","
         << "\"last_forward_lm_head_ms\":" << stats.last_forward_lm_head_ms << ","
+        << "\"last_forward_gpu_ms\":" << stats.last_forward_gpu_ms << ","
+        << "\"last_forward_layers_gpu_ms\":" << stats.last_forward_layers_gpu_ms << ","
+        << "\"last_forward_lm_head_gpu_ms\":" << stats.last_forward_lm_head_gpu_ms << ","
+        << "\"last_forward_final_norm_gpu_ms\":" << stats.last_forward_final_norm_gpu_ms << ","
         << "\"last_prefill_qkv_ms\":" << stats.last_prefill_qkv_ms << ","
         << "\"last_prefill_qk_norm_rope_ms\":" << stats.last_prefill_qk_norm_rope_ms << ","
         << "\"last_prefill_o_proj_ms\":" << stats.last_prefill_o_proj_ms << ","
@@ -193,6 +213,10 @@ std::string describe_osh26_vk_stats() {
         << "\"last_layer_submit_count\":" << stats.last_layer_submit_count << ","
         << "\"last_lm_head_submit_count\":" << stats.last_lm_head_submit_count << ","
         << "\"last_ttft_submit_count\":" << stats.last_ttft_submit_count << ","
+        << "\"last_descriptor_alloc_count\":" << stats.last_descriptor_alloc_count << ","
+        << "\"last_descriptor_update_count\":" << stats.last_descriptor_update_count << ","
+        << "\"last_prefix_cache_store_gpu_ms\":" << stats.last_prefix_cache_store_gpu_ms << ","
+        << "\"last_prefix_cache_restore_gpu_ms\":" << stats.last_prefix_cache_restore_gpu_ms << ","
         << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
         << "\"last_decode_ms\":" << stats.last_decode_ms << ","
         << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
@@ -200,6 +224,11 @@ std::string describe_osh26_vk_stats() {
         << "\"last_lm_head_local_topk_ms\":" << stats.last_lm_head_local_topk_ms << ","
         << "\"last_lm_head_merge_ms\":" << stats.last_lm_head_merge_ms << ","
         << "\"last_lm_head_wait_ms\":" << stats.last_lm_head_wait_ms << ","
+        << "\"last_lm_head_gpu_ms\":" << stats.last_lm_head_gpu_ms << ","
+        << "\"last_lm_head_actq8_gpu_ms\":" << stats.last_lm_head_actq8_gpu_ms << ","
+        << "\"last_lm_head_dot_gpu_ms\":" << stats.last_lm_head_dot_gpu_ms << ","
+        << "\"last_lm_head_topk_gpu_ms\":" << stats.last_lm_head_topk_gpu_ms << ","
+        << "\"last_lm_head_merge_gpu_ms\":" << stats.last_lm_head_merge_gpu_ms << ","
         << "\"last_token_tps\":" << stats.last_token_tps << ","
         << "\"gpu_lm_head_enabled\":" << (stats.gpu_lm_head_enabled ? "true" : "false") << ","
         << "\"last_q8_benchmark_ran\":" << (stats.last_q8_benchmark_ran ? "true" : "false") << ","
@@ -553,13 +582,23 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
 
     const auto restore_start = std::chrono::steady_clock::now();
     const size_t restore_pages = reusable_tokens / prefix_cache_block_size_;
-    for (size_t page = 0; page < restore_pages; ++page) {
-        const int dst_token = static_cast<int>(page * prefix_cache_block_size_);
-        if (osh26_vk_gpu_prefix_cache_restore_page(entry->page_slots[page], dst_token) != 0) {
+    if (prefix_cache_gpu_batch_copy_enabled()) {
+        if (osh26_vk_gpu_prefix_cache_restore_pages(entry->page_slots.data(),
+                static_cast<int>(restore_pages), 0) != 0) {
             last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - restore_start).count();
             prefix_cache_misses_ += 1;
             return false;
+        }
+    } else {
+        for (size_t page = 0; page < restore_pages; ++page) {
+            const int dst_token = static_cast<int>(page * prefix_cache_block_size_);
+            if (osh26_vk_gpu_prefix_cache_restore_page(entry->page_slots[page], dst_token) != 0) {
+                last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - restore_start).count();
+                prefix_cache_misses_ += 1;
+                return false;
+            }
         }
     }
 
@@ -751,20 +790,39 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
     entry.page_slots.reserve(page_count);
 
     const auto store_start = std::chrono::steady_clock::now();
-    for (size_t page = 0; page < page_count; ++page) {
-        const int page_slot = prefix_cache_free_page_slots_.back();
-        prefix_cache_free_page_slots_.pop_back();
-        const int src_token = static_cast<int>(page * prefix_cache_block_size_);
-        if (osh26_vk_gpu_prefix_cache_store_page(page_slot, src_token) != 0) {
-            prefix_cache_free_page_slots_.push_back(page_slot);
-            for (const int slot : entry.page_slots) {
+    if (prefix_cache_gpu_batch_copy_enabled()) {
+        std::vector<int> page_slots;
+        page_slots.reserve(page_count);
+        for (size_t page = 0; page < page_count; ++page) {
+            const int page_slot = prefix_cache_free_page_slots_.back();
+            prefix_cache_free_page_slots_.pop_back();
+            page_slots.push_back(page_slot);
+        }
+        if (osh26_vk_gpu_prefix_cache_store_pages(page_slots.data(), static_cast<int>(page_slots.size()), 0) != 0) {
+            for (const int slot : page_slots) {
                 prefix_cache_free_page_slots_.push_back(slot);
             }
             last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - store_start).count();
             return;
         }
-        entry.page_slots.push_back(page_slot);
+        entry.page_slots = std::move(page_slots);
+    } else {
+        for (size_t page = 0; page < page_count; ++page) {
+            const int page_slot = prefix_cache_free_page_slots_.back();
+            prefix_cache_free_page_slots_.pop_back();
+            const int src_token = static_cast<int>(page * prefix_cache_block_size_);
+            if (osh26_vk_gpu_prefix_cache_store_page(page_slot, src_token) != 0) {
+                prefix_cache_free_page_slots_.push_back(page_slot);
+                for (const int slot : entry.page_slots) {
+                    prefix_cache_free_page_slots_.push_back(slot);
+                }
+                last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - store_start).count();
+                return;
+            }
+            entry.page_slots.push_back(page_slot);
+        }
     }
 
     last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(

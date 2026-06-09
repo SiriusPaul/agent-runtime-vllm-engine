@@ -1,0 +1,53 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint stride;
+} pc;
+
+layout(set=0,binding=0,std430) readonly buffer WQ { uint wq[]; };
+layout(set=0,binding=1,std430) readonly buffer XQ { uint xq[]; };
+layout(set=0,binding=2,std430) writeonly buffer Y { float y[]; };
+
+int unpack_i8(uint word, uint idx) {
+    return bitfieldExtract(int(word), int(idx * 8u), 8);
+}
+
+void main() {
+    if (pc.M != 1u) return;
+
+    uint n = gl_WorkGroupID.x;
+    if (n >= pc.N) return;
+
+    uint lid = gl_LocalInvocationID.x;
+    uint blocks = (pc.K + 31u) / 32u;
+    uint w_words_offset = pc.N * blocks;
+    uint x_words_offset = pc.M * blocks;
+
+    float sum = 0.0;
+    for (uint block = lid; block < blocks; block += 32u) {
+        float w_scale = uintBitsToFloat(wq[n * blocks + block]);
+        float x_scale = uintBitsToFloat(xq[block]); // M=1: activation row 0
+        int dot = 0;
+        uint w_base = w_words_offset + (n * blocks + block) * 8u;
+        uint x_base = x_words_offset + (0 * blocks + block) * 8u;
+        for (uint wi = 0u; wi < 8u; ++wi) {
+            dot += unpack_i8(wq[w_base + wi], 0u) * unpack_i8(xq[x_base + wi], 0u);
+            dot += unpack_i8(wq[w_base + wi], 1u) * unpack_i8(xq[x_base + wi], 1u);
+            dot += unpack_i8(wq[w_base + wi], 2u) * unpack_i8(xq[x_base + wi], 2u);
+            dot += unpack_i8(wq[w_base + wi], 3u) * unpack_i8(xq[x_base + wi], 3u);
+        }
+        sum += float(dot) * w_scale * x_scale;
+    }
+    sum = subgroupAdd(sum);
+
+    if (lid == 0u) {
+        y[n] = sum;
+    }
+}

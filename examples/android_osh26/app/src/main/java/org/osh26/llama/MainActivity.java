@@ -64,7 +64,7 @@ public class MainActivity extends Activity {
         Button stopServer = findViewById(R.id.stop_server);
 
         File modelDir = new File(getFilesDir(), "models");
-        modelPath.setText(new File(modelDir, "qwen3-0.6b.gguf").getAbsolutePath());
+        modelPath.setText(new File(modelDir, "qwen3-1.7b-q8_0.gguf").getAbsolutePath());
         appendSystemLine(httpServer.start());
         refreshStatsAsync();
 

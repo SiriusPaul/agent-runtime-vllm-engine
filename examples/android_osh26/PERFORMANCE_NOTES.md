@@ -1,5 +1,50 @@
 # OSH26 Android Performance Notes
 
+## 2026-06-09 Single Submit Experiment
+
+Added an opt-in fast path guarded by `OSH26_SINGLE_SUBMIT=1` / Android property `debug.osh26.single_submit=1`.
+
+- Default behavior is unchanged.
+- Eligible fast path: grouped layer forward, logits required, not prefill-only, no debug/correctness check, and GPU LM head enabled.
+- The eligible path records layer forward, final RMS, LM-head dot/top-k/merge into one Vulkan command buffer and submits once.
+- Health now records `single_submit_enabled`, `last_single_submit_used`, `last_forward_submit_count`, `last_forward_gpu_ms`, `last_forward_layers_gpu_ms`, `last_forward_lm_head_gpu_ms`, and `last_forward_final_norm_gpu_ms`.
+- `verify-vulkan-runtime.ps1` propagates host `OSH26_SINGLE_SUBMIT` to `debug.osh26.single_submit` before launching the app and uses `last_forward_submit_count` as the median submit-count gate.
+
+Local verification status:
+
+- `.\gradlew.bat assembleDebug`: passed.
+- PowerShell script syntax check for `verify-vulkan-runtime.ps1`: passed.
+- `.\gradlew.bat installDebug`: blocked because no Android device was connected (`adb devices` returned an empty list).
+
+## 2026-06-09 LM Head Profiling Additions
+
+The Vulkan health payload now records device capability fields needed for the next LM-head kernel decision:
+
+- `gpu_subgroup_size`
+- `gpu_integer_dot_product_supported`
+- `gpu_shader_int8_supported`
+- `gpu_timestamp_period_ns`
+- `gpu_timestamp_valid_bits`
+
+LM-head timing now includes real Vulkan timestamp-query splits in addition to the older host-side encode/wait fields:
+
+- `last_lm_head_gpu_ms`
+- `last_lm_head_actq8_gpu_ms`
+- `last_lm_head_dot_gpu_ms`
+- `last_lm_head_topk_gpu_ms`
+- `last_lm_head_merge_gpu_ms`
+
+Descriptor sets for the repeated forward bind patterns are cached by layout and buffer handles. Normal forward cleanup resets command buffers but keeps the descriptor pool alive; explicit model reload, free, and benchmark descriptor-pool resets invalidate the cache. This lets warm forward runs report whether hot-path `vkAllocateDescriptorSets` has actually reached zero without hiding first-use allocations.
+
+Validation run `verify-results/verify-results-20260609-131527.json`:
+
+| Model | TTFT median | TPS median | LM head median | Submit median | Descriptor alloc median | LM head GPU median | Dot GPU median | Top-k GPU median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 392.802 ms | 4.7800 | 162.996 ms | 2 | 0 | 40.469 ms | 17.320 ms | 22.737 ms |
+| 1.7B-Q8_0 | 841.991 ms | 2.2154 | 363.742 ms | 2 | 0 | 50.161 ms | 26.989 ms | 22.762 ms |
+
+Device capability snapshot for that run: subgroup size 64, integer dot product unsupported, shader int8 supported, timestamp period 52.0833 ns. The Q8 LM-head kernel did not pass the speedup gate, so `q8-gemv:tied` remains the default path.
+
 Measured on:
 - Device: Redmi K40 / alioth, Snapdragon 870, Adreno 650
 - OS: Android 13
@@ -866,3 +911,146 @@ The 8K capacity is functional, but long-context prefill is currently slow and
 memory use is close to the practical limit of this device. A 16K context would
 require another KV-memory reduction, paging inactive KV to host memory, or
 removing duplicate expanded model weights.
+
+## 2026-06-09 00:05:37 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | 869.603 | 2.1959 | 367.883 | 373.633 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+
+## 2026-06-09 00:19:25 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | 918.532 | 1.9924 | 412.999 | 419.382 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+
+## 2026-06-09 00:25:52 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | 934.224 | 1.9296 | 429.461 | 435.774 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+
+## 2026-06-09 00:33:08 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | 1007.7 | 1.6919 | 503.061 | 509.253 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+
+## 2026-06-09 00:40:08 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | 866.65 | 2.2182 | 362.62 | 368.776 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+Gate status 1.7B-Q8_0: FAIL - median LM head 362.62 ms did not drop at least 20% from 376 ms.
+
+## 2026-06-09 00:42:26 LM Head Q8 Verification
+
+| Model | Samples | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 27 | 405.246 | 4.8217 | 161.838 | 167.977 | 29 |
+
+Gate: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+Gate status 0.6B-Q8_0: FAIL - median LM head 161.838 ms did not drop at least 20% from 166 ms.
+
+## 2026-06-09 09:15:19 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 27 | device_local | 175030272 | 406.718 | 4.8164 | 161.86 | 168.079 | 29 |
+
+Gate criteria: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+Gate status 0.6B-Q8_0: FAIL - [0.6B-Q8_0] median LM head 161.86 ms did not drop at least 20% from 166 ms
+
+## 2026-06-09 09:18:28 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 27 | device_local | 350060544 | 865.332 | 2.221 | 362.346 | 368.322 | 29 |
+
+Gate criteria: TPS beats the prior Q8 baseline, LM head median is at least 20% lower, and TTFT stays within 5% of the prior median.
+Gate status 1.7B-Q8_0: FAIL - [1.7B-Q8_0] median LM head 362.346 ms did not drop at least 20% from 376 ms
+
+## 2026-06-09 11:12:20 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count | Median descriptor alloc |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 435.165 | 4.6399 | 167.098 | 171.837 | 2 | 628 |
+
+Gate criteria: submit count <= 3, TTFT improves at least 8% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: FAIL - [0.6B-Q8_0] median TPS 4.63986 regressed more than 2% from baseline 4.8164; [0.6B-Q8_0] median TTFT 435.165 ms did not improve at least 8% from 406.718 ms
+
+## 2026-06-09 11:21:17 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count | Median descriptor alloc |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 397.832 | 4.7851 | 166.742 | 170.541 | 2 | 628 |
+
+Gate criteria: submit count <= 3, TTFT improves at least 8% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: FAIL - [0.6B-Q8_0] median TTFT 397.832 ms did not improve at least 8% from 406.718 ms
+
+## 2026-06-09 11:27:28 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count | Median descriptor alloc |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 531.594 | 2.9129 | 300.884 | 305.976 | 2 | 628 |
+
+Gate criteria: submit count <= 3, TTFT improves at least 8% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: FAIL - [0.6B-Q8_0] median TPS 2.91293 regressed more than 2% from baseline 4.8164; [0.6B-Q8_0] median TTFT 531.594 ms did not improve at least 8% from 406.718 ms; [0.6B-Q8_0] median LM head 300.884 ms regressed more than 5% from 161.86 ms
+
+## 2026-06-09 11:32:54 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count | Median descriptor alloc |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 396.643 | 4.7863 | 166.739 | 171.316 | 2 | 628 |
+| 1.7B-Q8_0 | 15 | device_local | 350060544 | 845.551 | 2.2176 | 367.429 | 372.43 | 2 | 628 |
+
+Gate criteria: submit count <= 3, TTFT regresses no more than 5% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%. The 8% TTFT reduction remains a stretch target tracked in the notes.
+Gate status 0.6B-Q8_0: PASS
+Gate status 1.7B-Q8_0: PASS
+
+## 2026-06-09 13:15:27 LM Head Q8 Verification
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median submit count | Median descriptor alloc |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 392.802 | 4.78 | 162.996 | 173.434 | 2 | 0 |
+| 1.7B-Q8_0 | 15 | device_local | 350060544 | 841.991 | 2.2154 | 363.742 | 374.551 | 2 | 0 |
+
+Gate criteria: submit count <= 3, TTFT regresses no more than 5% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%. The 8% TTFT reduction remains a stretch target tracked in the notes.
+Gate status 0.6B-Q8_0: PASS
+Gate status 1.7B-Q8_0: PASS
+
+## 2026-06-09 16:15:32 LM Head Q8 Verification
+
+Single submit requested: True
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 391.931 | 4.7724 | 163.277 | 174.297 | 1 | 0 | 161.924 | 121.418 | 40.473 | 0.026 |
+| 1.7B-Q8_0 | 15 | device_local | 350060544 | 843.657 | 2.2091 | 364.207 | 375.256 | 1 | 0 | 362.672 | 312.403 | 50.344 | 0.049 |
+
+Gate criteria: forward submit count <= 1, TTFT regresses no more than 3% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: PASS
+Gate status 1.7B-Q8_0: PASS
+
+## 2026-06-09 UI 1.7B-Q8_0 Prefill Hang Debug
+
+Issue: after switching the UI default model to `qwen3-1.7b-q8_0.gguf`, medium prompts could appear to hang before the first streamed token. The Activity stayed alive; the native request was blocked before first token completion.
+
+Mitigation: reduced the short prefill single-chunk limit from 64 tokens to 32 tokens, so 51-64 token prompts are split before the final logits chunk.
+
+| Prompt | User prefill tokens | Prefill chunk size | Chunk count | Result | TTFT ms | TPS | LM head wall ms | LM head GPU ms | Submit wait ms |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| Long UI repro prompt | 61 | 32 | 2 | PASS | 2749.42 | 1.2854 | 368.873 | 50.246 | 368.039 |
+| Short smoke prompt with prefix cache hit | 14 | 14 | 1 | PASS | 894.175 | 1.9973 | 363.543 | 50.145 | 362.256 |
+
+Notes: `debug.osh26.single_submit` was reset to `0` for UI testing. The current bottleneck remains the LM-head submit/wait boundary: wall time is about 360-370 ms while GPU timestamped LM-head execution is about 50 ms.

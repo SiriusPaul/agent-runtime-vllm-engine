@@ -16,6 +16,7 @@ int InitVulkan(void) {
     LOAD(CreateInstance); LOAD(DestroyInstance); LOAD(EnumeratePhysicalDevices);
     LOAD(GetPhysicalDeviceFeatures); LOAD(GetPhysicalDeviceFeatures2);
     LOAD(GetPhysicalDeviceFormatProperties); LOAD(GetPhysicalDeviceProperties);
+    LOAD(GetPhysicalDeviceProperties2);
     LOAD(GetPhysicalDeviceQueueFamilyProperties); LOAD(GetPhysicalDeviceMemoryProperties);
     LOAD(GetInstanceProcAddr); LOAD(GetDeviceProcAddr);
     LOAD(EnumerateDeviceExtensionProperties);
@@ -38,6 +39,8 @@ int InitVulkan(void) {
     LOAD(CreateDescriptorPool); LOAD(DestroyDescriptorPool);
     LOAD(ResetDescriptorPool);
     LOAD(AllocateDescriptorSets); LOAD(FreeDescriptorSets); LOAD(UpdateDescriptorSets);
+    /* Query */
+    LOAD(CreateQueryPool); LOAD(DestroyQueryPool); LOAD(GetQueryPoolResults);
     /* Command */
     LOAD(CreateCommandPool); LOAD(DestroyCommandPool); LOAD(ResetCommandPool);
     LOAD(AllocateCommandBuffers); LOAD(FreeCommandBuffers);
@@ -45,6 +48,7 @@ int InitVulkan(void) {
     LOAD(CmdBindPipeline); LOAD(CmdBindDescriptorSets);
     LOAD(CmdDispatch); LOAD(CmdPipelineBarrier); LOAD(CmdPushConstants);
     LOAD(CmdCopyBuffer); LOAD(CmdFillBuffer);
+    LOAD(CmdResetQueryPool); LOAD(CmdWriteTimestamp);
     LOGI("Vulkan functions loaded OK");
     done = 1; return 1;
 }
@@ -57,6 +61,7 @@ PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
 PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
 PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties;
+PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
 PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties;
 PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
@@ -96,6 +101,9 @@ PFN_vkResetDescriptorPool vkResetDescriptorPool;
 PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets;
 PFN_vkFreeDescriptorSets vkFreeDescriptorSets;
 PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
+PFN_vkCreateQueryPool vkCreateQueryPool;
+PFN_vkDestroyQueryPool vkDestroyQueryPool;
+PFN_vkGetQueryPoolResults vkGetQueryPoolResults;
 PFN_vkCreateCommandPool vkCreateCommandPool;
 PFN_vkDestroyCommandPool vkDestroyCommandPool;
 PFN_vkResetCommandPool vkResetCommandPool;
@@ -110,3 +118,5 @@ PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
 PFN_vkCmdPushConstants vkCmdPushConstants;
 PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
 PFN_vkCmdFillBuffer vkCmdFillBuffer;
+PFN_vkCmdResetQueryPool vkCmdResetQueryPool;
+PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp;
