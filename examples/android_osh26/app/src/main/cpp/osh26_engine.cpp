@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -25,15 +26,19 @@ namespace {
 constexpr int kDefaultContextSize = 8192;
 constexpr int kDefaultBatchSize = 512;
 constexpr int kDefaultMaxSeq = 1;
-constexpr int kShortPrefillTokenLimit = 64;
+constexpr int kShortPrefillTokenLimit = 32;
 constexpr int kMediumPrefillTokenLimit = 256;
-constexpr int kShortPrefillChunkSize = 64;
+constexpr int kShortPrefillChunkSize = 32;
 constexpr int kLongPrefillChunkSize = 128;
 constexpr int kGpuTopkCandidateCount = 32;
 constexpr int kGpuGuardTokenCount = 3;
 constexpr bool kEnablePrefixCache = true;
 constexpr int kPrefixCachePageTokens = OSH26_VK_PREFIX_CACHE_PAGE_TOKENS;
 constexpr int kPrefixCachePoolPages = OSH26_VK_PREFIX_CACHE_POOL_PAGES;
+
+bool prefix_cache_gpu_batch_copy_enabled() {
+    return std::getenv("OSH26_PREFIX_CACHE_GPU_COPY") != nullptr;
+}
 
 template <size_t N>
 constexpr std::array<int, N> prefix_policy_seq(int base = 1000) {
@@ -169,7 +174,23 @@ std::string describe_osh26_vk_stats() {
         << "\"mnn_prefill_attention_enabled\":" << (stats.mnn_prefill_attention_enabled ? "true" : "false") << ","
         << "\"prefill_q8_enabled\":" << (stats.prefill_q8_enabled ? "true" : "false") << ","
         << "\"decode_q8_enabled\":" << (stats.decode_q8_enabled ? "true" : "false") << ","
+        << "\"decode_q8_gemv_enabled\":" << (stats.decode_q8_gemv_enabled ? "true" : "false") << ","
+        << "\"last_decode_q8_gemv_used\":" << (stats.last_decode_q8_gemv_used ? "true" : "false") << ","
+        << "\"q8_only_mode\":" << (stats.q8_only_mode ? "true" : "false") << ","
+        << "\"embedding_head_shared\":" << (stats.embedding_head_shared ? "true" : "false") << ","
+        << "\"resident_f32_matrix_bytes\":" << stats.resident_f32_matrix_bytes << ","
+        << "\"single_submit_enabled\":" << (stats.single_submit_enabled ? "true" : "false") << ","
+        << "\"last_single_submit_used\":" << (stats.last_single_submit_used ? "true" : "false") << ","
+        << "\"lm_head_q8_enabled\":" << (stats.lm_head_q8_enabled ? "true" : "false") << ","
+        << "\"lm_head_path\":\"" << json_escape(stats.lm_head_path) << "\","
+        << "\"lm_head_memory_path\":\"" << json_escape(stats.lm_head_memory_path) << "\","
+        << "\"lm_head_device_local_bytes\":" << stats.lm_head_device_local_bytes << ","
         << "\"debug_correctness\":" << (stats.debug_correctness ? "true" : "false") << ","
+        << "\"gpu_subgroup_size\":" << stats.gpu_subgroup_size << ","
+        << "\"gpu_integer_dot_product_supported\":" << (stats.gpu_integer_dot_product_supported ? "true" : "false") << ","
+        << "\"gpu_shader_int8_supported\":" << (stats.gpu_shader_int8_supported ? "true" : "false") << ","
+        << "\"gpu_timestamp_period_ns\":" << stats.gpu_timestamp_period_ns << ","
+        << "\"gpu_timestamp_valid_bits\":" << stats.gpu_timestamp_valid_bits << ","
         << "\"mnn_kv_layout\":\"FP16 cacheKey[kvHeadNum,headDim/4,maxLen].vec4 cacheValue[kvHeadNum,maxLen,headDim/4].vec4\","
         << "\"last_attention_max_abs_err\":" << stats.last_attention_max_abs_err << ","
         << "\"attention_fallback_layers\":" << stats.attention_fallback_layers << ","
@@ -179,6 +200,16 @@ std::string describe_osh26_vk_stats() {
         << "\"last_forward_attention_ms\":" << stats.last_forward_attention_ms << ","
         << "\"last_forward_kv_update_ms\":" << stats.last_forward_kv_update_ms << ","
         << "\"last_forward_lm_head_ms\":" << stats.last_forward_lm_head_ms << ","
+        << "\"last_forward_gpu_ms\":" << stats.last_forward_gpu_ms << ","
+        << "\"last_forward_layers_gpu_ms\":" << stats.last_forward_layers_gpu_ms << ","
+        << "\"last_forward_lm_head_gpu_ms\":" << stats.last_forward_lm_head_gpu_ms << ","
+        << "\"last_forward_final_norm_gpu_ms\":" << stats.last_forward_final_norm_gpu_ms << ","
+        << "\"last_decode_layers_gpu_ms\":" << stats.last_decode_layers_gpu_ms << ","
+        << "\"last_decode_qkv_gpu_ms\":" << stats.last_decode_qkv_gpu_ms << ","
+        << "\"last_decode_attention_gpu_ms\":" << stats.last_decode_attention_gpu_ms << ","
+        << "\"last_decode_o_proj_gpu_ms\":" << stats.last_decode_o_proj_gpu_ms << ","
+        << "\"last_decode_ffn_gate_up_gpu_ms\":" << stats.last_decode_ffn_gate_up_gpu_ms << ","
+        << "\"last_decode_ffn_down_gpu_ms\":" << stats.last_decode_ffn_down_gpu_ms << ","
         << "\"last_prefill_qkv_ms\":" << stats.last_prefill_qkv_ms << ","
         << "\"last_prefill_qk_norm_rope_ms\":" << stats.last_prefill_qk_norm_rope_ms << ","
         << "\"last_prefill_o_proj_ms\":" << stats.last_prefill_o_proj_ms << ","
@@ -190,6 +221,10 @@ std::string describe_osh26_vk_stats() {
         << "\"last_layer_submit_count\":" << stats.last_layer_submit_count << ","
         << "\"last_lm_head_submit_count\":" << stats.last_lm_head_submit_count << ","
         << "\"last_ttft_submit_count\":" << stats.last_ttft_submit_count << ","
+        << "\"last_descriptor_alloc_count\":" << stats.last_descriptor_alloc_count << ","
+        << "\"last_descriptor_update_count\":" << stats.last_descriptor_update_count << ","
+        << "\"last_prefix_cache_store_gpu_ms\":" << stats.last_prefix_cache_store_gpu_ms << ","
+        << "\"last_prefix_cache_restore_gpu_ms\":" << stats.last_prefix_cache_restore_gpu_ms << ","
         << "\"last_prefill_ms\":" << stats.last_prefill_ms << ","
         << "\"last_decode_ms\":" << stats.last_decode_ms << ","
         << "\"last_lm_head_ms\":" << stats.last_lm_head_ms << ","
@@ -197,6 +232,11 @@ std::string describe_osh26_vk_stats() {
         << "\"last_lm_head_local_topk_ms\":" << stats.last_lm_head_local_topk_ms << ","
         << "\"last_lm_head_merge_ms\":" << stats.last_lm_head_merge_ms << ","
         << "\"last_lm_head_wait_ms\":" << stats.last_lm_head_wait_ms << ","
+        << "\"last_lm_head_gpu_ms\":" << stats.last_lm_head_gpu_ms << ","
+        << "\"last_lm_head_actq8_gpu_ms\":" << stats.last_lm_head_actq8_gpu_ms << ","
+        << "\"last_lm_head_dot_gpu_ms\":" << stats.last_lm_head_dot_gpu_ms << ","
+        << "\"last_lm_head_topk_gpu_ms\":" << stats.last_lm_head_topk_gpu_ms << ","
+        << "\"last_lm_head_merge_gpu_ms\":" << stats.last_lm_head_merge_gpu_ms << ","
         << "\"last_token_tps\":" << stats.last_token_tps << ","
         << "\"gpu_lm_head_enabled\":" << (stats.gpu_lm_head_enabled ? "true" : "false") << ","
         << "\"last_q8_benchmark_ran\":" << (stats.last_q8_benchmark_ran ? "true" : "false") << ","
@@ -550,13 +590,23 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
 
     const auto restore_start = std::chrono::steady_clock::now();
     const size_t restore_pages = reusable_tokens / prefix_cache_block_size_;
-    for (size_t page = 0; page < restore_pages; ++page) {
-        const int dst_token = static_cast<int>(page * prefix_cache_block_size_);
-        if (osh26_vk_gpu_prefix_cache_restore_page(entry->page_slots[page], dst_token) != 0) {
+    if (prefix_cache_gpu_batch_copy_enabled()) {
+        if (osh26_vk_gpu_prefix_cache_restore_pages(entry->page_slots.data(),
+                static_cast<int>(restore_pages), 0) != 0) {
             last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - restore_start).count();
             prefix_cache_misses_ += 1;
             return false;
+        }
+    } else {
+        for (size_t page = 0; page < restore_pages; ++page) {
+            const int dst_token = static_cast<int>(page * prefix_cache_block_size_);
+            if (osh26_vk_gpu_prefix_cache_restore_page(entry->page_slots[page], dst_token) != 0) {
+                last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - restore_start).count();
+                prefix_cache_misses_ += 1;
+                return false;
+            }
         }
     }
 
@@ -748,20 +798,39 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
     entry.page_slots.reserve(page_count);
 
     const auto store_start = std::chrono::steady_clock::now();
-    for (size_t page = 0; page < page_count; ++page) {
-        const int page_slot = prefix_cache_free_page_slots_.back();
-        prefix_cache_free_page_slots_.pop_back();
-        const int src_token = static_cast<int>(page * prefix_cache_block_size_);
-        if (osh26_vk_gpu_prefix_cache_store_page(page_slot, src_token) != 0) {
-            prefix_cache_free_page_slots_.push_back(page_slot);
-            for (const int slot : entry.page_slots) {
+    if (prefix_cache_gpu_batch_copy_enabled()) {
+        std::vector<int> page_slots;
+        page_slots.reserve(page_count);
+        for (size_t page = 0; page < page_count; ++page) {
+            const int page_slot = prefix_cache_free_page_slots_.back();
+            prefix_cache_free_page_slots_.pop_back();
+            page_slots.push_back(page_slot);
+        }
+        if (osh26_vk_gpu_prefix_cache_store_pages(page_slots.data(), static_cast<int>(page_slots.size()), 0) != 0) {
+            for (const int slot : page_slots) {
                 prefix_cache_free_page_slots_.push_back(slot);
             }
             last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - store_start).count();
             return;
         }
-        entry.page_slots.push_back(page_slot);
+        entry.page_slots = std::move(page_slots);
+    } else {
+        for (size_t page = 0; page < page_count; ++page) {
+            const int page_slot = prefix_cache_free_page_slots_.back();
+            prefix_cache_free_page_slots_.pop_back();
+            const int src_token = static_cast<int>(page * prefix_cache_block_size_);
+            if (osh26_vk_gpu_prefix_cache_store_page(page_slot, src_token) != 0) {
+                prefix_cache_free_page_slots_.push_back(page_slot);
+                for (const int slot : entry.page_slots) {
+                    prefix_cache_free_page_slots_.push_back(slot);
+                }
+                last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - store_start).count();
+                return;
+            }
+            entry.page_slots.push_back(page_slot);
+        }
     }
 
     last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
@@ -911,7 +980,7 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
     // CPU-only for llama.cpp (n_gpu_layers=0), weights go to GPU pool separately
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;
-    model_params.use_mmap = false;
+    model_params.use_mmap = true;
     model_params.use_mlock = false;
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (model_ == nullptr) {
@@ -932,28 +1001,34 @@ std::string ComputeBackend::load_model(const std::string & model_path) {
         __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "Skipping GPU model load (CPU backend requested)");
     }
 
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = kDefaultContextSize;
-    ctx_params.n_batch = kDefaultBatchSize;
-    ctx_params.n_ubatch = kDefaultBatchSize;
-    ctx_params.n_seq_max = kDefaultMaxSeq;
-    ctx_params.n_threads = default_thread_count();
-    ctx_params.n_threads_batch = ctx_params.n_threads;
-    // The custom Vulkan backend does not implement the KV update/attention ops yet.
-    // Keep KV cache in CPU memory while allowing layer weights and supported matmuls on GPU.
-    ctx_params.offload_kqv = false;
-    ctx_params.op_offload = false;
-    ctx_params.no_perf = false;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    ctx_ = llama_init_from_model(model_, ctx_params);
-    if (ctx_ == nullptr) {
-        osh26_vk_gpu_free();
-        llama_model_free(model_);
-        model_ = nullptr;
-        model_path_.clear();
-        active_backend_ = "llama.cpp CPU";
-        last_error_ = "failed to create llama_context";
-        return last_error_;
+    // For Vulkan production mode (no debug correctness), skip CPU context entirely.
+    // Only the model (for tokenizer/vocab) is kept; GPU context handles everything else.
+    const bool needs_cpu_context = (requested_backend_ != "vulkan") || debug_correctness_;
+    if (needs_cpu_context) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = kDefaultContextSize;
+        ctx_params.n_batch = kDefaultBatchSize;
+        ctx_params.n_ubatch = kDefaultBatchSize;
+        ctx_params.n_seq_max = kDefaultMaxSeq;
+        ctx_params.n_threads = default_thread_count();
+        ctx_params.n_threads_batch = ctx_params.n_threads;
+        ctx_params.offload_kqv = false;
+        ctx_params.op_offload = false;
+        ctx_params.no_perf = false;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        ctx_ = llama_init_from_model(model_, ctx_params);
+        if (ctx_ == nullptr) {
+            osh26_vk_gpu_free();
+            llama_model_free(model_);
+            model_ = nullptr;
+            model_path_.clear();
+            active_backend_ = "llama.cpp CPU";
+            last_error_ = "failed to create llama_context";
+            return last_error_;
+        }
+    } else {
+        ctx_ = nullptr;
+        __android_log_write(ANDROID_LOG_INFO, "OSH26Llama", "CPU context skipped (Vulkan production mode)");
     }
 
     model_path_ = model_path;
@@ -994,8 +1069,13 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (model_ == nullptr || ctx_ == nullptr) {
+        if (model_ == nullptr) {
             result.error = "model is not loaded";
+            last_error_ = result.error;
+            return result;
+        }
+        if (requested_backend_ != "vulkan" && ctx_ == nullptr) {
+            result.error = "model is not loaded (CPU backend requires context)";
             last_error_ = result.error;
             return result;
         }
@@ -1483,8 +1563,10 @@ cpu_path:
         result.finish_reason = "stop";
     }
 
+    if (ctx_ != nullptr) {
+        llama_memory_clear(llama_get_memory(ctx_), false);
+    }
     llama_sampler_free(sampler);
-    llama_memory_clear(llama_get_memory(ctx_), false);
 
     osh26_vk_stats vk_stats {};
     const bool have_vk_stats = use_gpu && osh26_vk_get_stats(&vk_stats) == 0;
@@ -1657,6 +1739,7 @@ std::string ComputeBackend::stats_json() const {
         << "  \"debug_correctness\": " << (debug_correctness_ ? "true" : "false") << ",\n"
         << "  \"gpu_offload_supported\": " << (llama_supports_gpu_offload() ? "true" : "false") << ",\n"
         << "  \"kv_cache_device\": \"" << (requested_backend_ == "vulkan" ? "CPU llama.cpp ctx + OSH26 Vulkan packed KV" : "CPU") << "\",\n"
+        << "  \"cpu_context_active\": " << (ctx_ != nullptr ? "true" : "false") << ",\n"
         << "  \"max_context_tokens\": " << kDefaultContextSize << ",\n"
         << "  \"short_prefill_token_limit\": " << kShortPrefillTokenLimit << ",\n"
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"

@@ -111,7 +111,12 @@
       "PowerShell($glslc = \"C:\\\\Users\\\\18259\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\ndk\\\\28.2.13676358\\\\shader-tools\\\\windows-x86_64\\\\glslc.exe\"; $dir = \"D:\\\\Programs\\\\llama\\\\examples\\\\android_osh26\\\\app\\\\src\\\\main\\\\cpp\"; & $glslc --version 2>&1)",
       "PowerShell($glslc = \"C:\\\\Users\\\\18259\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\ndk\\\\28.2.13676358\\\\shader-tools\\\\windows-x86_64\\\\glslc.exe\"; $dir = \"D:\\\\Programs\\\\llama\\\\examples\\\\android_osh26\\\\app\\\\src\\\\main\\\\cpp\"; & $glslc -fshader-stage=compute --target-env=spv1.3 \"$dir\\\\attention_decode_q1_subgroup.comp\" -o \"$dir\\\\attn_decode_q1.spv\" 2>&1; if \\($LASTEXITCODE -eq 0\\) { Write-Output \"OK\" } else { Write-Output \"FAIL\" })",
       "PowerShell($glslc = \"C:\\\\Users\\\\18259\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\ndk\\\\28.2.13676358\\\\shader-tools\\\\windows-x86_64\\\\glslc.exe\"; $dir = \"D:\\\\Programs\\\\llama\\\\examples\\\\android_osh26\\\\app\\\\src\\\\main\\\\cpp\"; & $glslc -fshader-stage=compute --target-env=vulkan1.1 \"$dir\\\\attention_decode_q1_subgroup.comp\" -o \"$dir\\\\attn_decode_q1.spv\" 2>&1; if \\($LASTEXITCODE -eq 0\\) { Write-Output \"decode OK\" } else { Write-Output \"decode FAILED\" })",
-      "PowerShell($glslc = \"C:\\\\Users\\\\18259\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\ndk\\\\28.2.13676358\\\\shader-tools\\\\windows-x86_64\\\\glslc.exe\"; $dir = \"D:\\\\Programs\\\\llama\\\\examples\\\\android_osh26\\\\app\\\\src\\\\main\\\\cpp\"; & $glslc -fshader-stage=compute --target-env=vulkan1.1 \"$dir\\\\attention_kvcache_update.comp\" -o \"$dir\\\\attn_kvcache.spv\" 2>&1; if \\($LASTEXITCODE -eq 0\\) { Write-Output \"kvcache OK\" } else { Write-Output \"kvcache FAIL\" })"
+      "PowerShell($glslc = \"C:\\\\Users\\\\18259\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\ndk\\\\28.2.13676358\\\\shader-tools\\\\windows-x86_64\\\\glslc.exe\"; $dir = \"D:\\\\Programs\\\\llama\\\\examples\\\\android_osh26\\\\app\\\\src\\\\main\\\\cpp\"; & $glslc -fshader-stage=compute --target-env=vulkan1.1 \"$dir\\\\attention_kvcache_update.comp\" -o \"$dir\\\\attn_kvcache.spv\" 2>&1; if \\($LASTEXITCODE -eq 0\\) { Write-Output \"kvcache OK\" } else { Write-Output \"kvcache FAIL\" })",
+      "Bash(./gradlew.bat --version)",
+      "Read(//d/下载/**)",
+      "Bash(adb push *)",
+      "Bash(adb wait-for-device *)",
+      "Bash(python -c ' *)"
     ]
   }
 }

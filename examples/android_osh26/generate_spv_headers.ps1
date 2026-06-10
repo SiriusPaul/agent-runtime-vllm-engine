@@ -44,6 +44,11 @@ Write-SpvHeader `
     -SymbolName "_tmp_lm_head_topk_local_spv"
 
 Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/lm_head_q8_topk_local.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/lm_head_q8_topk_local.spv.h" `
+    -SymbolName "_tmp_lm_head_q8_topk_local_spv"
+
+Write-SpvHeader `
     -SourcePath "examples/android_osh26/app/src/main/cpp/lm_head_topk_merge.comp" `
     -HeaderPath "examples/android_osh26/app/src/main/cpp/lm_head_topk_merge.spv.h" `
     -SymbolName "_tmp_lm_head_topk_merge_spv"
@@ -107,3 +112,8 @@ Write-SpvHeader `
     -SourcePath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_finalize.comp" `
     -HeaderPath "examples/android_osh26/app/src/main/cpp/attention_prefill_kblock_finalize.spv.h" `
     -SymbolName "_tmp_attention_prefill_kblock_finalize_spv"
+
+Write-SpvHeader `
+    -SourcePath "examples/android_osh26/app/src/main/cpp/gemv_q8_packed.comp" `
+    -HeaderPath "examples/android_osh26/app/src/main/cpp/gemv_q8_packed.spv.h" `
+    -SymbolName "_tmp_gemv_q8_packed_spv"

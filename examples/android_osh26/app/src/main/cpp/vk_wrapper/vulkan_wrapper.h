@@ -18,6 +18,7 @@ extern PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
 extern PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
 extern PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 extern PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties;
+extern PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
 extern PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties;
 extern PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
@@ -62,6 +63,10 @@ extern PFN_vkResetDescriptorPool vkResetDescriptorPool;
 extern PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets;
 extern PFN_vkFreeDescriptorSets vkFreeDescriptorSets;
 extern PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
+/* Query */
+extern PFN_vkCreateQueryPool vkCreateQueryPool;
+extern PFN_vkDestroyQueryPool vkDestroyQueryPool;
+extern PFN_vkGetQueryPoolResults vkGetQueryPoolResults;
 /* Command */
 extern PFN_vkCreateCommandPool vkCreateCommandPool;
 extern PFN_vkDestroyCommandPool vkDestroyCommandPool;
@@ -77,6 +82,8 @@ extern PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
 extern PFN_vkCmdPushConstants vkCmdPushConstants;
 extern PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
 extern PFN_vkCmdFillBuffer vkCmdFillBuffer;
+extern PFN_vkCmdResetQueryPool vkCmdResetQueryPool;
+extern PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp;
 
 #ifdef __cplusplus
 }

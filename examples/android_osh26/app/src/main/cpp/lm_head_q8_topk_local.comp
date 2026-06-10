@@ -1,0 +1,114 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform P {
+    uint count;
+    uint topk;
+    uint base;
+    uint out_offset;
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer WQ {
+    uint wq[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer XQ {
+    uint xq[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutBuf {
+    uint data[];
+} uOut;
+
+shared float sh_partial[128];
+shared float sh_vals[4];
+shared uint sh_ids[4];
+
+uint head_base() {
+    return pc.base & 0x00FFFFFFu;
+}
+
+uint q8_blocks() {
+    return pc.base >> 24u;
+}
+
+int unpack_i8(uint word, uint idx) {
+    return bitfieldExtract(int(word), int(idx * 8u), 8);
+}
+
+float dot_token_partial(uint n, uint lane) {
+    const uint blocks = q8_blocks();
+    const uint w_words_offset = pc.count * blocks;
+    const uint x_words_offset = blocks;
+    float sum = 0.0;
+
+    for (uint block = lane; block < blocks; block += 32u) {
+        const float w_scale = uintBitsToFloat(wq[n * blocks + block]);
+        const float x_scale = uintBitsToFloat(xq[block]);
+        const uint w_base = w_words_offset + (n * blocks + block) * 8u;
+        const uint x_base = x_words_offset + block * 8u;
+        int dot = 0;
+
+        for (uint wi = 0u; wi < 8u; ++wi) {
+            const uint wv = wq[w_base + wi];
+            const uint xv = xq[x_base + wi];
+            dot += unpack_i8(wv, 0u) * unpack_i8(xv, 0u);
+            dot += unpack_i8(wv, 1u) * unpack_i8(xv, 1u);
+            dot += unpack_i8(wv, 2u) * unpack_i8(xv, 2u);
+            dot += unpack_i8(wv, 3u) * unpack_i8(xv, 3u);
+        }
+        sum += float(dot) * w_scale * x_scale;
+    }
+    return sum;
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lane = lid & 31u;
+    const uint token_slot = lid >> 5u;
+    const uint n = gl_WorkGroupID.x * 4u + token_slot;
+    float v = -1e30;
+    uint id = 0u;
+
+    if (n < pc.count) {
+        v = dot_token_partial(n, lane);
+        id = head_base() + n;
+    }
+
+    sh_partial[lid] = v;
+    barrier();
+    memoryBarrierShared();
+
+    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            sh_partial[lid] += sh_partial[lid + offset];
+        }
+        barrier();
+        memoryBarrierShared();
+    }
+
+    if (lane == 0u) {
+        sh_vals[token_slot] = (n < pc.count) ? sh_partial[lid] : -1e30;
+        sh_ids[token_slot] = (n < pc.count) ? id : 0u;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    if (lid == 0u) {
+        for (uint i = 0u; i < pc.topk && i < 32u; ++i) {
+            uint max_idx = 0u;
+            float max_val = sh_vals[0];
+            for (uint k = 1u; k < 4u; ++k) {
+                if (sh_vals[k] > max_val) {
+                    max_val = sh_vals[k];
+                    max_idx = k;
+                }
+            }
+            const uint out_idx = (pc.out_offset + gl_WorkGroupID.x * pc.topk + i) * 2u;
+            uOut.data[out_idx + 0u] = sh_ids[max_idx];
+            uOut.data[out_idx + 1u] = floatBitsToUint(max_val);
+            sh_vals[max_idx] = -1e30;
+        }
+    }
+}
