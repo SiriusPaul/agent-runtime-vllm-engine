@@ -17,6 +17,8 @@ struct osh26_vk_stats {
     bool mnn_prefill_attention_enabled;
     bool prefill_q8_enabled;
     bool decode_q8_enabled;
+    bool decode_q8_gemv_enabled;
+    bool last_decode_q8_gemv_used;
     bool q8_only_mode;
     bool embedding_head_shared;
     uint64_t resident_f32_matrix_bytes;
@@ -51,6 +53,12 @@ struct osh26_vk_stats {
     double last_forward_layers_gpu_ms;
     double last_forward_lm_head_gpu_ms;
     double last_forward_final_norm_gpu_ms;
+    double last_decode_layers_gpu_ms;
+    double last_decode_qkv_gpu_ms;
+    double last_decode_attention_gpu_ms;
+    double last_decode_o_proj_gpu_ms;
+    double last_decode_ffn_gate_up_gpu_ms;
+    double last_decode_ffn_down_gpu_ms;
     double last_prefill_qkv_ms;
     double last_prefill_qk_norm_rope_ms;
     double last_prefill_o_proj_ms;

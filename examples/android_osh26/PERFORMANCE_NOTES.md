@@ -1054,3 +1054,40 @@ Mitigation: reduced the short prefill single-chunk limit from 64 tokens to 32 to
 | Short smoke prompt with prefix cache hit | 14 | 14 | 1 | PASS | 894.175 | 1.9973 | 363.543 | 50.145 | 362.256 |
 
 Notes: `debug.osh26.single_submit` was reset to `0` for UI testing. The current bottleneck remains the LM-head submit/wait boundary: wall time is about 360-370 ms while GPU timestamped LM-head execution is about 50 ms.
+
+## 2026-06-10 08:23:59 LM Head Q8 Verification
+
+Single submit requested: True
+Decode Q8 GEMV requested: True
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms | Decode layers GPU ms | Decode QKV GPU ms | Decode attn GPU ms | Decode O GPU ms | Decode FFN gate/up GPU ms | Decode FFN down GPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 15 | device_local | 350060544 | 842.481 | 3.0408 | 216.018 | 226.241 | 1 | 0 | 214.439 | 164.037 | 50.317 | 0.048 | 162.174 | 23.322 | 28.125 | 10.764 | 62.216 | 37.66 |
+
+Gate criteria: forward submit count <= 1, TTFT regresses no more than 3% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 1.7B-Q8_0: PASS
+
+## 2026-06-10 08:25:09 LM Head Q8 Verification
+
+Single submit requested: True
+Decode Q8 GEMV requested: True
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms | Decode layers GPU ms | Decode QKV GPU ms | Decode attn GPU ms | Decode O GPU ms | Decode FFN gate/up GPU ms | Decode FFN down GPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 393.6 | 5.7498 | 120.511 | 131.288 | 1 | 0 | 118.877 | 78.398 | 40.493 | 0.023 | 77.315 | 14.943 | 28.09 | 5.652 | 20.242 | 8.391 |
+
+Gate criteria: forward submit count <= 1, TTFT regresses no more than 3% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: PASS
+
+## 2026-06-10 Decode Q8 GEMV Default Decision
+
+The `nt == 1` Q8 decode projections now use the subgroup `GEMV_Q8` path by default. Set `OSH26_DECODE_Q8_GEMV=0` or Android property `debug.osh26.decode_q8_gemv=0` to restore the prior `MMQ8` decode path. Prefill remains on `MMQ8`.
+
+| Model | Baseline TPS | Decode GEMV median TPS | Change | Median decode ms | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0.6B-Q8_0 | 4.7800 | 5.7498 | +20.3% | 131.288 | default enabled |
+| 1.7B-Q8_0 | 2.2154 | 3.0408 | +37.3% | 226.241 | default enabled |
+
+Both models passed 15-request verifier runs with stable repeated token IDs, zero descriptor allocations, no attention fallback, and no logits sanity failure. Single submit remained opt-in because it did not add at least 5% TPS over decode GEMV alone.
+
+The default UI configuration also completed the prior 61-token hang reproduction prompt with two prefill chunks (`32 + 29`), `last_decode_q8_gemv_used=true`, and no active request left behind.

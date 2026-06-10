@@ -71,6 +71,7 @@ static int g_idim = 0;   /* intermediate_dim: 3072 for 0.6B, 6144 for 1.7B */
 #define LM_HEAD_Q8_MAX_CANDIDATES (LM_HEAD_Q8_MAX_LOCAL_GROUPS * LM_HEAD_Q8_TOPK_TILE)
 #define LM_HEAD_TOP1_MARGIN_REQUIRED 1.0e-3f
 #define SUBMIT_POOL_CAP 512
+#define TIMESTAMP_QUERY_CAP 512
 #define F32(n) ((VkDeviceSize)(n)*4)
 #define PREFIX_PAGE_TOKENS OSH26_VK_PREFIX_CACHE_PAGE_TOKENS
 #define PREFIX_POOL_PAGES OSH26_VK_PREFIX_CACHE_POOL_PAGES
@@ -197,6 +198,12 @@ static double g_last_forward_gpu_ms;
 static double g_last_forward_layers_gpu_ms;
 static double g_last_forward_lm_head_gpu_ms;
 static double g_last_forward_final_norm_gpu_ms;
+static double g_last_decode_layers_gpu_ms;
+static double g_last_decode_qkv_gpu_ms;
+static double g_last_decode_attention_gpu_ms;
+static double g_last_decode_o_proj_gpu_ms;
+static double g_last_decode_ffn_gate_up_gpu_ms;
+static double g_last_decode_ffn_down_gpu_ms;
 static double g_last_prefill_qkv_ms;
 static double g_last_prefill_qk_norm_rope_ms;
 static double g_last_prefill_o_proj_ms;
@@ -206,6 +213,7 @@ static double g_last_prefill_attention_ms;
 static double g_last_prefill_ffn_gate_up_silu_ms;
 static bool g_prefill_q8_enabled;
 static bool g_decode_q8_enabled;
+static bool g_last_decode_q8_gemv_used;
 static bool g_q8_only_mode;
 static bool g_embedding_head_shared;
 static uint64_t g_resident_f32_matrix_bytes;
@@ -393,6 +401,21 @@ static bool single_submit_flag_enabled(void) {
     }
 #endif
     return false;
+}
+
+static bool decode_q8_gemv_flag_enabled(void) {
+    const char *env_value = getenv("OSH26_DECODE_Q8_GEMV");
+    if (env_value != NULL && env_value[0] != '\0') {
+        return flag_value_enabled(env_value);
+    }
+#ifdef __ANDROID__
+    char prop[PROP_VALUE_MAX];
+    int len = __system_property_get("debug.osh26.decode_q8_gemv", prop);
+    if (len > 0) {
+        return flag_value_enabled(prop);
+    }
+#endif
+    return true;
 }
 
 static bool gguf_get_u32_checked(struct gguf_context *g, const char *key, uint32_t *out) {
@@ -881,6 +904,16 @@ typedef struct {
     uint32_t act_end;
     uint32_t merge_begin;
     uint32_t merge_end;
+    uint32_t decode_qkv_begin[N_LAY];
+    uint32_t decode_qkv_end[N_LAY];
+    uint32_t decode_attention_begin[N_LAY];
+    uint32_t decode_attention_end[N_LAY];
+    uint32_t decode_o_proj_begin[N_LAY];
+    uint32_t decode_o_proj_end[N_LAY];
+    uint32_t decode_ffn_gate_up_begin[N_LAY];
+    uint32_t decode_ffn_gate_up_end[N_LAY];
+    uint32_t decode_ffn_down_begin[N_LAY];
+    uint32_t decode_ffn_down_end[N_LAY];
     uint32_t dot_begin[HEAD_SHARDS];
     uint32_t dot_end[HEAD_SHARDS];
     uint32_t topk_begin[HEAD_SHARDS];
@@ -894,17 +927,24 @@ static void lm_ts_reset(LmHeadTimestampScope *ts,VkCommandBuffer cb){
     ts->forward_begin=ts->forward_end=ts->layers_begin=ts->layers_end=UINT32_MAX;
     ts->lm_begin=ts->lm_end=ts->final_norm_begin=ts->final_norm_end=UINT32_MAX;
     ts->act_begin=ts->act_end=ts->merge_begin=ts->merge_end=UINT32_MAX;
+    for(int i=0;i<N_LAY;i++){
+        ts->decode_qkv_begin[i]=ts->decode_qkv_end[i]=UINT32_MAX;
+        ts->decode_attention_begin[i]=ts->decode_attention_end[i]=UINT32_MAX;
+        ts->decode_o_proj_begin[i]=ts->decode_o_proj_end[i]=UINT32_MAX;
+        ts->decode_ffn_gate_up_begin[i]=ts->decode_ffn_gate_up_end[i]=UINT32_MAX;
+        ts->decode_ffn_down_begin[i]=ts->decode_ffn_down_end[i]=UINT32_MAX;
+    }
     for(int i=0;i<HEAD_SHARDS;i++){
         ts->dot_begin[i]=ts->dot_end[i]=ts->topk_begin[i]=ts->topk_end[i]=UINT32_MAX;
     }
     ts->enabled=QP_LmHead!=VK_NULL_HANDLE&&g_gpu_timestamp_valid_bits>0&&g_gpu_timestamp_period_ns>0.0f;
     if(ts->enabled){
-        vkCmdResetQueryPool(cb,QP_LmHead,0,64);
+        vkCmdResetQueryPool(cb,QP_LmHead,0,TIMESTAMP_QUERY_CAP);
     }
 }
 
 static uint32_t lm_ts_write(LmHeadTimestampScope *ts,VkCommandBuffer cb){
-    if(!ts->enabled||ts->next>=64)return UINT32_MAX;
+    if(!ts->enabled||ts->next>=TIMESTAMP_QUERY_CAP)return UINT32_MAX;
     const uint32_t idx=ts->next++;
     vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,QP_LmHead,idx);
     return idx;
@@ -920,13 +960,19 @@ static void lm_ts_collect(const LmHeadTimestampScope *ts){
     g_last_forward_layers_gpu_ms=0.0;
     g_last_forward_lm_head_gpu_ms=0.0;
     g_last_forward_final_norm_gpu_ms=0.0;
+    g_last_decode_layers_gpu_ms=0.0;
+    g_last_decode_qkv_gpu_ms=0.0;
+    g_last_decode_attention_gpu_ms=0.0;
+    g_last_decode_o_proj_gpu_ms=0.0;
+    g_last_decode_ffn_gate_up_gpu_ms=0.0;
+    g_last_decode_ffn_down_gpu_ms=0.0;
     g_last_lm_head_gpu_ms=0.0;
     g_last_lm_head_actq8_gpu_ms=0.0;
     g_last_lm_head_dot_gpu_ms=0.0;
     g_last_lm_head_topk_gpu_ms=0.0;
     g_last_lm_head_merge_gpu_ms=0.0;
     if(!ts->enabled||ts->next==0)return;
-    uint64_t q[64];
+    uint64_t q[TIMESTAMP_QUERY_CAP];
     memset(q,0,sizeof(q));
     VkResult r=vkGetQueryPoolResults(D,QP_LmHead,0,ts->next,sizeof(q[0])*ts->next,q,sizeof(q[0]),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT);
     if(r!=VK_SUCCESS){
@@ -937,6 +983,15 @@ static void lm_ts_collect(const LmHeadTimestampScope *ts){
     g_last_forward_layers_gpu_ms=lm_ts_delta_ms(q,ts->next,ts->layers_begin,ts->layers_end);
     g_last_forward_lm_head_gpu_ms=lm_ts_delta_ms(q,ts->next,ts->lm_begin,ts->lm_end);
     g_last_forward_final_norm_gpu_ms=lm_ts_delta_ms(q,ts->next,ts->final_norm_begin,ts->final_norm_end);
+    for(int l=0;l<N_LAY;l++){
+        g_last_decode_qkv_gpu_ms+=lm_ts_delta_ms(q,ts->next,ts->decode_qkv_begin[l],ts->decode_qkv_end[l]);
+        g_last_decode_attention_gpu_ms+=lm_ts_delta_ms(q,ts->next,ts->decode_attention_begin[l],ts->decode_attention_end[l]);
+        g_last_decode_o_proj_gpu_ms+=lm_ts_delta_ms(q,ts->next,ts->decode_o_proj_begin[l],ts->decode_o_proj_end[l]);
+        g_last_decode_ffn_gate_up_gpu_ms+=lm_ts_delta_ms(q,ts->next,ts->decode_ffn_gate_up_begin[l],ts->decode_ffn_gate_up_end[l]);
+        g_last_decode_ffn_down_gpu_ms+=lm_ts_delta_ms(q,ts->next,ts->decode_ffn_down_begin[l],ts->decode_ffn_down_end[l]);
+    }
+    g_last_decode_layers_gpu_ms=g_last_decode_qkv_gpu_ms+g_last_decode_attention_gpu_ms+
+        g_last_decode_o_proj_gpu_ms+g_last_decode_ffn_gate_up_gpu_ms+g_last_decode_ffn_down_gpu_ms;
     g_last_lm_head_gpu_ms=g_last_forward_lm_head_gpu_ms;
     g_last_lm_head_actq8_gpu_ms=lm_ts_delta_ms(q,ts->next,ts->act_begin,ts->act_end);
     g_last_lm_head_merge_gpu_ms=lm_ts_delta_ms(q,ts->next,ts->merge_begin,ts->merge_end);
@@ -1186,7 +1241,7 @@ int osh26_vk_gpu_init(void){if(vk_ok)return 0;
     VkDescriptorPoolCreateInfo lm_dp={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,0,0,2,1,&lm_ds};
     if(vkCreateDescriptorPool(D,&lm_dp,0,&DP_Lm)!=VK_SUCCESS){LOGE("LM head descriptor pool creation failed");return -1;}
     if(g_gpu_timestamp_valid_bits>0&&vkCreateQueryPool&&vkCmdResetQueryPool&&vkCmdWriteTimestamp&&vkGetQueryPoolResults){
-        VkQueryPoolCreateInfo qpi={VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,0,0,VK_QUERY_TYPE_TIMESTAMP,64,0};
+        VkQueryPoolCreateInfo qpi={VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,0,0,VK_QUERY_TYPE_TIMESTAMP,TIMESTAMP_QUERY_CAP,0};
         VkResult qr=vkCreateQueryPool(D,&qpi,0,&QP_LmHead);
         if(qr!=VK_SUCCESS){
             QP_LmHead=VK_NULL_HANDLE;
@@ -1415,7 +1470,8 @@ int osh26_vk_gpu_load_model(const char*path){if(!vk_ok||!path)return -1;
     g_last_prefill_qkv_ms=0.0;g_last_prefill_qk_norm_rope_ms=0.0;g_last_prefill_o_proj_ms=0.0;g_last_prefill_down_ms=0.0;
     g_last_prefill_cpu_post_ms=0.0;g_last_prefill_attention_ms=0.0;g_last_prefill_ffn_gate_up_silu_ms=0.0;
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
-    g_last_forward_gpu_ms=0.0;g_last_forward_layers_gpu_ms=0.0;g_last_forward_lm_head_gpu_ms=0.0;g_last_forward_final_norm_gpu_ms=0.0;g_last_logits_topk_count=0;
+    g_last_forward_gpu_ms=0.0;g_last_forward_layers_gpu_ms=0.0;g_last_forward_lm_head_gpu_ms=0.0;g_last_forward_final_norm_gpu_ms=0.0;
+    g_last_decode_layers_gpu_ms=0.0;g_last_decode_qkv_gpu_ms=0.0;g_last_decode_attention_gpu_ms=0.0;g_last_decode_o_proj_gpu_ms=0.0;g_last_decode_ffn_gate_up_gpu_ms=0.0;g_last_decode_ffn_down_gpu_ms=0.0;g_last_decode_q8_gemv_used=false;g_last_logits_topk_count=0;
     g_q8_only_mode=false; g_embedding_head_shared=false; g_resident_f32_matrix_bytes=0; g_last_single_submit_used=false; g_lm_head_q8_enabled=false; g_lm_head_q8_fused_enabled=!g_debug_correctness && getenv("OSH26_LM_HEAD_Q8_FUSED")!=NULL; g_lm_head_device_local_bytes=0; snprintf(g_lm_head_path,sizeof(g_lm_head_path),"unloaded"); snprintf(g_lm_head_memory_path,sizeof(g_lm_head_memory_path),"unloaded");
     g_submit_cursor=0; g_current_submit_phase = SUBMIT_PHASE_NONE;
     g_current_forward_is_prefill=false;
@@ -1715,6 +1771,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
     if(pos==0){g_last_lm_head_validation_ran=false;g_last_lm_head_validation_ok=false;g_last_lm_head_validation_stage=0;g_last_lm_head_matched_logit_max_abs_err=0.0f;g_last_lm_head_top1_match=false;g_last_lm_head_top5_overlap=0;g_last_lm_head_top20_overlap=0;g_last_lm_head_cpu_top1_margin=0.0f;g_last_lm_head_validation_ms=0.0;g_last_ttft_submit_count=0;memset(g_last_lm_head_ref_top5,0,sizeof(g_last_lm_head_ref_top5));}
     g_last_forward_submit_count=0;g_last_forward_layers_ms=0.0;g_last_forward_attention_ms=0.0;g_last_forward_kv_update_ms=0.0;g_last_forward_lm_head_ms=0.0;
     g_last_forward_gpu_ms=0.0;g_last_forward_layers_gpu_ms=0.0;g_last_forward_lm_head_gpu_ms=0.0;g_last_forward_final_norm_gpu_ms=0.0;
+    g_last_decode_layers_gpu_ms=0.0;g_last_decode_qkv_gpu_ms=0.0;g_last_decode_attention_gpu_ms=0.0;g_last_decode_o_proj_gpu_ms=0.0;g_last_decode_ffn_gate_up_gpu_ms=0.0;g_last_decode_ffn_down_gpu_ms=0.0;g_last_decode_q8_gemv_used=false;
     g_last_single_submit_used=false;
     if (nt > 1) {
         g_last_prefill_submit_count=0;g_last_prefill_qkv_ms=0.0;g_last_prefill_qk_norm_rope_ms=0.0;g_last_prefill_o_proj_ms=0.0;g_last_prefill_down_ms=0.0;g_last_prefill_cpu_post_ms=0.0;g_last_prefill_attention_ms=0.0;g_last_prefill_ffn_gate_up_silu_ms=0.0;
@@ -1761,6 +1818,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
         const bool decode_gpu_attention = (nt == 1 && !debug_check && g_mnn_attention_enabled && ((g_attention_fallback_layers & (1u << l)) == 0));
         const bool decode_grouped_layer = grouped_decode_forward && decode_gpu_attention;
         const bool decode_q8_layer = !debug_check && g_decode_q8_enabled;
+        const bool decode_q8_gemv_layer = decode_q8_layer && nt == 1 && decode_q8_gemv_flag_enabled();
         VkCommandBuffer prefill_cb = grouped_prefill_forward ? grouped_layer_cb : VK_NULL_HANDLE;
         VkCommandBuffer decode_cb = grouped_decode_forward ? grouped_layer_cb : VK_NULL_HANDLE;
         if (nt > 1 && !debug_check && !grouped_prefill_forward) {
@@ -1812,13 +1870,21 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           }
         } else if (nt == 1 && !debug_check) {
           VkCommandBuffer cb1=decode_grouped_layer?decode_cb:CB();
+          if(single_submit_forward)lm_ts.decode_qkv_begin[l]=lm_ts_write(&lm_ts,cb1);
           RMS(cb1,nt,HDIM,&B_Hid,&W_ra[l],&B_Hid2);
           BARRIER(cb1);
           if(decode_q8_layer){
             ACT_Q8(cb1,&B_Hid2,&B_Q8In,nt,HDIM);
-            MMQ8(cb1,&WQ_Q[l],&B_Q8In,&B_Qb,nt,QDIM,HDIM);
-            MMQ8(cb1,&WQ_K[l],&B_Q8In,&B_Kb,nt,KVD,HDIM);
-            MMQ8(cb1,&WQ_V[l],&B_Q8In,&B_Vb,nt,KVD,HDIM);
+            if(decode_q8_gemv_layer){
+              GEMV_Q8(cb1,&WQ_Q[l],&B_Q8In,&B_Qb,QDIM,HDIM);
+              GEMV_Q8(cb1,&WQ_K[l],&B_Q8In,&B_Kb,KVD,HDIM);
+              GEMV_Q8(cb1,&WQ_V[l],&B_Q8In,&B_Vb,KVD,HDIM);
+              g_last_decode_q8_gemv_used=true;
+            }else{
+              MMQ8(cb1,&WQ_Q[l],&B_Q8In,&B_Qb,nt,QDIM,HDIM);
+              MMQ8(cb1,&WQ_K[l],&B_Q8In,&B_Kb,nt,KVD,HDIM);
+              MMQ8(cb1,&WQ_V[l],&B_Q8In,&B_Vb,nt,KVD,HDIM);
+            }
           }else{
             MM(cb1,&W_Q[l],&B_Hid2,&B_Qb,nt,QDIM,HDIM);
             MM(cb1,&W_K[l],&B_Hid2,&B_Kb,nt,KVD,HDIM);
@@ -1831,6 +1897,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           ROPE_NEOX(cb1,&B_Qb,nt,N_HD,pos,HD);
           ROPE_NEOX(cb1,&B_Kb,nt,N_KVH,pos,HD);
           BARRIER(cb1);
+          if(single_submit_forward)lm_ts.decode_qkv_end[l]=lm_ts_write(&lm_ts,cb1);
           if(!decode_grouped_layer)SubmitNoWait(cb1);
         }else{
           VkCommandBuffer cb1a=CB();
@@ -1898,7 +1965,7 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
               if(!att_done && decode_gpu_attention){
                   AttnConst ac={{1,pos+1,N_HD,N_KVH},{HD,N_HD/N_KVH,pos,pos+1},{0,0,0,MAX_S},{1.0f/sqrtf((float)HD),0,0,0}};
                   memcpy(B_AttnRunConst[l].P,&ac,sizeof(ac));buf_flush(&B_AttnRunConst[l]);
-                  { VkCommandBuffer cba=decode_grouped_layer?decode_cb:CB();DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnRunConst[l]);BARRIER(cba);if(!decode_grouped_layer)SubmitNoWait(cba); }
+                  { VkCommandBuffer cba=decode_grouped_layer?decode_cb:CB();if(single_submit_forward)lm_ts.decode_attention_begin[l]=lm_ts_write(&lm_ts,cba);DEC_ATTN(cba,&B_Att,&B_Qb,&B_KCache[l],&B_VCache[l],&B_AttnRunConst[l]);BARRIER(cba);if(single_submit_forward)lm_ts.decode_attention_end[l]=lm_ts_write(&lm_ts,cba);if(!decode_grouped_layer)SubmitNoWait(cba); }
                   if(debug_check){
                       cpu_attention_ref(nt,pos,l,qb,kv,sc,tmp);
                       buf_inv(&B_Att);
@@ -1935,21 +2002,35 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
 
         if(nt==1 && !debug_check){
           VkCommandBuffer cb2=decode_grouped_layer?decode_cb:CB();
+          if(single_submit_forward)lm_ts.decode_o_proj_begin[l]=lm_ts_write(&lm_ts,cb2);
           if(decode_q8_layer){
             ACT_Q8(cb2,&B_Att,&B_Q8In,nt,QDIM);
-            MMQ8(cb2,&WQ_O[l],&B_Q8In,&B_Tmp,nt,HDIM,QDIM);
+            if(decode_q8_gemv_layer){
+              GEMV_Q8(cb2,&WQ_O[l],&B_Q8In,&B_Tmp,HDIM,QDIM);
+              g_last_decode_q8_gemv_used=true;
+            }else{
+              MMQ8(cb2,&WQ_O[l],&B_Q8In,&B_Tmp,nt,HDIM,QDIM);
+            }
           }else{
             MM(cb2,&W_O[l],&B_Att,&B_Tmp,nt,HDIM,QDIM);
           }
           BARRIER(cb2);
+          if(single_submit_forward)lm_ts.decode_o_proj_end[l]=lm_ts_write(&lm_ts,cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           BARRIER(cb2);
           RMS(cb2,nt,HDIM,&B_Hid,&W_rf[l],&B_Hid2);
           BARRIER(cb2);
+          if(single_submit_forward)lm_ts.decode_ffn_gate_up_begin[l]=lm_ts_write(&lm_ts,cb2);
           if(decode_q8_layer){
             ACT_Q8(cb2,&B_Hid2,&B_Q8In,nt,HDIM);
-            MMQ8(cb2,&WQ_Gate[l],&B_Q8In,&B_Gat,nt,IDIM,HDIM);
-            MMQ8(cb2,&WQ_Up[l],&B_Q8In,&B_Up,nt,IDIM,HDIM);
+            if(decode_q8_gemv_layer){
+              GEMV_Q8(cb2,&WQ_Gate[l],&B_Q8In,&B_Gat,IDIM,HDIM);
+              GEMV_Q8(cb2,&WQ_Up[l],&B_Q8In,&B_Up,IDIM,HDIM);
+              g_last_decode_q8_gemv_used=true;
+            }else{
+              MMQ8(cb2,&WQ_Gate[l],&B_Q8In,&B_Gat,nt,IDIM,HDIM);
+              MMQ8(cb2,&WQ_Up[l],&B_Q8In,&B_Up,nt,IDIM,HDIM);
+            }
           }else{
             MM(cb2,&W_Gate[l],&B_Hid2,&B_Gat,nt,IDIM,HDIM);
             MM(cb2,&W_Up[l],&B_Hid2,&B_Up,nt,IDIM,HDIM);
@@ -1957,13 +2038,21 @@ int osh26_vk_gpu_forward_ex(const int*tokens,int nt,int pos,uint32_t flags){if(!
           BARRIER(cb2);
           SILU(cb2,&B_Gat,&B_Up,&B_Dwn,nt*IDIM);
           BARRIER(cb2);
+          if(single_submit_forward)lm_ts.decode_ffn_gate_up_end[l]=lm_ts_write(&lm_ts,cb2);
+          if(single_submit_forward)lm_ts.decode_ffn_down_begin[l]=lm_ts_write(&lm_ts,cb2);
           if(decode_q8_layer){
             ACT_Q8(cb2,&B_Dwn,&B_Q8In,nt,IDIM);
-            MMQ8(cb2,&WQ_Down[l],&B_Q8In,&B_Tmp,nt,HDIM,IDIM);
+            if(decode_q8_gemv_layer){
+              GEMV_Q8(cb2,&WQ_Down[l],&B_Q8In,&B_Tmp,HDIM,IDIM);
+              g_last_decode_q8_gemv_used=true;
+            }else{
+              MMQ8(cb2,&WQ_Down[l],&B_Q8In,&B_Tmp,nt,HDIM,IDIM);
+            }
           }else{
             MM(cb2,&W_Down[l],&B_Dwn,&B_Tmp,nt,HDIM,IDIM);
           }
           BARRIER(cb2);
+          if(single_submit_forward)lm_ts.decode_ffn_down_end[l]=lm_ts_write(&lm_ts,cb2);
           ADD(cb2,&B_Hid,&B_Tmp,nt*HDIM);
           BARRIER(cb2);
           if(!decode_grouped_layer)SubmitNoWait(cb2);
@@ -2966,7 +3055,7 @@ void osh26_vk_gpu_free(void){
     buf_free(&W_Fnorm);
     for(int l=0;l<N_LAY;l++){buf_free(&WQ_Down[l]);buf_free(&WQ_Up[l]);buf_free(&WQ_Gate[l]);buf_free(&WQ_O[l]);buf_free(&WQ_V[l]);buf_free(&WQ_K[l]);buf_free(&WQ_Q[l]);buf_free(&W_Down[l]);buf_free(&W_Up[l]);buf_free(&W_Gate[l]);buf_free(&W_rf[l]);buf_free(&W_Kn[l]);buf_free(&W_Qn[l]);buf_free(&W_O[l]);buf_free(&W_V[l]);buf_free(&W_K[l]);buf_free(&W_Q[l]);buf_free(&W_ra[l]);}
     if(Emb){free(Emb);Emb=NULL;}
-    mdl_ok=false;g_prefill_q8_enabled=false;g_decode_q8_enabled=false;
+    mdl_ok=false;g_prefill_q8_enabled=false;g_decode_q8_enabled=false;g_last_decode_q8_gemv_used=false;
     g_lm_head_q8_enabled=false;g_lm_head_q8_fused_enabled=false;g_lm_head_device_local_bytes=0;snprintf(g_lm_head_path,sizeof(g_lm_head_path),"unloaded");snprintf(g_lm_head_memory_path,sizeof(g_lm_head_memory_path),"unloaded");
 }
 int osh26_vk_get_stats(struct osh26_vk_stats*o){
@@ -2978,6 +3067,8 @@ int osh26_vk_get_stats(struct osh26_vk_stats*o){
     o->mnn_prefill_attention_enabled=g_mnn_prefill_attention_enabled;
     o->prefill_q8_enabled=g_prefill_q8_enabled;
     o->decode_q8_enabled=g_decode_q8_enabled;
+    o->decode_q8_gemv_enabled=decode_q8_gemv_flag_enabled();
+    o->last_decode_q8_gemv_used=g_last_decode_q8_gemv_used;
     o->q8_only_mode=g_q8_only_mode;
     o->embedding_head_shared=g_embedding_head_shared;
     o->resident_f32_matrix_bytes=g_resident_f32_matrix_bytes;
@@ -3012,6 +3103,12 @@ int osh26_vk_get_stats(struct osh26_vk_stats*o){
     o->last_forward_layers_gpu_ms=g_last_forward_layers_gpu_ms;
     o->last_forward_lm_head_gpu_ms=g_last_forward_lm_head_gpu_ms;
     o->last_forward_final_norm_gpu_ms=g_last_forward_final_norm_gpu_ms;
+    o->last_decode_layers_gpu_ms=g_last_decode_layers_gpu_ms;
+    o->last_decode_qkv_gpu_ms=g_last_decode_qkv_gpu_ms;
+    o->last_decode_attention_gpu_ms=g_last_decode_attention_gpu_ms;
+    o->last_decode_o_proj_gpu_ms=g_last_decode_o_proj_gpu_ms;
+    o->last_decode_ffn_gate_up_gpu_ms=g_last_decode_ffn_gate_up_gpu_ms;
+    o->last_decode_ffn_down_gpu_ms=g_last_decode_ffn_down_gpu_ms;
     o->last_prefill_qkv_ms=g_last_prefill_qkv_ms;
     o->last_prefill_qk_norm_rope_ms=g_last_prefill_qk_norm_rope_ms;
     o->last_prefill_o_proj_ms=g_last_prefill_o_proj_ms;

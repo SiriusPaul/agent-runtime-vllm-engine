@@ -8,6 +8,7 @@ param(
     [switch] $RunModel06BFull,
     [switch] $RunModel06BQ8,
     [switch] $RunModel17BQ8,
+    [switch] $DecodeQ8Gemv,
     [string] $Model06BFullPath = "",
     [string] $Model06BQ8Path = "",
     [string] $Model17BQ8Path = ""
@@ -77,6 +78,7 @@ function Test-FlagEnabled {
 }
 
 $SingleSubmitRequested = Test-FlagEnabled $env:OSH26_SINGLE_SUBMIT
+$DecodeQ8GemvRequested = [bool]$DecodeQ8Gemv -or (Test-FlagEnabled $env:OSH26_DECODE_Q8_GEMV)
 
 function Get-Median {
     param([double[]] $Values)
@@ -110,6 +112,12 @@ function Get-PerformanceSummary {
         MedianForwardLayersGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastForwardLayersGpuMs }))
         MedianForwardLmHeadGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastForwardLmHeadGpuMs }))
         MedianForwardFinalNormGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastForwardFinalNormGpuMs }))
+        MedianDecodeLayersGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeLayersGpuMs }))
+        MedianDecodeQkvGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeQkvGpuMs }))
+        MedianDecodeAttentionGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeAttentionGpuMs }))
+        MedianDecodeOProjGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeOProjGpuMs }))
+        MedianDecodeFfnGateUpGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeFfnGateUpGpuMs }))
+        MedianDecodeFfnDownGpuMs = Get-Median ([double[]] @($rows | ForEach-Object { [double]$_.LastDecodeFfnDownGpuMs }))
     }
 }
 
@@ -136,6 +144,9 @@ function Assert-PerformanceGate {
     if ([double]$summary.MedianTPS -lt ([double]$baseline.Tps * 0.98)) {
         $ModelResults.failures += "[$ModelLabel] median TPS $($summary.MedianTPS) regressed more than 2% from baseline $($baseline.Tps)"
     }
+    if ($DecodeQ8GemvRequested -and $ModelLabel -eq "1.7B-Q8_0" -and [double]$summary.MedianTPS -lt 2.55) {
+        $ModelResults.failures += "[$ModelLabel] median TPS $($summary.MedianTPS) did not reach the decode Q8 GEMV target of 2.55"
+    }
     $ttftRegression = if ($SingleSubmitRequested) { 1.03 } else { 1.05 }
     if ([double]$summary.MedianTTFT -gt ([double]$baseline.TtftMs * $ttftRegression)) {
         $ModelResults.failures += "[$ModelLabel] median TTFT $($summary.MedianTTFT) ms regressed more than $([Math]::Round(($ttftRegression - 1.0) * 100.0, 1))% from $($baseline.TtftMs) ms"
@@ -157,9 +168,10 @@ function Add-PerformanceNotes {
         "## $stamp LM Head Q8 Verification",
         "",
         "Single submit requested: $SingleSubmitRequested",
+        "Decode Q8 GEMV requested: $DecodeQ8GemvRequested",
         "",
-        "| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms | Decode layers GPU ms | Decode QKV GPU ms | Decode attn GPU ms | Decode O GPU ms | Decode FFN gate/up GPU ms | Decode FFN down GPU ms |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     foreach ($modelLabel in @("0.6B-Q8_0", "1.7B-Q8_0")) {
         if ($AllResults.ContainsKey($modelLabel) -and $AllResults[$modelLabel].performanceSummary) {
@@ -167,7 +179,7 @@ function Add-PerformanceNotes {
             $first = @($AllResults[$modelLabel].vulkanResults | Where-Object { $_.LmHeadMemoryPath } | Select-Object -First 1)
             $memPath = if ($first.Count -gt 0) { $first[0].LmHeadMemoryPath } else { "" }
             $devBytes = if ($first.Count -gt 0) { $first[0].LmHeadDeviceLocalBytes } else { 0 }
-            $lines += "| $modelLabel | $($s.SampleCount) | $memPath | $devBytes | $([Math]::Round([double]$s.MedianTTFT, 3)) | $([Math]::Round([double]$s.MedianTPS, 4)) | $([Math]::Round([double]$s.MedianLmHeadMs, 3)) | $([Math]::Round([double]$s.MedianDecodeMs, 3)) | $([Math]::Round([double]$s.MedianSubmitCount, 1)) | $([Math]::Round([double]$s.MedianDescriptorAllocCount, 1)) | $([Math]::Round([double]$s.MedianForwardGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardLayersGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardLmHeadGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardFinalNormGpuMs, 3)) |"
+            $lines += "| $modelLabel | $($s.SampleCount) | $memPath | $devBytes | $([Math]::Round([double]$s.MedianTTFT, 3)) | $([Math]::Round([double]$s.MedianTPS, 4)) | $([Math]::Round([double]$s.MedianLmHeadMs, 3)) | $([Math]::Round([double]$s.MedianDecodeMs, 3)) | $([Math]::Round([double]$s.MedianSubmitCount, 1)) | $([Math]::Round([double]$s.MedianDescriptorAllocCount, 1)) | $([Math]::Round([double]$s.MedianForwardGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardLayersGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardLmHeadGpuMs, 3)) | $([Math]::Round([double]$s.MedianForwardFinalNormGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeLayersGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeQkvGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeAttentionGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeOProjGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeFfnGateUpGpuMs, 3)) | $([Math]::Round([double]$s.MedianDecodeFfnDownGpuMs, 3)) |"
         }
     }
     $lines += ""
@@ -390,6 +402,8 @@ function Assert-HealthGate {
         "last_logits_top5",
         "single_submit_enabled",
         "last_single_submit_used",
+        "decode_q8_gemv_enabled",
+        "last_decode_q8_gemv_used",
         "lm_head_q8_enabled",
         "lm_head_path",
         "lm_head_memory_path",
@@ -412,6 +426,12 @@ function Assert-HealthGate {
         "last_forward_layers_gpu_ms",
         "last_forward_lm_head_gpu_ms",
         "last_forward_final_norm_gpu_ms",
+        "last_decode_layers_gpu_ms",
+        "last_decode_qkv_gpu_ms",
+        "last_decode_attention_gpu_ms",
+        "last_decode_o_proj_gpu_ms",
+        "last_decode_ffn_gate_up_gpu_ms",
+        "last_decode_ffn_down_gpu_ms",
         "last_lm_head_gpu_ms",
         "last_lm_head_actq8_gpu_ms",
         "last_lm_head_dot_gpu_ms",
@@ -450,6 +470,12 @@ function Assert-HealthGate {
     $ResultObj.LastForwardLayersGpuMs = $vk.last_forward_layers_gpu_ms
     $ResultObj.LastForwardLmHeadGpuMs = $vk.last_forward_lm_head_gpu_ms
     $ResultObj.LastForwardFinalNormGpuMs = $vk.last_forward_final_norm_gpu_ms
+    $ResultObj.LastDecodeLayersGpuMs = $vk.last_decode_layers_gpu_ms
+    $ResultObj.LastDecodeQkvGpuMs = $vk.last_decode_qkv_gpu_ms
+    $ResultObj.LastDecodeAttentionGpuMs = $vk.last_decode_attention_gpu_ms
+    $ResultObj.LastDecodeOProjGpuMs = $vk.last_decode_o_proj_gpu_ms
+    $ResultObj.LastDecodeFfnGateUpGpuMs = $vk.last_decode_ffn_gate_up_gpu_ms
+    $ResultObj.LastDecodeFfnDownGpuMs = $vk.last_decode_ffn_down_gpu_ms
     $ResultObj.PrefillQkvMs = $vk.last_prefill_qkv_ms
     $ResultObj.PrefillQkNormRopeMs = $vk.last_prefill_qk_norm_rope_ms
     $ResultObj.PrefillOProjMs = $vk.last_prefill_o_proj_ms
@@ -461,6 +487,8 @@ function Assert-HealthGate {
     $ResultObj.LastTokenTps = $vk.last_token_tps
     $ResultObj.PrefillQ8Enabled = $vk.prefill_q8_enabled
     $ResultObj.DecodeQ8Enabled = $vk.decode_q8_enabled
+    $ResultObj.DecodeQ8GemvEnabled = $vk.decode_q8_gemv_enabled
+    $ResultObj.LastDecodeQ8GemvUsed = $vk.last_decode_q8_gemv_used
     $ResultObj.LmHeadQ8Enabled = $vk.lm_head_q8_enabled
     $ResultObj.LmHeadPath = $vk.lm_head_path
     $ResultObj.LmHeadMemoryPath = $vk.lm_head_memory_path
@@ -545,6 +573,12 @@ function Assert-HealthGate {
         }
         if ($SingleSubmitRequested -and -not $DebugCorrectness -and -not [bool] $vk.last_single_submit_used) {
             $ResultObj.FailReason = "OSH26_SINGLE_SUBMIT requested but last_single_submit_used=false"
+            throw "[$ModelLabel] $($ResultObj.FailReason)"
+        }
+        if ($DecodeQ8GemvRequested -and
+                ($ModelLabel -eq "0.6B-Q8_0" -or $ModelLabel -eq "1.7B-Q8_0") -and
+                -not [bool] $vk.last_decode_q8_gemv_used) {
+            $ResultObj.FailReason = "OSH26_DECODE_Q8_GEMV requested but last_decode_q8_gemv_used=false"
             throw "[$ModelLabel] $($ResultObj.FailReason)"
         }
         if (($ModelLabel -eq "0.6B-Q8_0" -or $ModelLabel -eq "1.7B-Q8_0") -and -not $DebugCorrectness) {
@@ -810,6 +844,7 @@ Write-Host "debug_correctness: $DebugCorrectness"
 Write-Host "run_long_stress: $RunLongStress"
 Write-Host "run_full_prompt_set: $RunFullPromptSet"
 Write-Host "single_submit_requested: $SingleSubmitRequested"
+Write-Host "decode_q8_gemv_requested: $DecodeQ8GemvRequested"
 
 # Install APK
 if (-not $SkipInstall) {
@@ -835,6 +870,7 @@ $TempModels.Keys | ForEach-Object {
 Invoke-Adb logcat -c
 Invoke-Adb shell am force-stop $PackageName
 Invoke-Adb shell setprop debug.osh26.single_submit $(if ($SingleSubmitRequested) { "1" } else { "0" })
+Invoke-Adb shell setprop debug.osh26.decode_q8_gemv $(if ($DecodeQ8GemvRequested) { "1" } else { "0" })
 Invoke-Adb forward tcp:$Port tcp:$Port
 Invoke-Adb shell am start -n $ActivityName | Out-Host
 
@@ -889,6 +925,7 @@ $globalVersion = @{
     timestamp = $timestamp
     debugCorrectness = [bool]$DebugCorrectness
     singleSubmitRequested = [bool]$SingleSubmitRequested
+    decodeQ8GemvRequested = [bool]$DecodeQ8GemvRequested
     runLongStress = [bool]$RunLongStress
     runFullPromptSet = [bool]$RunFullPromptSet
     seed = $DefaultSeed
@@ -930,6 +967,7 @@ if ($globalFailures.Count -eq 0) {
 }
 
 Invoke-Adb shell setprop debug.osh26.single_submit 0
+Invoke-Adb shell setprop debug.osh26.decode_q8_gemv 1
 
 # Return nonzero exit code on failures
 if ($globalFailures.Count -gt 0) {
