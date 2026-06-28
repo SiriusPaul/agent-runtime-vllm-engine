@@ -128,8 +128,29 @@ Value [kvHeadNum, maxLen, headDim / 4].vec4
 - 只接受 token id 完全一致的公共前缀，不做文本、模糊或语义匹配。
 - 可复用长度按 16 tokens 向下对齐，避免维护任意长度的碎片页。
 - 始终保留 prompt 的最后一个 token 重新计算，确保 logits 和生成边界来自本次 forward。
-- 单个条目最多缓存 128 tokens；缓存条目和物理页由固定上限约束。
+- 动态条目默认最多缓存 128 tokens；subagent pinned 条目默认最多缓存 256 tokens。
+- 前缀页池默认 32 pages，可通过 Android property 回退到更小容量。
 - Debug correctness、非 Vulkan 路径或不支持的状态会自动跳过前缀复用。
+
+### Stateless Subagent Cache
+
+端侧 Agent 的 subagent 通常不依赖历史上下文，只依赖一段固定 system prompt 和当前任务。HTTP `/v1/chat/completions` 会识别包含 `YAML action flow` 和 `tool: return` 的 system prompt，并进入 `stateless_subagent` 模式：
+
+```text
+system: 固定 subagent 工具协议
+user:   当前任务
+```
+
+该模式只缓存固定 system prompt 和 chat template 的 user-role 起始部分，不缓存每次 user task，避免一次性任务污染 cache。第一次请求完成后写入 pinned prefix，后续相同 system prompt、不同 user task 的请求可以直接恢复这段 KV。
+
+可用属性：
+
+```powershell
+adb shell setprop debug.osh26.prefix_cache_pages 32
+adb shell setprop debug.osh26.prefix_cache_max_entry_tokens 128
+adb shell setprop debug.osh26.prefix_cache_max_pinned_tokens 256
+adb shell setprop debug.osh26.prefix_cache_max_entries 8
+```
 
 ### 缓存管理与调度创新
 
@@ -138,6 +159,7 @@ Value [kvHeadNum, maxLen, headDim / 4].vec4
 | 最长可复用前缀 | 只匹配完整 prompt 或最近条目 | 遍历缓存并选择 page 对齐后复用 token 数最多的条目 | 尽可能减少实际 prefill 长度 |
 | 逻辑条目与物理页分离 | 每条记录持有连续大块缓存 | 条目只记录 token 和 page slot，物理页由共享池管理 | 回收简单，内存上限明确 |
 | LRU 与去重 | 缓存满后整体清空或重复存储 | 相同前缀更新已有条目；不足时逐条淘汰最久未使用项并回收页 | 提高有限 GPU 内存的命中效率 |
+| Subagent pinned prefix | 每次重复计算固定工具协议 | 固定 system prompt 写入 pinned entry，不参与普通淘汰 | 降低 subagent 首 token 等待 |
 | Cache-aware scheduling | 请求严格 FIFO 执行 | 队列优先选择可复用前缀最长的请求，同分时按 FIFO | 批量请求中优先兑现缓存收益，同时保留公平性 |
 | GPU resident store/restore | KV 经 CPU 暂存和恢复 | active cache 与 prefix pool 之间使用 GPU buffer copy，可选批量复制 | 降低 CPU 往返和 host bookkeeping |
 | 可观测性 | 只记录是否命中 | 暴露 hit ratio、复用 token/page、淘汰、碎片率及 restore/store 时间 | 可以量化缓存对 TTFT 的实际贡献 |
@@ -151,6 +173,8 @@ Value [kvHeadNum, maxLen, headDim / 4].vec4
 - `prefix_cache_reuse_tokens`、`prefix_cache_reuse_blocks`。
 - `prefix_cache_hit_ratio`、`prefix_cache_block_reuse_ratio`、`prefix_cache_fragmentation`。
 - `prefix_cache_pool_pages`、`prefix_cache_used_pages`、`prefix_cache_free_pages`。
+- `last_prompt_mode`、`subagent_prefix_tokens`、`subagent_prefix_warm_state`。
+- `prefix_cache_pinned_entries`、`prefix_cache_dynamic_entries`。
 
 ### 当前默认优化
 

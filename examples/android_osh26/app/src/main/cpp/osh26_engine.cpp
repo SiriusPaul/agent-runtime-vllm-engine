@@ -13,8 +13,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
+#include <iomanip>
+#include <sys/system_properties.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -35,9 +38,40 @@ constexpr int kGpuGuardTokenCount = 3;
 constexpr bool kEnablePrefixCache = true;
 constexpr int kPrefixCachePageTokens = OSH26_VK_PREFIX_CACHE_PAGE_TOKENS;
 constexpr int kPrefixCachePoolPages = OSH26_VK_PREFIX_CACHE_POOL_PAGES;
+constexpr const char * kDefaultSystemPrompt = "You are a helpful local assistant. Answer in the same language as the user and keep the response concise.";
 
 bool prefix_cache_gpu_batch_copy_enabled() {
     return std::getenv("OSH26_PREFIX_CACHE_GPU_COPY") != nullptr;
+}
+
+int android_int_property(const char * name, int fallback, int lo, int hi) {
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get(name, prop) <= 0 || prop[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    long value = std::strtol(prop, &end, 10);
+    if (end == prop) {
+        return fallback;
+    }
+    value = std::max<long>(lo, std::min<long>(hi, value));
+    return (int) value;
+}
+
+uint64_t fnv1a64(const std::string & value) {
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char c : value) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::string cache_key_for_prompt(const std::string & system_prompt, bool enable_thinking) {
+    std::ostringstream out;
+    out << "v1:" << (enable_thinking ? "think:" : "no_think:")
+        << std::hex << std::setw(16) << std::setfill('0') << fnv1a64(system_prompt);
+    return out.str();
 }
 
 template <size_t N>
@@ -454,13 +488,13 @@ ComputeBackend::~ComputeBackend() {
     release();
 }
 
-std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool enable_thinking) const {
+std::string ComputeBackend::build_prompt(const std::string & user_prompt, const GenerateOptions & options) const {
+    const std::string system_msg = options.system_prompt.empty() ? kDefaultSystemPrompt : options.system_prompt;
     if (model_ != nullptr) {
         const char * tmpl = llama_model_chat_template(model_, nullptr);
         if (tmpl != nullptr && tmpl[0] != '\0') {
-            std::string system_msg = "You are a helpful local assistant. Answer in the same language as the user and keep the response concise.";
             std::string user_msg = user_prompt;
-            user_msg += enable_thinking ? "\n/think" : "\n/no_think";
+            user_msg += options.enable_thinking ? "\n/think" : "\n/no_think";
             std::array<llama_chat_message, 2> messages = {
                 llama_chat_message{"system", system_msg.c_str()},
                 llama_chat_message{"user", user_msg.c_str()},
@@ -483,21 +517,22 @@ std::string ComputeBackend::build_prompt(const std::string & user_prompt, bool e
         }
     }
     std::string prompt = "<|im_start|>system\n"
-                         "You are a helpful local assistant. Answer in the same language as the user and keep the response concise.\n"
-                         "<|im_end|>\n"
+                         + system_msg +
+                         "\n<|im_end|>\n"
                          "<|im_start|>user\n" + user_prompt;
-    prompt += enable_thinking ? "\n/think" : "\n/no_think";
+    prompt += options.enable_thinking ? "\n/think" : "\n/no_think";
     prompt += "\n<|im_end|>\n<|im_start|>assistant\n";
     return prompt;
 }
 
-std::string ComputeBackend::build_prompt_prefix() const {
+std::string ComputeBackend::build_prompt_prefix(const GenerateOptions & options) const {
+    const std::string system_msg = options.system_prompt.empty() ? kDefaultSystemPrompt : options.system_prompt;
     if (model_ != nullptr) {
         const char * tmpl = llama_model_chat_template(model_, nullptr);
         if (tmpl != nullptr && tmpl[0] != '\0') {
             const std::string marker = "__OSH26_PREFIX_SPLIT_MARKER__";
             std::array<llama_chat_message, 2> messages = {
-                llama_chat_message{"system", "You are a helpful local assistant."},
+                llama_chat_message{"system", system_msg.c_str()},
                 llama_chat_message{"user", marker.c_str()},
             };
             const int32_t needed = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
@@ -522,8 +557,8 @@ std::string ComputeBackend::build_prompt_prefix() const {
     }
 
     return "<|im_start|>system\n"
-           "You are a helpful local assistant. Think before answering when useful.\n"
-           "<|im_end|>\n"
+           + system_msg +
+           "\n<|im_end|>\n"
            "<|im_start|>user\n";
 }
 
@@ -585,6 +620,7 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
     PrefixCacheEntry * entry = find_best_prefix_cache_match_locked(prompt_tokens, &reusable_tokens);
     if (entry == nullptr || reusable_tokens == 0) {
         prefix_cache_misses_ += 1;
+        last_prefix_cache_miss_reason_ = "no_match";
         return false;
     }
 
@@ -596,6 +632,7 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
             last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - restore_start).count();
             prefix_cache_misses_ += 1;
+            last_prefix_cache_miss_reason_ = "restore_failed";
             return false;
         }
     } else {
@@ -605,6 +642,7 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
                 last_prefix_restore_ms_ = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - restore_start).count();
                 prefix_cache_misses_ += 1;
+                last_prefix_cache_miss_reason_ = "restore_failed";
                 return false;
             }
         }
@@ -625,6 +663,7 @@ bool ComputeBackend::restore_prefix_cache_locked(const std::vector<llama_token> 
     prefix_cache_reuse_tokens_ += reusable_tokens;
     prefix_cache_block_reuse_ += restore_pages;
     last_prefix_cache_hit_ = true;
+    last_prefix_cache_miss_reason_.clear();
     last_prefix_tokens_ = static_cast<int>(reusable_tokens);
     last_reusable_prefix_tokens_ = reusable_tokens;
     if (restored_tokens != nullptr) {
@@ -658,6 +697,8 @@ void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
         prefix_cache_misses_ = 0;
         prefix_cache_reuse_tokens_ = 0;
         prefix_cache_block_reuse_ = 0;
+        prefix_cache_admitted_entries_ = 0;
+        prefix_cache_admission_skips_ = 0;
         prefix_cache_root_ = PrefixCacheNode{};
         prefix_cache_lru_.clear();
         prefix_cache_entries_.clear();
@@ -671,6 +712,11 @@ void ComputeBackend::reset_cache_locked(bool clear_prefix_state) {
         last_cached_prefix_entries_ = 0;
         last_prefix_restore_ms_ = 0.0;
         last_prefix_store_ms_ = 0.0;
+        last_prefix_cache_miss_reason_.clear();
+        last_prefix_cache_admission_reason_.clear();
+        last_subagent_cache_key_.clear();
+        last_subagent_prefix_warm_state_ = "not_run";
+        last_subagent_prefix_tokens_ = 0;
     }
 }
 
@@ -750,25 +796,37 @@ void ComputeBackend::complete_request(const std::shared_ptr<GenerationRequest> &
     request->cv.notify_all();
 }
 
-void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens) {
+void ComputeBackend::insert_prefix_cache_locked(
+        const std::vector<llama_token> & prompt_tokens,
+        bool pinned,
+        const std::string & cache_key,
+        size_t max_tokens) {
+    last_prefix_cache_admission_reason_.clear();
     if (!kEnablePrefixCache) {
+        last_prefix_cache_admission_reason_ = "disabled";
         return;
     }
     if (debug_correctness_ || requested_backend_ != "vulkan" || !osh26_vk_gpu_prefix_cache_supported()) {
+        last_prefix_cache_admission_reason_ = "unsupported";
         return;
     }
     if (prompt_tokens.size() <= 1) {
+        last_prefix_cache_admission_reason_ = "too_short";
         return;
     }
     init_prefix_cache_page_slots_locked();
 
-    const size_t prefix_cap = std::min(max_prefix_cache_tokens_, prompt_tokens.size() - 1);
+    const size_t prefix_cap = std::min(max_tokens, prompt_tokens.size() - 1);
     const size_t prefix_len = (prefix_cap / prefix_cache_block_size_) * prefix_cache_block_size_;
     if (prefix_len == 0) {
+        last_prefix_cache_admission_reason_ = "too_short";
+        prefix_cache_admission_skips_ += 1;
         return;
     }
     const size_t page_count = prefix_len / prefix_cache_block_size_;
     if (page_count == 0 || page_count > prefix_cache_pool_pages_) {
+        last_prefix_cache_admission_reason_ = "too_large";
+        prefix_cache_admission_skips_ += 1;
         return;
     }
     while (prefix_cache_free_page_slots_.size() < page_count) {
@@ -777,24 +835,33 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
         }
     }
     if (prefix_cache_free_page_slots_.size() < page_count) {
+        last_prefix_cache_admission_reason_ = "no_free_pages";
+        prefix_cache_admission_skips_ += 1;
         return;
     }
 
     const std::vector<llama_token> cached_tokens(prompt_tokens.begin(), prompt_tokens.begin() + prefix_len);
     for (auto it = prefix_cache_entries_.begin(); it != prefix_cache_entries_.end(); ++it) {
-        if (it->tokens == cached_tokens) {
+        if (it->tokens == cached_tokens || (!cache_key.empty() && it->cache_key == cache_key)) {
             it->request_count += 1;
             it->last_used_tick = ++prefix_cache_tick_;
+            it->pinned = it->pinned || pinned;
+            if (!cache_key.empty()) {
+                it->cache_key = cache_key;
+            }
             prefix_cache_entries_.splice(prefix_cache_entries_.begin(), prefix_cache_entries_, it);
             last_cached_prefix_entries_ = prefix_cache_entries_.size();
+            last_prefix_cache_admission_reason_ = "updated";
             return;
         }
     }
 
     PrefixCacheEntry entry;
     entry.tokens = cached_tokens;
+    entry.cache_key = cache_key;
     entry.request_count = 1;
     entry.last_used_tick = ++prefix_cache_tick_;
+    entry.pinned = pinned;
     entry.page_slots.reserve(page_count);
 
     const auto store_start = std::chrono::steady_clock::now();
@@ -812,6 +879,8 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
             }
             last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - store_start).count();
+            last_prefix_cache_admission_reason_ = "store_failed";
+            prefix_cache_admission_skips_ += 1;
             return;
         }
         entry.page_slots = std::move(page_slots);
@@ -827,6 +896,8 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
                 }
                 last_prefix_store_ms_ = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - store_start).count();
+                last_prefix_cache_admission_reason_ = "store_failed";
+                prefix_cache_admission_skips_ += 1;
                 return;
             }
             entry.page_slots.push_back(page_slot);
@@ -840,6 +911,8 @@ void ComputeBackend::insert_prefix_cache_locked(const std::vector<llama_token> &
     prefix_cache_entries_.push_front(std::move(entry));
     prefix_cache_entry_count_ = prefix_cache_entries_.size();
     last_cached_prefix_entries_ = prefix_cache_entry_count_;
+    prefix_cache_admitted_entries_ += 1;
+    last_prefix_cache_admission_reason_ = pinned ? "admitted_pinned" : "admitted";
     evict_prefix_cache_locked();
 }
 
@@ -882,7 +955,27 @@ bool ComputeBackend::evict_one_prefix_cache_entry_locked() {
     if (prefix_cache_entries_.empty()) {
         return false;
     }
-    PrefixCacheEntry & victim = prefix_cache_entries_.back();
+    auto victim_it = prefix_cache_entries_.end();
+    uint64_t victim_score = std::numeric_limits<uint64_t>::max();
+    uint64_t victim_tick = std::numeric_limits<uint64_t>::max();
+    for (auto it = prefix_cache_entries_.begin(); it != prefix_cache_entries_.end(); ++it) {
+        if (it->pinned) {
+            continue;
+        }
+        const uint64_t score = (uint64_t) it->hit_count * (uint64_t) it->tokens.size()
+            + (uint64_t) it->request_count * 16ull;
+        if (victim_it == prefix_cache_entries_.end()
+                || score < victim_score
+                || (score == victim_score && it->last_used_tick < victim_tick)) {
+            victim_it = it;
+            victim_score = score;
+            victim_tick = it->last_used_tick;
+        }
+    }
+    if (victim_it == prefix_cache_entries_.end()) {
+        return false;
+    }
+    PrefixCacheEntry & victim = *victim_it;
     for (const int slot : victim.page_slots) {
         prefix_cache_free_page_slots_.push_back(slot);
     }
@@ -896,7 +989,7 @@ bool ComputeBackend::evict_one_prefix_cache_entry_locked() {
     } else {
         prefix_cache_used_pages_ = 0;
     }
-    prefix_cache_entries_.pop_back();
+    prefix_cache_entries_.erase(victim_it);
     prefix_cache_evictions_ += 1;
     prefix_cache_entry_count_ = prefix_cache_entries_.size();
     last_cached_prefix_entries_ = prefix_cache_entry_count_;
@@ -923,8 +1016,11 @@ void ComputeBackend::init_prefix_cache_page_slots_locked() {
     if (!prefix_cache_free_page_slots_.empty() || prefix_cache_used_pages_ > 0 || !prefix_cache_entries_.empty()) {
         return;
     }
-    prefix_cache_pool_pages_ = kPrefixCachePoolPages;
+    prefix_cache_pool_pages_ = (size_t) android_int_property("debug.osh26.prefix_cache_pages", kPrefixCachePoolPages, 4, kPrefixCachePoolPages);
     prefix_cache_block_size_ = kPrefixCachePageTokens;
+    max_prefix_cache_entries_ = (size_t) android_int_property("debug.osh26.prefix_cache_max_entries", 8, 1, 32);
+    max_prefix_cache_tokens_ = (size_t) android_int_property("debug.osh26.prefix_cache_max_entry_tokens", 128, 16, 512);
+    max_pinned_prefix_cache_tokens_ = (size_t) android_int_property("debug.osh26.prefix_cache_max_pinned_tokens", 256, 16, 512);
     prefix_cache_free_page_slots_.reserve(prefix_cache_pool_pages_);
     for (size_t i = 0; i < prefix_cache_pool_pages_; ++i) {
         prefix_cache_free_page_slots_.push_back(static_cast<int>(prefix_cache_pool_pages_ - 1 - i));
@@ -1114,9 +1210,15 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         last_submit_wait_ms_ = 0.0;
 
         const auto prompt_build_start = std::chrono::steady_clock::now();
-        prompt = build_prompt(user_prompt, options.enable_thinking);
+        prompt = build_prompt(user_prompt, options);
         last_prompt_build_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - prompt_build_start).count();
+        request->prompt_mode = options.stateless_subagent_mode ? "stateless_subagent" : "chat";
+        request->subagent_cache_key = options.stateless_subagent_mode
+            ? cache_key_for_prompt(options.system_prompt.empty() ? kDefaultSystemPrompt : options.system_prompt, options.enable_thinking)
+            : "";
+        last_prompt_mode_ = request->prompt_mode;
+        last_subagent_cache_key_ = request->subagent_cache_key;
 
         const auto tokenize_start = std::chrono::steady_clock::now();
         const llama_vocab * vocab = llama_model_get_vocab(model_);
@@ -1135,6 +1237,28 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         }
         last_tokenize_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tokenize_start).count();
+
+        if (options.stateless_subagent_mode) {
+            const std::string prefix_text = build_prompt_prefix(options);
+            const int prefix_prompt = -llama_tokenize(vocab, prefix_text.c_str(), (int32_t) prefix_text.size(), nullptr, 0, true, true);
+            request->subagent_prefix_tokens = 0;
+            request->subagent_prefix_warm_state = "too_short";
+            if (prefix_prompt > 0) {
+                std::vector<llama_token> prefix_tokens((size_t) prefix_prompt);
+                if (llama_tokenize(vocab, prefix_text.c_str(), (int32_t) prefix_text.size(), prefix_tokens.data(), prefix_prompt, true, true) >= 0) {
+                    const size_t common = strict_common_prefix_tokens(prompt_tokens, prefix_tokens);
+                    const size_t capped = std::min(common, prompt_tokens.size() > 1 ? prompt_tokens.size() - 1 : 0);
+                    const size_t aligned = (capped / prefix_cache_block_size_) * prefix_cache_block_size_;
+                    request->subagent_prefix_tokens = aligned;
+                    request->subagent_prefix_warm_state = aligned > 0 ? "pending" : "too_short";
+                }
+            }
+        } else {
+            request->subagent_prefix_tokens = 0;
+            request->subagent_prefix_warm_state = "not_subagent";
+        }
+        last_subagent_prefix_tokens_ = request->subagent_prefix_tokens;
+        last_subagent_prefix_warm_state_ = request->subagent_prefix_warm_state;
 
         request->prompt = std::move(prompt);
         request->prompt_tokens = prompt_tokens;
@@ -1302,8 +1426,30 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
 
         if (result.error.empty() && !result.cancelled && kEnablePrefixCache && !debug_correctness_) {
             std::lock_guard<std::mutex> lock(mutex_);
-            insert_prefix_cache_locked(prompt_tokens);
+            if (options.stateless_subagent_mode && request->subagent_prefix_tokens > 0) {
+                const size_t subagent_source_tokens = std::min(request->subagent_prefix_tokens + 1, prompt_tokens.size());
+                std::vector<llama_token> subagent_prefix(
+                    prompt_tokens.begin(),
+                    prompt_tokens.begin() + subagent_source_tokens);
+                insert_prefix_cache_locked(
+                    subagent_prefix,
+                    true,
+                    request->subagent_cache_key,
+                    max_pinned_prefix_cache_tokens_);
+                if (last_prefix_cache_admission_reason_ == "admitted_pinned"
+                        || last_prefix_cache_admission_reason_ == "updated") {
+                    request->subagent_prefix_warm_state = "ok";
+                } else {
+                    request->subagent_prefix_warm_state = last_prefix_cache_admission_reason_;
+                }
+            } else {
+                insert_prefix_cache_locked(prompt_tokens, false, "", max_prefix_cache_tokens_);
+            }
             last_cached_prefix_entries_ = prefix_cache_entries_.size();
+            last_prompt_mode_ = request->prompt_mode;
+            last_subagent_cache_key_ = request->subagent_cache_key;
+            last_subagent_prefix_tokens_ = request->subagent_prefix_tokens;
+            last_subagent_prefix_warm_state_ = request->subagent_prefix_warm_state;
         }
         if (result.error.empty() && !result.cancelled && kEnablePrefixCache && !debug_correctness_) {
             std::vector<std::shared_ptr<GenerationRequest>> queued_snapshot;
@@ -1589,6 +1735,10 @@ cpu_path:
         last_finish_reason_ = result.finish_reason;
         last_error_ = result.error;
         last_token_ids_ = result.token_ids;
+        last_prompt_mode_ = request->prompt_mode;
+        last_subagent_cache_key_ = request->subagent_cache_key;
+        last_subagent_prefix_tokens_ = request->subagent_prefix_tokens;
+        last_subagent_prefix_warm_state_ = request->subagent_prefix_warm_state;
         if (have_vk_stats) {
             last_prefill_qkv_ms_ = vk_stats.last_prefill_qkv_ms;
             last_prefill_cpu_post_ms_ = vk_stats.last_prefill_cpu_post_ms;
@@ -1731,6 +1881,15 @@ std::string ComputeBackend::stats_json() const {
         ? (double) prefix_cache_block_reuse_ / (double) max_reusable_blocks
         : 0.0;
     const size_t prefix_cache_free_pages = prefix_cache_free_page_slots_.size();
+    size_t prefix_cache_pinned_entries = 0;
+    size_t prefix_cache_dynamic_entries = 0;
+    for (const auto & entry : prefix_cache_entries_) {
+        if (entry.pinned) {
+            ++prefix_cache_pinned_entries;
+        } else {
+            ++prefix_cache_dynamic_entries;
+        }
+    }
     std::ostringstream out;
     out << "{\n"
         << "  \"backend\": \"" << json_escape(active_backend_) << "\",\n"
@@ -1745,7 +1904,7 @@ std::string ComputeBackend::stats_json() const {
         << "  \"vulkan\": " << describe_osh26_vk_stats() << ",\n"
         << "  \"devices\": " << (available_devices_.empty() ? describe_backend_devices() : available_devices_) << ",\n"
         << "  \"api_port\": 8000,\n"
-        << "  \"scheduler\": \"queued-prefix-paged-lite\",\n"
+        << "  \"scheduler\": \"prefix-aware-aging-v2\",\n"
         << "  \"max_concurrent_requests\": 1,\n"
         << "  \"max_pending_requests\": " << max_pending_requests_ << ",\n"
         << "  \"model_loaded\": " << (model_ ? "true" : "false") << ",\n"
@@ -1766,7 +1925,12 @@ std::string ComputeBackend::stats_json() const {
         << "  \"last_decoded_tokens\": " << last_decoded_tokens_ << ",\n"
         << "  \"last_prompt_build_ms\": " << last_prompt_build_ms_ << ",\n"
         << "  \"last_tokenize_ms\": " << last_tokenize_ms_ << ",\n"
+        << "  \"last_prompt_mode\": \"" << json_escape(last_prompt_mode_) << "\",\n"
         << "  \"prefix_cache_enabled\": " << (prefix_cache_enabled ? "true" : "false") << ",\n"
+        << "  \"subagent_cache_enabled\": " << (prefix_cache_enabled ? "true" : "false") << ",\n"
+        << "  \"subagent_cache_key\": \"" << json_escape(last_subagent_cache_key_) << "\",\n"
+        << "  \"subagent_prefix_tokens\": " << last_subagent_prefix_tokens_ << ",\n"
+        << "  \"subagent_prefix_warm_state\": \"" << json_escape(last_subagent_prefix_warm_state_) << "\",\n"
         << "  \"prefix_cache_supported\": " << (prefix_cache_supported ? "true" : "false") << ",\n"
         << "  \"last_prefix_cache_hit\": " << (last_prefix_cache_hit_ ? "true" : "false") << ",\n"
         << "  \"prefix_cache_valid\": " << (prefix_cache_valid ? "true" : "false") << ",\n"
@@ -1779,8 +1943,13 @@ std::string ComputeBackend::stats_json() const {
         << "  \"prefix_cache_pool_pages\": " << prefix_cache_pool_pages_ << ",\n"
         << "  \"prefix_cache_used_pages\": " << prefix_cache_used_pages_ << ",\n"
         << "  \"prefix_cache_free_pages\": " << prefix_cache_free_pages << ",\n"
+        << "  \"prefix_cache_effective_pages\": " << prefix_cache_pool_pages_ << ",\n"
+        << "  \"prefix_cache_pinned_entries\": " << prefix_cache_pinned_entries << ",\n"
+        << "  \"prefix_cache_dynamic_entries\": " << prefix_cache_dynamic_entries << ",\n"
         << "  \"prefix_cache_max_entries\": " << max_prefix_cache_entries_ << ",\n"
         << "  \"prefix_cache_max_tokens\": " << max_prefix_cache_tokens_ << ",\n"
+        << "  \"prefix_cache_admitted_entries\": " << prefix_cache_admitted_entries_ << ",\n"
+        << "  \"prefix_cache_admission_skips\": " << prefix_cache_admission_skips_ << ",\n"
         << "  \"prefix_cache_hits\": " << prefix_cache_hits_ << ",\n"
         << "  \"prefix_cache_misses\": " << prefix_cache_misses_ << ",\n"
         << "  \"prefix_cache_evictions\": " << prefix_cache_evictions_ << ",\n"
@@ -1789,6 +1958,8 @@ std::string ComputeBackend::stats_json() const {
         << "  \"prefix_cache_hit_ratio\": " << prefix_cache_hit_ratio << ",\n"
         << "  \"prefix_cache_block_reuse_ratio\": " << prefix_cache_block_reuse_ratio << ",\n"
         << "  \"prefix_cache_fragmentation\": " << prefix_cache_fragmentation_locked() << ",\n"
+        << "  \"last_prefix_cache_miss_reason\": \"" << json_escape(last_prefix_cache_miss_reason_) << "\",\n"
+        << "  \"last_prefix_cache_admission_reason\": \"" << json_escape(last_prefix_cache_admission_reason_) << "\",\n"
         << "  \"last_prefix_restore_ms\": " << last_prefix_restore_ms_ << ",\n"
         << "  \"last_prefix_store_ms\": " << last_prefix_store_ms_ << ",\n"
         << "  \"last_user_prefill_tokens\": " << last_user_prefill_tokens_ << ",\n"

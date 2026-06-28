@@ -106,7 +106,7 @@ struct osh26_vk_candidate {
 };
 
 #define OSH26_VK_PREFIX_CACHE_PAGE_TOKENS 16
-#define OSH26_VK_PREFIX_CACHE_POOL_PAGES 16
+#define OSH26_VK_PREFIX_CACHE_POOL_PAGES 32
 
 typedef enum osh26_vk_forward_flags {
     OSH26_FORWARD_NEED_LOGITS = 1u << 0,

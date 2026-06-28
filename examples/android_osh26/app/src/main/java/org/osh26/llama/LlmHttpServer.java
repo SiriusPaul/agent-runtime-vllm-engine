@@ -230,18 +230,21 @@ public final class LlmHttpServer {
 
     private void handleChatCompletion(String body, OutputStream writer) throws Exception {
         JSONObject request = new JSONObject(body);
-        String prompt = messagesToPrompt(request.optJSONArray("messages"));
+        ChatPrompt chatPrompt = parseChatPrompt(request.optJSONArray("messages"));
         int maxTokens = request.optInt("max_tokens", 2048);
         float temperature = (float) request.optDouble("temperature", 0.6);
         float topP = (float) request.optDouble("top_p", 0.95);
         int seed = request.optInt("seed", 0xCAFE);
         boolean thinking = request.optBoolean("thinking", false);
         boolean stream = request.optBoolean("stream", false);
+        boolean statelessSubagent = request.optBoolean("stateless_subagent", chatPrompt.statelessSubagent);
+        String userPrompt = statelessSubagent ? chatPrompt.lastUserPrompt : chatPrompt.legacyPrompt;
+        String systemPrompt = statelessSubagent ? chatPrompt.systemPrompt : "";
 
         if (stream) {
             writeSseHeaders(writer);
             String id = "chatcmpl-" + UUID.randomUUID();
-            LlamaNative.generateStream(prompt, new LlamaNative.StreamCallback() {
+            LlamaNative.generateChatStream(userPrompt, systemPrompt, statelessSubagent, new LlamaNative.StreamCallback() {
                 @Override
                 public void onToken(String token) {
                     try {
@@ -290,7 +293,9 @@ public final class LlmHttpServer {
             return;
         }
 
-        JSONObject completion = new JSONObject(LlamaNative.generateBlockingJson(prompt, maxTokens, temperature, topP, seed, thinking));
+        JSONObject completion = new JSONObject(LlamaNative.generateChatBlockingJson(
+                userPrompt, systemPrompt, statelessSubagent,
+                maxTokens, temperature, topP, seed, thinking));
         if (!completion.optBoolean("ok") && !"cancelled".equals(completion.optString("finish_reason"))) {
             writeJson(writer, 500, errorJson("generation_error", completion.optString("error")));
             return;
@@ -314,23 +319,50 @@ public final class LlmHttpServer {
         writeJson(writer, 200, json);
     }
 
-    private String messagesToPrompt(JSONArray messages) {
+    private ChatPrompt parseChatPrompt(JSONArray messages) {
         if (messages == null || messages.length() == 0) {
-            return "";
+            return new ChatPrompt("", "", "", false);
         }
-        StringBuilder out = new StringBuilder();
+        String systemPrompt = "";
+        String lastUser = "";
+        StringBuilder legacyPrompt = new StringBuilder();
         for (int i = 0; i < messages.length(); i++) {
             JSONObject message = messages.optJSONObject(i);
             if (message == null) {
                 continue;
             }
+            String role = message.optString("role", "");
             String content = message.optString("content", "");
             if (content.isEmpty()) {
                 continue;
             }
-            out.append(content).append('\n');
+            legacyPrompt.append(content).append('\n');
+            if ("system".equals(role)) {
+                systemPrompt = content;
+            } else if ("user".equals(role)) {
+                lastUser = content;
+            }
         }
-        return out.toString().trim();
+        if (lastUser.isEmpty()) {
+            lastUser = legacyPrompt.toString().trim();
+        }
+        boolean statelessSubagent = systemPrompt.contains("YAML action flow")
+                && systemPrompt.contains("tool: return");
+        return new ChatPrompt(legacyPrompt.toString().trim(), lastUser, systemPrompt, statelessSubagent);
+    }
+
+    private static final class ChatPrompt {
+        final String legacyPrompt;
+        final String lastUserPrompt;
+        final String systemPrompt;
+        final boolean statelessSubagent;
+
+        ChatPrompt(String legacyPrompt, String lastUserPrompt, String systemPrompt, boolean statelessSubagent) {
+            this.legacyPrompt = legacyPrompt;
+            this.lastUserPrompt = lastUserPrompt;
+            this.systemPrompt = systemPrompt;
+            this.statelessSubagent = statelessSubagent;
+        }
     }
 
     private JSONObject errorJson(String type, String message) throws Exception {

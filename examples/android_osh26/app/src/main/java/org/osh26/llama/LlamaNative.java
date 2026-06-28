@@ -19,7 +19,9 @@ public final class LlamaNative {
     public static native void configureBackend(String mode, int nGpuLayers);
     public static native void setDebugCorrectness(boolean enabled);
     public static native String generateBlockingJson(String prompt, int maxTokens, float temperature, float topP, int seed, boolean thinking);
+    public static native String generateChatBlockingJson(String userPrompt, String systemPrompt, boolean statelessSubagent, int maxTokens, float temperature, float topP, int seed, boolean thinking);
     public static native String generateStream(String prompt, StreamCallback callback, int maxTokens, float temperature, float topP, int seed, boolean thinking);
+    public static native String generateChatStream(String userPrompt, String systemPrompt, boolean statelessSubagent, StreamCallback callback, int maxTokens, float temperature, float topP, int seed, boolean thinking);
     public static native void cancel();
     public static native void resetCache();
     public static native void release();

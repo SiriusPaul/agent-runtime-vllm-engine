@@ -1091,3 +1091,49 @@ The `nt == 1` Q8 decode projections now use the subgroup `GEMV_Q8` path by defau
 Both models passed 15-request verifier runs with stable repeated token IDs, zero descriptor allocations, no attention fallback, and no logits sanity failure. Single submit remained opt-in because it did not add at least 5% TPS over decode GEMV alone.
 
 The default UI configuration also completed the prior 61-token hang reproduction prompt with two prefill chunks (`32 + 29`), `last_decode_q8_gemv_used=true`, and no active request left behind.
+
+## 2026-06-18 13:16:17 LM Head Q8 Verification
+
+Single submit requested: False
+Decode Q8 GEMV requested: True
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms | Decode layers GPU ms | Decode QKV GPU ms | Decode attn GPU ms | Decode O GPU ms | Decode FFN gate/up GPU ms | Decode FFN down GPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 15 | device_local | 175030272 | 388.606 | 5.8382 | 118.45 | 128.334 | 2 | 0 | 0 | 0 | 40.492 | 0.03 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Gate criteria: forward submit count <= 3, TTFT regresses no more than 5% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 0.6B-Q8_0: PASS
+
+## 2026-06-18 13:19:42 LM Head Q8 Verification
+
+Single submit requested: False
+Decode Q8 GEMV requested: True
+
+| Model | Samples | LM head memory | Device-local bytes | Median TTFT ms | Median TPS | Median LM head ms | Median decode ms | Median forward submits | Median descriptor alloc | Forward GPU ms | Layers GPU ms | LM head GPU ms | Final norm GPU ms | Decode layers GPU ms | Decode QKV GPU ms | Decode attn GPU ms | Decode O GPU ms | Decode FFN gate/up GPU ms | Decode FFN down GPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.7B-Q8_0 | 15 | device_local | 350060544 | 841.068 | 3.0614 | 214.37 | 224.53 | 2 | 0 | 0 | 0 | 50.221 | 0.056 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Gate criteria: forward submit count <= 3, TTFT regresses no more than 5% from the device-local baseline, TPS regresses no more than 2%, and LM head regresses no more than 5%.
+Gate status 1.7B-Q8_0: PASS
+
+## 2026-06-18 Stateless Subagent Pinned Prefix Cache Verification
+
+Device: Xiaomi M2012K11AC, Android 13. Backend: OSH26 Vulkan runtime with decode Q8 GEMV enabled and single-submit disabled.
+
+The cache test used one fixed stateless-subagent system prompt and eight different user tasks. The system prompt contained the explicit `YAML action flow` / `tool: return` protocol, and every request also set `stateless_subagent=true`. Generation used six tokens, temperature `0`, top-p `1`, and seed `51966`. Cache state was reset before each model test.
+
+| Model | Cold TTFT ms | Warm samples | Warm cache hits | Reused prefix tokens | Warm user prefill tokens (median) | Warm TTFT ms (median) | TTFT reduction vs cold | Cold TPS | Warm TPS (median) | Prefix restore ms (median) | Cold prefix store ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.6B-Q8_0 | 2249.13 | 7 | 7/7 | 112 | 19 | 678.543 | 69.83% | 2.0131 | 4.3513 | 217.918 | 201.877 |
+| 1.7B-Q8_0 | 5787.45 | 7 | 7/7 | 112 | 19 | 1310.29 | 77.36% | 0.8564 | 2.4078 | 217.588 | 197.017 |
+
+The first request admitted one pinned entry (`admitted_pinned`). All seven warm requests used different user tasks, reported `last_prefix_cache_hit=true`, reused the same 112-token prefix, and left exactly one pinned cache entry with no dynamic entry or eviction. Subsequent admissions reported `updated`, confirming that the fixed protocol prefix was reused rather than duplicated.
+
+Interpretation: the pinned-prefix path removes 112 of roughly 135 cold prompt tokens from repeated stateless-subagent prefill. The remaining 17-20 user-side tokens plus the approximately 218 ms GPU prefix restore dominate warm TTFT. The cold-to-warm comparison includes the one-time cold prefill and cache-store cost; it demonstrates repeated-request cache benefit, not a kernel-only speedup.
+
+Ordinary chat regression smoke test also passed after `reset_cache`: `last_prompt_mode=chat`, the subagent cache key stayed empty, the request created one dynamic entry and zero pinned entries, and generation completed without a native or HTTP error.
+
+Raw production-gate results:
+
+- `verify-results/verify-results-20260618-131617.json`: 0.6B-Q8_0, 15/15 passed, median TTFT 388.606 ms, median TPS 5.8382, median LM head 118.45 ms, median decode 128.334 ms.
+- `verify-results/verify-results-20260618-131942.json`: 1.7B-Q8_0, 15/15 passed, median TTFT 841.068 ms, median TPS 3.0614, median LM head 214.37 ms, median decode 224.53 ms.
