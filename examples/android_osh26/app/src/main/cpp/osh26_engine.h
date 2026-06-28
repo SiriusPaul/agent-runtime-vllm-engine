@@ -25,6 +25,8 @@ struct GenerateOptions {
     float top_p = 0.95f;
     uint32_t seed = 0xCAFE;
     bool enable_thinking = true;
+    std::string system_prompt;
+    bool stateless_subagent_mode = false;
 };
 
 struct GenerateResult {
@@ -78,9 +80,11 @@ private:
     struct PrefixCacheEntry {
         std::vector<llama_token> tokens;
         std::vector<int> page_slots;
+        std::string cache_key;
         size_t hit_count = 0;
         size_t request_count = 0;
         uint64_t last_used_tick = 0;
+        bool pinned = false;
     };
 
     struct GenerationRequest {
@@ -92,6 +96,10 @@ private:
         GenerateResult result;
         size_t prompt_tokens_total = 0;
         size_t reusable_prefix_tokens = 0;
+        size_t subagent_prefix_tokens = 0;
+        std::string subagent_cache_key;
+        std::string subagent_prefix_warm_state = "not_run";
+        std::string prompt_mode = "chat";
         size_t queue_position = 0;
         RequestState state = RequestState::queued;
         bool started = false;
@@ -110,8 +118,8 @@ private:
         std::condition_variable cv;
     };
 
-    std::string build_prompt(const std::string & user_prompt, bool enable_thinking) const;
-    std::string build_prompt_prefix() const;
+    std::string build_prompt(const std::string & user_prompt, const GenerateOptions & options) const;
+    std::string build_prompt_prefix(const GenerateOptions & options) const;
     bool warm_prefix_cache_locked();
     void start_prefix_warmup_async_locked();
     PrefixCacheEntry * find_best_prefix_cache_match_locked(
@@ -135,7 +143,7 @@ private:
     bool process_request_gpu(const std::shared_ptr<GenerationRequest> & request, const llama_vocab * vocab, llama_sampler * sampler);
     bool prefill_prompt_gpu(const std::shared_ptr<GenerationRequest> & request, const llama_token * tokens, int n_tokens, int start_pos, bool * cancelled);
     bool prefill_prompt_cpu(const std::shared_ptr<GenerationRequest> & request, llama_batch & batch, bool * cancelled);
-    void insert_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens);
+    void insert_prefix_cache_locked(const std::vector<llama_token> & prompt_tokens, bool pinned, const std::string & cache_key, size_t max_tokens);
     PrefixCacheNode * ensure_prefix_node_locked(const std::vector<llama_token> & tokens);
     PrefixCacheNode * find_prefix_node_locked(const std::vector<llama_token> & tokens) const;
     void touch_prefix_node_locked(PrefixCacheNode * node);
@@ -179,6 +187,7 @@ private:
     size_t prefix_cache_block_size_ = 16;
     size_t max_prefix_cache_entries_ = 16;
     size_t max_prefix_cache_tokens_ = 128;
+    size_t max_pinned_prefix_cache_tokens_ = 256;
     size_t prefix_cache_pool_pages_ = 16;
     size_t prefix_cache_used_pages_ = 0;
     size_t max_pending_requests_ = 8;
@@ -229,6 +238,14 @@ private:
     size_t last_cached_prefix_entries_ = 0;
     double last_prefix_restore_ms_ = 0.0;
     double last_prefix_store_ms_ = 0.0;
+    std::string last_prompt_mode_ = "chat";
+    std::string last_prefix_cache_miss_reason_;
+    std::string last_prefix_cache_admission_reason_;
+    std::string last_subagent_cache_key_;
+    std::string last_subagent_prefix_warm_state_ = "not_run";
+    size_t last_subagent_prefix_tokens_ = 0;
+    size_t prefix_cache_admitted_entries_ = 0;
+    size_t prefix_cache_admission_skips_ = 0;
     bool last_logits_sanity_ok_ = true;
     int last_logits_whitespace_streak_ = 0;
     int last_logits_same_token_streak_ = 0;

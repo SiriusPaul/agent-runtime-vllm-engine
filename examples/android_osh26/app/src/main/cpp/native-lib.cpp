@@ -236,6 +236,21 @@ osh26::GenerateOptions options_from_args(jint max_tokens, jfloat temperature, jf
     return options;
 }
 
+osh26::GenerateOptions chat_options_from_args(
+        JNIEnv * env,
+        jstring j_system_prompt,
+        jboolean stateless_subagent,
+        jint max_tokens,
+        jfloat temperature,
+        jfloat top_p,
+        jint seed,
+        jboolean thinking) {
+    osh26::GenerateOptions options = options_from_args(max_tokens, temperature, top_p, seed, thinking);
+    options.system_prompt = jstring_to_string(env, j_system_prompt);
+    options.stateless_subagent_mode = stateless_subagent == JNI_TRUE;
+    return options;
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
@@ -269,6 +284,17 @@ Java_org_osh26_llama_LlamaNative_generateBlockingJson(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_org_osh26_llama_LlamaNative_generateChatBlockingJson(
+        JNIEnv * env, jclass, jstring j_user_prompt, jstring j_system_prompt, jboolean stateless_subagent,
+        jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
+    osh26::GenerateResult result = osh26::engine().generate(
+            jstring_to_string(env, j_user_prompt),
+            chat_options_from_args(env, j_system_prompt, stateless_subagent, max_tokens, temperature, top_p, seed, thinking),
+            nullptr);
+    return string_to_jstring(env, result_to_json(result));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_org_osh26_llama_LlamaNative_generateStream(
         JNIEnv * env, jclass, jstring j_prompt, jobject callback, jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
     jobject callback_ref = env->NewGlobalRef(callback);
@@ -276,6 +302,40 @@ Java_org_osh26_llama_LlamaNative_generateStream(
     osh26::GenerateResult result = osh26::engine().generate(
             jstring_to_string(env, j_prompt),
             options_from_args(max_tokens, temperature, top_p, seed, thinking),
+            [callback_ref, &pending_stream_bytes](const std::string & token) {
+                pending_stream_bytes += token;
+                const size_t emit_len = utf8_valid_prefix_length(pending_stream_bytes);
+                if (emit_len > 0) {
+                    call_stream_callback(callback_ref, "onToken", pending_stream_bytes.substr(0, emit_len));
+                    pending_stream_bytes.erase(0, emit_len);
+                }
+            });
+
+    if (!pending_stream_bytes.empty()) {
+        call_stream_callback(callback_ref, "onToken", pending_stream_bytes);
+        pending_stream_bytes.clear();
+    }
+
+    if (result.ok) {
+        call_complete_callback(callback_ref, result.text, result.finish_reason);
+    } else if (result.cancelled) {
+        call_complete_callback(callback_ref, result.text, result.finish_reason);
+    } else {
+        call_stream_callback(callback_ref, "onError", result.error);
+    }
+    env->DeleteGlobalRef(callback_ref);
+    return string_to_jstring(env, result.ok ? "generation complete" : "generation failed: " + result.error);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_osh26_llama_LlamaNative_generateChatStream(
+        JNIEnv * env, jclass, jstring j_user_prompt, jstring j_system_prompt, jboolean stateless_subagent,
+        jobject callback, jint max_tokens, jfloat temperature, jfloat top_p, jint seed, jboolean thinking) {
+    jobject callback_ref = env->NewGlobalRef(callback);
+    std::string pending_stream_bytes;
+    osh26::GenerateResult result = osh26::engine().generate(
+            jstring_to_string(env, j_user_prompt),
+            chat_options_from_args(env, j_system_prompt, stateless_subagent, max_tokens, temperature, top_p, seed, thinking),
             [callback_ref, &pending_stream_bytes](const std::string & token) {
                 pending_stream_bytes += token;
                 const size_t emit_len = utf8_valid_prefix_length(pending_stream_bytes);
