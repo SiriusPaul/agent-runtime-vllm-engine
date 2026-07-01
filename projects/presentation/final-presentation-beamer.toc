@@ -1,0 +1,6 @@
+\beamer@sectionintoc {1}{项目背景与定位}{3}{0}{1}
+\beamer@sectionintoc {2}{系统架构与技术路线}{9}{0}{2}
+\beamer@sectionintoc {3}{核心竞争力}{20}{0}{3}
+\beamer@sectionintoc {4}{评测}{27}{0}{4}
+\beamer@sectionintoc {5}{端侧 LLM 推理引擎}{31}{0}{5}
+\beamer@sectionintoc {6}{项目总结}{44}{0}{6}

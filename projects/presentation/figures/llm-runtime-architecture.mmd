@@ -1,0 +1,53 @@
+flowchart TB
+    subgraph java["Android / Java layer"]
+        ui["MainActivity UI\nstream output"]
+        http["LlmHttpServer\n/v1/chat, /health"]
+        jni["LlamaNative.java\nJNI facade"]
+        cb["callbacks\ntoken stream"]
+        ui --> http --> jni --> cb
+    end
+
+    bridge["native-lib.cpp\nJNI bridge"]
+
+    subgraph engine["OSH26 C++ Engine: osh26::ComputeBackend"]
+        queue["Request queue\nworker + cancel"]
+        cache["Prefix cache\npinned + LRU pages"]
+        state["llama.cpp state\nmodel + ctx + sampler"]
+        queue --> cache --> state
+    end
+
+    cpu["llama.cpp CPU path\ndebug / fallback"]
+
+    subgraph gpu["OSH26 Vulkan Runtime"]
+        rt["osh26_vk_gpu.c\nforward_ex / collect_topk"]
+        wrapper["Vulkan wrapper\nAdreno device"]
+        kernels["GPU kernels\nQ8 GEMV | Attention | LM Head"]
+        gkv["GPU KV Cache\nstore / restore pages"]
+        rt --> wrapper
+        rt --> kernels
+        rt --> gkv
+    end
+
+    note1["GGML OpenCL/Vulkan disabled"]
+    note2["handwritten quant backend"]
+
+    jni --> bridge --> engine
+    state -.-> cpu
+    state --> rt
+    cache --> gkv
+    gkv --> cache
+    wrapper --> cb
+    note1 -.-> cpu
+    note2 --> rt
+
+    classDef javaCls fill:#fed7aa,stroke:#c2410c,color:#1f2937
+    classDef nativeCls fill:#dbeafe,stroke:#1e3a5f,color:#1f2937
+    classDef cacheCls fill:#ddd6fe,stroke:#6d28d9,color:#1f2937
+    classDef gpuCls fill:#a7f3d0,stroke:#047857,color:#1f2937
+    classDef warnCls fill:#fee2e2,stroke:#dc2626,color:#1f2937
+    class ui,http javaCls
+    class jni,cb,bridge,queue,state nativeCls
+    class cache,gkv cacheCls
+    class rt,wrapper,kernels gpuCls
+    class cpu,note1 warnCls
+    class note2 cacheCls

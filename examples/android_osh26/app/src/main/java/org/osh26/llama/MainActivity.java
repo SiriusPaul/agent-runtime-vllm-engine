@@ -29,7 +29,7 @@ public class MainActivity extends Activity {
     private EditText modelPath;
     private EditText messageInput;
     private Button sendMessage;
-    private final LlmHttpServer httpServer = new LlmHttpServer();
+    private static final LlmHttpServer httpServer = new LlmHttpServer();
     private final ArrayDeque<String> conversationTurns = new ArrayDeque<>();
     private int conversationContextChars = 0;
     private final ExecutorService nativeExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -42,6 +42,7 @@ public class MainActivity extends Activity {
         thread.setDaemon(true);
         return thread;
     });
+    private boolean httpOutputOpen = false;
     private boolean generating = false;
     private boolean loadingModel = false;
 
@@ -55,6 +56,7 @@ public class MainActivity extends Activity {
         chatScroll = findViewById(R.id.chat_scroll);
         modelPath = findViewById(R.id.model_path);
         messageInput = findViewById(R.id.message_input);
+        httpServer.setEventListener(message -> runOnUiThread(() -> handleHttpEvent(message)));
         Button loadModel = findViewById(R.id.load_model);
         Button importModel = findViewById(R.id.import_model);
         Button resetCache = findViewById(R.id.reset_cache);
@@ -216,15 +218,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        httpServer.stop();
-        LlamaNative.cancel();
-        nativeExecutor.execute(() -> {
-            try {
-                LlamaNative.release();
-            } catch (Throwable t) {
-                Log.e(TAG, "release failed", t);
-            }
-        });
+        httpServer.setEventListener(null);
+        // Keep the local HTTP runtime alive while client apps, such as action chat, are in foreground.
         nativeExecutor.shutdown();
         generationExecutor.shutdown();
         super.onDestroy();
@@ -332,6 +327,47 @@ public class MainActivity extends Activity {
             chatTranscript.append("\n");
         }
         chatTranscript.append(role + ": " + text + "\nAssistant: ");
+        scrollChatToBottom();
+    }
+
+    private void handleHttpEvent(String message) {
+        if (message.startsWith("chat request: ")) {
+            httpOutputOpen = false;
+            appendSystemLine("[http] " + message);
+            refreshStatsAsync();
+            return;
+        }
+        if (message.startsWith("chat output token: ")) {
+            appendHttpOutputToken(message.substring("chat output token: ".length()));
+            return;
+        }
+        if (message.startsWith("chat output final: ")) {
+            httpOutputOpen = false;
+            appendSystemLine("[http output] " + message.substring("chat output final: ".length()));
+            refreshStatsAsync();
+            return;
+        }
+        if (message.startsWith("chat complete: ") || message.startsWith("chat error: ")) {
+            if (httpOutputOpen) {
+                chatTranscript.append("\n");
+                httpOutputOpen = false;
+            }
+            appendSystemLine("[http] " + message);
+            refreshStatsAsync();
+            return;
+        }
+        appendSystemLine("[http] " + message);
+    }
+
+    private void appendHttpOutputToken(String token) {
+        if (!httpOutputOpen) {
+            if (chatTranscript.length() > 0) {
+                chatTranscript.append("\n");
+            }
+            chatTranscript.append("[http output] ");
+            httpOutputOpen = true;
+        }
+        chatTranscript.append(token);
         scrollChatToBottom();
     }
 

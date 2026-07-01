@@ -1,1 +1,5 @@
-1. Speaker note: explain the slide conclusion first, then connect it to the defense claim that OSH26 is an endpoint Agent Runtime rather than a plain llama.cpp wrapper.
+# 01_cover
+
+1. OSH26 Runtime
+
+开场直接讲：我们的贡献不是模型算法，而是把本地模型做成 Android 上可部署、可观测、可调度的端侧系统。

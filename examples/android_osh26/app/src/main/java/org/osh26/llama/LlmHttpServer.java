@@ -13,6 +13,9 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -21,11 +24,29 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class LlmHttpServer {
     public static final int PORT = 8000;
+    public interface EventListener {
+        void onHttpEvent(String message);
+    }
 
     private final ExecutorService clients = Executors.newCachedThreadPool();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final ArrayDeque<String> recentEvents = new ArrayDeque<>();
+    private volatile EventListener eventListener;
     private ServerSocket serverSocket;
     private Thread acceptThread;
+
+    public void setEventListener(EventListener listener) {
+        eventListener = listener;
+        if (listener != null) {
+            List<String> snapshot;
+            synchronized (recentEvents) {
+                snapshot = new ArrayList<>(recentEvents);
+            }
+            for (String event : snapshot) {
+                listener.onHttpEvent("replay: " + event);
+            }
+        }
+    }
 
     public synchronized String start() {
         if (running.get()) {
@@ -87,9 +108,12 @@ public final class LlmHttpServer {
                     return;
                 }
 
+                emitEvent("request: " + parts[0] + " " + parts[1]
+                        + (request.body.isEmpty() ? "" : ", body=" + truncateForLog(request.body, 320)));
                 route(parts[0], parts[1], request.body, output);
             } catch (Throwable t) {
                 Log.e("OSH26HTTP", "request failed: " + t.getMessage(), t);
+                emitEvent("error: " + t.toString());
                 try {
                     writeJson(output, 500, errorJson("internal_error", t.toString()));
                 } catch (Exception ignored2) {
@@ -177,12 +201,16 @@ public final class LlmHttpServer {
             int nGpuLayers = request.optInt("n_gpu_layers", -1);
             boolean debugCorrectness = request.optBoolean("debug_correctness", false);
             Log.i("OSH26HTTP", "load_model path=" + modelPath + ", backend=" + backend + ", n_gpu_layers=" + nGpuLayers + ", debug_correctness=" + debugCorrectness);
+            emitEvent("load_model start: backend=" + backend
+                    + ", n_gpu_layers=" + nGpuLayers
+                    + ", path=" + truncateForLog(modelPath, 180));
             LlamaNative.configureBackend(backend, nGpuLayers);
             LlamaNative.setDebugCorrectness(debugCorrectness);
             JSONObject json = new JSONObject();
             json.put("result", LlamaNative.loadModel(modelPath));
             json.put("engine", new JSONObject(LlamaNative.getEngineStats()));
             Log.i("OSH26HTTP", "load_model completed");
+            emitEvent("load_model complete: " + truncateForLog(json.optString("result"), 260));
             writeJson(writer, 200, json);
             return;
         }
@@ -230,8 +258,10 @@ public final class LlmHttpServer {
 
     private void handleChatCompletion(String body, OutputStream writer) throws Exception {
         JSONObject request = new JSONObject(body);
-        ChatPrompt chatPrompt = parseChatPrompt(request.optJSONArray("messages"));
-        int maxTokens = request.optInt("max_tokens", 2048);
+        JSONArray messages = request.optJSONArray("messages");
+        ChatPrompt chatPrompt = parseChatPrompt(messages);
+        int requestedMaxTokens = request.optInt("max_tokens", 2048);
+        int maxTokens = Math.max(1, requestedMaxTokens);
         float temperature = (float) request.optDouble("temperature", 0.6);
         float topP = (float) request.optDouble("top_p", 0.95);
         int seed = request.optInt("seed", 0xCAFE);
@@ -239,7 +269,14 @@ public final class LlmHttpServer {
         boolean stream = request.optBoolean("stream", false);
         boolean statelessSubagent = request.optBoolean("stateless_subagent", chatPrompt.statelessSubagent);
         String userPrompt = statelessSubagent ? chatPrompt.lastUserPrompt : chatPrompt.legacyPrompt;
-        String systemPrompt = statelessSubagent ? chatPrompt.systemPrompt : "";
+        String systemPrompt = chatPrompt.systemPrompt;
+        emitEvent("chat request: model=" + request.optString("model", "local-gguf")
+                + ", stream=" + stream
+                + ", max_tokens=" + maxTokens
+                + ", temperature=" + temperature
+                + ", top_p=" + topP
+                + ", stateless_subagent=" + statelessSubagent);
+        emitEvent("chat messages: " + summarizeMessages(messages));
 
         if (stream) {
             writeSseHeaders(writer);
@@ -247,6 +284,7 @@ public final class LlmHttpServer {
             LlamaNative.generateChatStream(userPrompt, systemPrompt, statelessSubagent, new LlamaNative.StreamCallback() {
                 @Override
                 public void onToken(String token) {
+                    emitEvent("chat output token: " + token);
                     try {
                         JSONObject delta = new JSONObject();
                         delta.put("content", token);
@@ -266,6 +304,10 @@ public final class LlmHttpServer {
                 @Override
                 public void onComplete(String text, String finishReason) {
                     try {
+                        if (text == null || text.isEmpty()) {
+                            emitEvent("chat empty output: stream completed without text");
+                        }
+                        emitEvent("chat complete: finish_reason=" + finishReason);
                         JSONObject choice = new JSONObject();
                         choice.put("index", 0);
                         choice.put("delta", new JSONObject());
@@ -284,6 +326,7 @@ public final class LlmHttpServer {
                 @Override
                 public void onError(String error) {
                     try {
+                        emitEvent("chat error: " + truncateForLog(error, 240));
                         writeSseData(writer, errorJson("generation_error", error).toString());
                         writeSseData(writer, "[DONE]");
                     } catch (Exception ignored) {
@@ -293,28 +336,55 @@ public final class LlmHttpServer {
             return;
         }
 
-        JSONObject completion = new JSONObject(LlamaNative.generateChatBlockingJson(
-                userPrompt, systemPrompt, statelessSubagent,
-                maxTokens, temperature, topP, seed, thinking));
-        if (!completion.optBoolean("ok") && !"cancelled".equals(completion.optString("finish_reason"))) {
-            writeJson(writer, 500, errorJson("generation_error", completion.optString("error")));
+        StringBuilder completionTextBuilder = new StringBuilder();
+        String[] finishReason = new String[]{"stop"};
+        String[] generationError = new String[]{""};
+        String status = LlamaNative.generateChatStream(userPrompt, systemPrompt, statelessSubagent, new LlamaNative.StreamCallback() {
+            @Override
+            public void onToken(String token) {
+                completionTextBuilder.append(token);
+                emitEvent("chat output token: " + token);
+            }
+
+            @Override
+            public void onComplete(String text, String reason) {
+                finishReason[0] = reason == null || reason.isEmpty() ? "stop" : reason;
+                if (completionTextBuilder.length() == 0 && text != null && !text.isEmpty()) {
+                    completionTextBuilder.append(text);
+                }
+            }
+
+            @Override
+            public void onError(String error) {
+                generationError[0] = error == null ? "" : error;
+            }
+        }, maxTokens, temperature, topP, seed, thinking);
+        if (!generationError[0].isEmpty()) {
+            emitEvent("chat error: " + truncateForLog(generationError[0], 240));
+            writeJson(writer, 500, errorJson("generation_error", generationError[0]));
             return;
         }
+        String completionText = completionTextBuilder.toString();
+        if (completionText.isEmpty()) {
+            emitEvent("chat empty output: model returned zero decoded tokens");
+        }
+        emitEvent("chat output final: " + completionText);
+        emitEvent("chat complete: finish_reason=" + finishReason[0] + ", native_status=" + status);
 
         JSONObject message = new JSONObject();
         message.put("role", "assistant");
-        message.put("content", completion.optString("text"));
+        message.put("content", completionText);
         JSONObject choice = new JSONObject();
         choice.put("index", 0);
         choice.put("message", message);
-        choice.put("finish_reason", completion.optString("finish_reason", "stop"));
+        choice.put("finish_reason", finishReason[0]);
         JSONObject json = new JSONObject();
         json.put("id", "chatcmpl-" + UUID.randomUUID());
         json.put("object", "chat.completion");
         json.put("model", request.optString("model", "local-gguf"));
         json.put("choices", new JSONArray().put(choice));
         JSONObject usage = new JSONObject();
-        usage.put("completion_tokens", completion.optInt("decoded_tokens"));
+        usage.put("completion_tokens", new JSONObject(LlamaNative.getEngineStats()).optInt("last_decoded_tokens", 0));
         json.put("usage", usage);
         writeJson(writer, 200, json);
     }
@@ -336,11 +406,15 @@ public final class LlmHttpServer {
             if (content.isEmpty()) {
                 continue;
             }
-            legacyPrompt.append(content).append('\n');
             if ("system".equals(role)) {
                 systemPrompt = content;
             } else if ("user".equals(role)) {
+                legacyPrompt.append("User: ").append(content).append('\n');
                 lastUser = content;
+            } else if ("assistant".equals(role)) {
+                legacyPrompt.append("Assistant: ").append(content).append('\n');
+            } else {
+                legacyPrompt.append(content).append('\n');
             }
         }
         if (lastUser.isEmpty()) {
@@ -349,6 +423,51 @@ public final class LlmHttpServer {
         boolean statelessSubagent = systemPrompt.contains("YAML action flow")
                 && systemPrompt.contains("tool: return");
         return new ChatPrompt(legacyPrompt.toString().trim(), lastUser, systemPrompt, statelessSubagent);
+    }
+
+    private String summarizeMessages(JSONArray messages) {
+        if (messages == null || messages.length() == 0) {
+            return "(empty)";
+        }
+        StringBuilder summary = new StringBuilder();
+        for (int i = 0; i < messages.length(); i++) {
+            JSONObject message = messages.optJSONObject(i);
+            if (message == null) {
+                continue;
+            }
+            if (summary.length() > 0) {
+                summary.append(" | ");
+            }
+            summary.append(message.optString("role", "unknown"))
+                    .append(": ")
+                    .append(truncateForLog(message.optString("content", ""), 160));
+        }
+        return summary.length() > 0 ? summary.toString() : "(empty)";
+    }
+
+    private String truncateForLog(String text, int maxChars) {
+        if (text == null || text.isEmpty()) {
+            return "(empty)";
+        }
+        String flattened = text.replace('\r', ' ').replace('\n', ' ').trim();
+        if (flattened.length() <= maxChars) {
+            return flattened;
+        }
+        return flattened.substring(0, Math.max(0, maxChars - 3)) + "...";
+    }
+
+    private void emitEvent(String message) {
+        Log.i("OSH26HTTP", message);
+        synchronized (recentEvents) {
+            recentEvents.addLast(message);
+            while (recentEvents.size() > 120) {
+                recentEvents.removeFirst();
+            }
+        }
+        EventListener listener = eventListener;
+        if (listener != null) {
+            listener.onHttpEvent(message);
+        }
     }
 
     private static final class ChatPrompt {
@@ -381,6 +500,8 @@ public final class LlmHttpServer {
         writer.write(header.getBytes(StandardCharsets.US_ASCII));
         writer.write(bytes);
         writer.flush();
+        emitEvent("response: status=" + status + ", bytes=" + bytes.length
+                + ", body=" + truncateForLog(json.toString(), 360));
     }
 
     private void writeSseHeaders(OutputStream writer) throws IOException {
@@ -389,11 +510,15 @@ public final class LlmHttpServer {
                 + "Cache-Control: no-cache\r\n"
                 + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         writer.flush();
+        emitEvent("response: status=200, content_type=text/event-stream");
     }
 
     private synchronized void writeSseData(OutputStream writer, String data) throws IOException {
         writer.write(("data: " + data + "\n\n").getBytes(StandardCharsets.UTF_8));
         writer.flush();
+        if ("[DONE]".equals(data)) {
+            emitEvent("sse: [DONE]");
+        }
     }
 
     private String reason(int status) {

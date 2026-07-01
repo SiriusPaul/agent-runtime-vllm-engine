@@ -6,7 +6,7 @@
 | ---- | ----- |
 | **Project Name** | osh26_agent_runtime_ppt |
 | **Canvas Format** | PPT 16:9 (1280 x 720) |
-| **Page Count** | 16 |
+| **Page Count** | 24 |
 | **Design Style** | Top Consulting + dark tech academic defense |
 | **Target Audience** | OSH26 course instructors and teaching assistants |
 | **Use Case** | Course project defense presentation |
@@ -194,6 +194,33 @@ Content: JNI/HTTP service, streaming/cancel lifecycle, Q8 Vulkan path, Prefix KV
 Title: OSH26 Runtime makes local Android Agents deployable.
 Content: Faster first token, reusable memory, small-concurrency readiness, and real-device evidence make the project more than a wrapper around llama.cpp.
 
+### Refined 24-page outline (2026-07-01)
+
+P01 Cover: OSH26 Runtime and four headline metrics.
+P02 Endpoint value: offline, privacy, low latency, local control.
+P03 Runtime framing: endpoint inference as OS-style service management.
+P04 llama.cpp boundary: model base versus Android Agent Runtime layer.
+P05 Git roadmap: CPU demo to stateless subagent cache.
+P06 Architecture: Agent/App, JNI/HTTP, scheduler, KV cache, backend.
+P07 Android lifecycle: load/generate/cancel/release/health.
+P08 OpenCL failure: Android linker namespace and deployability barrier.
+P09 Native ggml Vulkan failure: Adreno Vulkan capability/correctness mismatch.
+P10 Custom GPU runtime: controlled Vulkan 1.1 Q8 path.
+P11 Memory architecture: CPU control plane and GPU data plane.
+P12 KV Cache as virtual memory/page cache.
+P13 Stateless subagent pinned prefix cache.
+P14 Request scheduling: prefix-aware aging, backpressure, cancellation.
+P15 Q8 W8A8 prefill performance.
+P16 Decode Q8 GEMV performance.
+P17 LM head, descriptor cache, submit/timestamp telemetry.
+P18 8K context and chunked prefill.
+P19 Single weight residency and Qwen3-1.7B support.
+P20 Benchmark gates and correctness isolation.
+P21 Framework comparison: llama.cpp, vLLM, MNN, OSH26.
+P22 Integration with Action Fabric.
+P23 Teacher takeaways mapped to OS concepts.
+P24 Closing.
+
 ---
 
 ## X. Speaker Notes Guidance
@@ -208,4 +235,3 @@ Use concise Chinese narration, conclusion first. Each notes page should explain 
 - Use only colors and typography in `spec_lock.md`.
 - Use editable SVG shapes and charts, no external images.
 - Avoid banned SVG features: style tags, class attributes, foreignObject, masks, scripts, and group opacity.
-

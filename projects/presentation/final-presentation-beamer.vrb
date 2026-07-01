@@ -1,0 +1,44 @@
+\frametitle{Workflow YAML：结构化计划}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.65\textwidth}
+      \tiny
+\begin{verbatim}
+version: 1
+id: device-report
+steps:
+  - id: device
+    action: device_info
+    inputs:
+      includeHardware: true
+  - id: network
+    action: network_status
+    inputs:
+      includeDetails: true
+  - id: power
+    action: power_status
+    inputs:
+      includeDetails: true
+  - id: final_report
+    action: subagent
+    inputs:
+      prompt: "根据 ${device} ${network} ${power} 生成设备状态摘要。"
+output: final_report
+\end{verbatim}
+    \end{column}
+    \begin{column}{0.32\textwidth}
+      \begin{block}{DAG 结构}
+        \scriptsize
+        \code{device}、\code{network}、\code{power} 互不依赖，可并发执行；\code{final\_report} 依赖三者。
+      \end{block}
+
+      \begin{block}{推理轮数与输出}
+        \tiny
+        主 Agent 控制链从约 4 轮（选三个工具 + 最终回答）降为 1 轮（生成完整计划）。成功后不再回主 Agent 临时总结；用户拿到的是首轮计划中 \code{output: final\_report} 指定的节点结果。
+      \end{block}
+
+      \begin{block}{缩减上下文}
+        \tiny
+        工具输出保存在 runtime state，下游通过 \code{\$\{device\}} 等引用结果，避免完整工具历史反复进入模型上下文。
+      \end{block}
+    \end{column}
+  \end{columns}

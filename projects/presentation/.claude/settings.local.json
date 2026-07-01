@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"^!\" \"D:\\\\\\\\Programs\\\\\\\\llama\\\\\\\\projects\\\\\\\\presentation\\\\\\\\final-presentation-beamer.log\")",
+      "Bash(latexmk -xelatex final-presentation-beamer.tex)"
+    ]
+  }
+}

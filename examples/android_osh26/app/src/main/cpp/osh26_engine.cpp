@@ -1263,7 +1263,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
         request->prompt = std::move(prompt);
         request->prompt_tokens = prompt_tokens;
         request->prompt_tokens_total = request->prompt_tokens.size();
-        request->reusable_prefix_tokens = kEnablePrefixCache
+        request->reusable_prefix_tokens = (kEnablePrefixCache && options.stateless_subagent_mode)
             ? best_cached_prefix_tokens_locked(request->prompt_tokens)
             : 0;
         request->queue_position = next_queue_position_++;
@@ -1284,9 +1284,27 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             if (shutdown_requested_) {
                 return true;
             }
+            if (request->completed || request->cancelled) {
+                return true;
+            }
             const auto next = pick_next_request_locked();
             return active_request_ == nullptr && next == request;
         });
+        if (request->completed || request->cancelled) {
+            auto it = std::find(request_queue_.begin(), request_queue_.end(), request);
+            if (it != request_queue_.end()) {
+                request_queue_.erase(it);
+            }
+            if (!request->completed) {
+                request->result.cancelled = true;
+                request->result.finish_reason = "cancelled";
+                request->result.error = "request cancelled before start";
+                request->result.ok = false;
+                request->completed = true;
+                total_cancelled_requests_ += 1;
+            }
+            return request->result;
+        }
         if (shutdown_requested_) {
             auto it = std::find(request_queue_.begin(), request_queue_.end(), request);
             if (it != request_queue_.end()) {
@@ -1376,7 +1394,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             last_reusable_prefix_tokens_ = 0;
             last_cached_prefix_entries_ = 0;
             last_prefix_restore_ms_ = 0.0;
-            if (kEnablePrefixCache) {
+            if (kEnablePrefixCache && options.stateless_subagent_mode) {
                 restore_prefix_cache_locked(prompt_tokens, &n_pos);
             }
         }
@@ -1424,7 +1442,7 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             last_user_prefill_ms_ = 0.0;
         }
 
-        if (result.error.empty() && !result.cancelled && kEnablePrefixCache && !debug_correctness_) {
+        if (result.error.empty() && !result.cancelled && kEnablePrefixCache && options.stateless_subagent_mode && !debug_correctness_) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (options.stateless_subagent_mode && request->subagent_prefix_tokens > 0) {
                 const size_t subagent_source_tokens = std::min(request->subagent_prefix_tokens + 1, prompt_tokens.size());
@@ -1442,8 +1460,6 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
                 } else {
                     request->subagent_prefix_warm_state = last_prefix_cache_admission_reason_;
                 }
-            } else {
-                insert_prefix_cache_locked(prompt_tokens, false, "", max_prefix_cache_tokens_);
             }
             last_cached_prefix_entries_ = prefix_cache_entries_.size();
             last_prompt_mode_ = request->prompt_mode;
@@ -1462,7 +1478,9 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (const auto & queued : queued_snapshot) {
-                    scores.push_back(queued != nullptr ? best_cached_prefix_tokens_locked(queued->prompt_tokens) : 0);
+                    scores.push_back((queued != nullptr && queued->options.stateless_subagent_mode)
+                            ? best_cached_prefix_tokens_locked(queued->prompt_tokens)
+                            : 0);
                 }
             }
             {
@@ -1575,7 +1593,34 @@ GenerateResult ComputeBackend::generate(const std::string & user_prompt, const G
             }
             llama_token token = cur_p.data[cur_p.selected].id;
 
-            if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+            if (llama_vocab_is_eog(vocab, token)) {
+                hit_eog = true;
+                hit_limit = false;
+                if (result.decoded_tokens == 0) {
+                    result.error = "model emitted EOG before first token";
+                    const int c0 = candidate_count > 0 ? gpu_candidates[0].token : -1;
+                    const int c1 = candidate_count > 1 ? gpu_candidates[1].token : -1;
+                    const int c2 = candidate_count > 2 ? gpu_candidates[2].token : -1;
+                    const int c3 = candidate_count > 3 ? gpu_candidates[3].token : -1;
+                    const int c4 = candidate_count > 4 ? gpu_candidates[4].token : -1;
+                    const float l0 = candidate_count > 0 ? gpu_candidates[0].logit : 0.0f;
+                    const float l1 = candidate_count > 1 ? gpu_candidates[1].logit : 0.0f;
+                    const float l2 = candidate_count > 2 ? gpu_candidates[2].logit : 0.0f;
+                    const float l3 = candidate_count > 3 ? gpu_candidates[3].logit : 0.0f;
+                    const float l4 = candidate_count > 4 ? gpu_candidates[4].logit : 0.0f;
+                    __android_log_print(
+                        ANDROID_LOG_WARN,
+                        "OSH26GPU",
+                        "first-token EOG selected=%d top5=%d(%.3f),%d(%.3f),%d(%.3f),%d(%.3f),%d(%.3f)",
+                        (int) token,
+                        c0, (double) l0,
+                        c1, (double) l1,
+                        c2, (double) l2,
+                        c3, (double) l3,
+                        c4, (double) l4);
+                }
+                break;
+            }
             if (result.decoded_tokens == 0) {
                 previous_gpu_token = -1;
                 last_logits_same_token_streak_ = 0;
@@ -1674,7 +1719,19 @@ cpu_path:
 
             n_pos += batch.n_tokens;
             llama_token token = llama_sampler_sample(sampler, ctx_, -1);
-            if (llama_vocab_is_eog(vocab, token)) { hit_eog = true; hit_limit = false; break; }
+            if (llama_vocab_is_eog(vocab, token)) {
+                hit_eog = true;
+                hit_limit = false;
+                if (result.decoded_tokens == 0) {
+                    result.error = "model emitted EOG before first token";
+                    __android_log_print(
+                        ANDROID_LOG_WARN,
+                        "OSH26GPU",
+                        "CPU first-token EOG selected=%d",
+                        (int) token);
+                }
+                break;
+            }
 
             if (first_token) {
                 result.ttft_ms = std::chrono::duration<double, std::milli>(
@@ -1786,10 +1843,8 @@ void ComputeBackend::cancel() {
     if (active_request_ != nullptr) {
         std::lock_guard<std::mutex> request_lock(active_request_->mutex);
         active_request_->cancelled = true;
-    } else if (!request_queue_.empty()) {
-        std::lock_guard<std::mutex> request_lock(request_queue_.front()->mutex);
-        request_queue_.front()->cancelled = true;
     }
+    fail_queued_requests_locked("request cancelled", true);
     queue_cv_.notify_all();
 }
 

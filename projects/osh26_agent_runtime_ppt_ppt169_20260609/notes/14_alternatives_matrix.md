@@ -1,1 +1,0 @@
-14. Speaker note: explain the slide conclusion first, then connect it to the defense claim that OSH26 is an endpoint Agent Runtime rather than a plain llama.cpp wrapper.

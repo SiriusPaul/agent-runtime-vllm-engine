@@ -34,6 +34,19 @@ OSH26 Runtime is a lightweight Android Agent Runtime framework:
 15. Novelty and project contribution.
 16. Summary and defense answers.
 
+## Refined Deck 2026-07-01
+
+The deck was expanded from 16 to 24 pages and rewritten in Chinese for the OSH26 course defense. The revised focus is: endpoint deployment is an operating-system-level problem, and OSH26 differs from plain llama.cpp by adding Android lifecycle control, KV/prefix memory management, request scheduling, Adreno-specific Q8 Vulkan execution, and verifier-gated real-device optimization.
+
+New content added:
+
+- Endpoint deployment importance: offline use, privacy, low latency, local permission control.
+- Git-history roadmap: CPU inference, OpenAI API, failed native Vulkan, custom GPU runtime, KV cache, Q8 prefill, native Q8, 8K context, single weight residency, 1.7B support, decode Q8 GEMV, stateless subagent cache.
+- Operating-system concepts embedded into the technical explanation: working set, page cache, pinned/dynamic entries, LRU, fragmentation, short-job preference, aging, backpressure, critical sections, control plane/data plane split, driver boundary.
+- More explicit failure analysis for OpenCL and native ggml Vulkan.
+- More direct differentiation against llama.cpp, vLLM, and MNN.
+- Action Fabric linkage: upper layer makes Agent execution schedulable; OSH26 Runtime makes local model serving schedulable.
+
 ## Key Data
 
 ### Q8 W8A8 Prefill
@@ -100,4 +113,3 @@ Gap for our goal: more graph/operator oriented; less direct support for GGUF/lla
 ## Defense Message
 
 This is not repeated wheel-building. The project contributes an Android Agent Runtime layer above a proven model base, plus a target-device optimized GPU and cache path. The work includes Android integration, JNI/HTTP API, streaming/cancel/release lifecycle, Q8 W8A8 prefill acceleration, Prefix KV Cache, 8K context validation, descriptor allocation optimization, real-device benchmarking, and failure analysis for OpenCL/Vulkan deployment paths.
-
